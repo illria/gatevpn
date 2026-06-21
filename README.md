@@ -151,10 +151,35 @@ TARGET_IP_TYPES=residential
 - 如果当前国家没有住宅 IP，会继续按 `移动 IP -> 普通/未知 -> 机房 IP -> 代理 IP/Tor` 逐级兜底，尽量保持服务运行。
 - 如果你把 IP 类型设置成 `residential,mobile`，则会先找住宅，再找移动；仍然没有时继续按后续类型兜底。
 - 如果你设置成 `all`，自动切换会直接把全部类型放进综合风险/延迟排序。
+- 自动切换候选池的总排序逻辑是：**IP 类别优先**（住宅优先，其次移动网、普通/未知、机房、代理/Tor），同类别内再看 **具体检测状态与 IP 质量**（可用状态、失败冷却、黑名单、风险等级、欺诈值、风控数据完整度），最后才看 **延迟**。
 - 默认开启严格同地区故障转移；如需在同地区无可用节点时允许跨地区兜底，可在环境变量中设置：
 
 ```bash
 STRICT_COUNTRY_FAILOVER=0
+```
+
+### 出口失败与防反复横跳
+
+- OpenVPN 握手成功后会立即检测本地代理出口 IP；如果出口检测失败，会把该节点临时隔离并马上尝试下一个候选节点。
+- 运行中代理出口连续失败达到阈值后，也会把当前节点临时隔离，避免 A 节点失败切到 B、B 失败后又立刻回到 A。
+- 自动切换会跳过本轮已尝试节点和隔离期内的失败节点，在同地区内继续尝试 C/D 等候选；同地区没有可用节点时是否跨地区兜底由 `STRICT_COUNTRY_FAILOVER` 控制。
+
+可选环境变量：
+
+```bash
+# 出口连续失败几次后触发自动切换，默认 3
+PROXY_FAIL_AUTO_SWITCH_THRESHOLD=3
+
+# 节点出口失败后的临时隔离时间，默认沿用 INVALID_BACKOFF_SECONDS，即 30 分钟
+FAILED_NODE_QUARANTINE_SECONDS=1800
+
+# 单轮自动故障转移最多尝试多少个候选节点，默认 8
+AUTO_SWITCH_MAX_CHAIN_ATTEMPTS=8
+
+# 连接成功后是否强制验证代理出口，默认开启
+PROXY_CONNECT_VERIFY_REQUIRED=1
+PROXY_CONNECT_VERIFY_ATTEMPTS=2
+PROXY_CONNECT_VERIFY_DELAY_SECONDS=3
 ```
 
 注意：VPNGate 节点由第三方志愿者提供；VPNBook 节点由 VPNBook 官网提供；IPSpeed 节点由 ipspeed.info 的免费 OpenVPN 列表提供。住宅/机房/代理类型识别依赖公开 IP 数据源，不能保证 100% 准确，但会作为自动切换的优先级依据。
