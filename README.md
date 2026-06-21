@@ -179,6 +179,9 @@ PROXY_FAIL_GRACE_SECONDS=120
 PROXY_HEALTH_CHECK_URLS=https://api.ipify.org,http://api.ipify.org,https://ifconfig.me/ip,https://icanhazip.com,http://ip.sb
 PROXY_HEALTH_CHECK_TIMEOUT_SECONDS=8
 
+# IP 回显目标都失败时，用普通网页连通性兜底；能访问网页就不切节点，只把出口 IP 标为未知
+PROXY_CONNECTIVITY_CHECK_URLS=http://connectivitycheck.gstatic.com/generate_204,https://www.gstatic.com/generate_204,https://www.cloudflare.com/cdn-cgi/trace,https://www.google.com/generate_204
+
 # 节点出口失败后的临时隔离时间，默认沿用 INVALID_BACKOFF_SECONDS，即 30 分钟
 FAILED_NODE_QUARANTINE_SECONDS=1800
 
@@ -223,6 +226,8 @@ en uninstall   # 卸载
       │
       └─ SSH / Web UI 仍走物理网卡，避免 VPS 失联
 ```
+
+代理进程的出站 socket 会绑定 `tun0`，并打上 `fwmark 100` 走独立策略路由表，避免普通 VPS 默认路由、OpenVPN 推送路由和本地管理流量互相干扰。
 
 ## 文件说明
 
