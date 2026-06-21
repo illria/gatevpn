@@ -128,10 +128,6 @@ AUTO_SELECT_ALLOW_ACTIVE_SWITCH = os.environ.get("AUTO_SELECT_ALLOW_ACTIVE_SWITC
 PROXY_FAIL_GRACE_SECONDS = int(os.environ.get("PROXY_FAIL_GRACE_SECONDS", "75"))
 PROXY_FAIL_AUTO_SWITCH_THRESHOLD = max(1, int(os.environ.get("PROXY_FAIL_AUTO_SWITCH_THRESHOLD", "3")))
 AUTO_SWITCH_RETRY_COOLDOWN_SECONDS = max(10, int(os.environ.get("AUTO_SWITCH_RETRY_COOLDOWN_SECONDS", "45")))
-# 出口检测失败后，短时间内不要再把同一个节点放回自动候选池。
-# 这可以避免 A 出口失败 -> B 出口失败 -> 又回到 A 的来回横跳。
-FAILED_NODE_QUARANTINE_SECONDS = max(60, int(os.environ.get("FAILED_NODE_QUARANTINE_SECONDS", str(INVALID_BACKOFF_SECONDS))))
-AUTO_SWITCH_MAX_CHAIN_ATTEMPTS = max(1, int(os.environ.get("AUTO_SWITCH_MAX_CHAIN_ATTEMPTS", "8")))
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
@@ -389,12 +385,7 @@ def get_node_sources() -> list[str]:
     return split_node_sources(NODE_SOURCES_ENV or cfg.get("node_sources") or DEFAULT_NODE_SOURCES)
 
 def node_sources_display(value: Any) -> str:
-    labels = {
-        "vpngate": "VPNGate",
-        "vpnbook": "VPNBook",
-        "ipspeed": "IPSpeed",
-        "vpngate_scraper": "Vpngate-Scraper",
-    }
+    labels = {"vpngate": "VPNGate", "vpnbook": "VPNBook", "ipspeed": "IPSpeed", "vpngate_scraper": "Vpngate-Scraper"}
     return " + ".join(labels.get(x, x) for x in split_node_sources(value))
 
 def get_target_countries() -> list[str]:
@@ -602,74 +593,75 @@ def node_is_clean_for_connect(node: dict[str, Any]) -> bool:
     return True
 
 def node_ip_priority_rank(node: dict[str, Any]) -> int:
-    """Lower is better. This rank is only the IP category preference."""
-    ip_type = normalize_ip_type_token(node.get("ip_type") or "")
-    quality = normalize_ip_type_token(node.get("quality") or "")
-    if ip_type == "residential" or quality in {"clean_residential", "residential"}:
-        return 0
-    if ip_type == "mobile" or quality == "mobile":
-        return 1
-    if ip_type in {"normal", "unknown", ""} or quality in {"normal", "unknown", ""}:
-        return 2
-    if ip_type == "hosting" or quality in {"hosting", "datacenter"}:
-        return 3
-    if ip_type == "proxy" or quality in {"proxy", "risky"}:
-        return 4
-    if ip_type == "tor":
-        return 5
-    return 2
-
-def node_detection_quality_key(node: dict[str, Any]) -> tuple[int, int, int, int, int, int]:
-    """Lower is better. This rank captures the concrete test/risk state of a node."""
-    probe_status = str(node.get("probe_status") or "not_checked").lower()
-    probe_rank = 0 if probe_status == "available" else 80
-    failure_rank = 50 if node_in_fail_quarantine(node) else min(parse_int(node.get("failure_count")), 5) * 4
+    """Lower is better. Prefer clean residential IPs; deprioritize risky or blacklisted IPs."""
+    ip_type = str(node.get("ip_type") or "").strip().lower()
+    quality = str(node.get("quality") or "").strip().lower()
+    risk_level = str(node.get("risk_level") or "").strip().lower()
     blacklist_count = parse_int(node.get("blacklist_count"))
-    blacklist_rank = 0 if blacklist_count <= 0 else 90 + min(blacklist_count, 9)
-    risk_level = str(node.get("risk_level") or "unknown").lower()
-    risk_rank = {
-        "clean": 0,
-        "low": 8,
-        "unknown": 28,
-        "": 28,
-        "medium": 55,
-        "high": 80,
-        "blocked": 100,
-    }.get(risk_level, 35)
-    fraud_score = node_fraud_score(node, unknown=65)
-    if fraud_score <= MAX_AUTO_FRAUD_SCORE:
-        fraud_rank = fraud_score
-    elif fraud_score <= 50:
-        fraud_rank = 50 + fraud_score
-    else:
-        fraud_rank = 90 + fraud_score
-    data_rank = 0 if node_has_risk_data(node) else 30
-    return (
-        probe_rank,
-        failure_rank,
-        blacklist_rank,
-        risk_rank,
-        fraud_rank,
-        data_rank,
-    )
+    fraud_score = node_fraud_score(node, unknown=50)
 
-def node_candidate_score_key(node: dict[str, Any]) -> tuple[int, int, int, int, int, int, int, int, int, int]:
-    """Automatic node choice: IP category first, clean/risk state second, latency third."""
-    quality_key = node_detection_quality_key(node)
+    if blacklist_count > 0 or risk_level in {"high", "blocked"}:
+        return 99
+    if fraud_score > MAX_AUTO_FRAUD_SCORE and not ALLOW_RISKY_IP_CONNECT:
+        return 90
+    if ip_type == "residential" and quality in {"clean_residential", "", "normal", "residential"} and risk_level in {"clean", ""}:
+        return 0
+    if ip_type == "residential":
+        return 1
+    if ip_type == "mobile" or quality == "mobile":
+        return 2
+    if quality in {"", "normal"} and ip_type in {"", "unknown"}:
+        return 5
+    if ip_type == "hosting" or quality in {"hosting", "datacenter"}:
+        return 8
+    if ip_type in {"proxy", "tor"} or quality in {"proxy", "risky"}:
+        return 9
+    return 6
+
+def node_sort_key(node: dict[str, Any]) -> tuple[int, int, int, int, int]:
     return (
         node_ip_priority_rank(node),
-        *quality_key,
+        node_fraud_score(node, unknown=50),
         parse_int(node.get("latency_ms")) or 999999,
         parse_int(node.get("ping")) or 999999,
         -parse_int(node.get("score")),
     )
 
-def node_sort_key(node: dict[str, Any]) -> tuple[int, int, int, int, int, int, int, int, int, int]:
-    return node_candidate_score_key(node)
+def node_auto_fallback_key(node: dict[str, Any]) -> tuple[int, int, int, int, int, int]:
+    """Lower is better for emergency failover. Risk is a ranking factor, not a hard block."""
+    risk_level = str(node.get("risk_level") or "unknown").lower()
+    ip_type = normalize_ip_type_token(node.get("ip_type") or "unknown")
+    blacklist_count = parse_int(node.get("blacklist_count"))
+    fraud_score = node_fraud_score(node, unknown=80)
 
-def node_auto_fallback_key(node: dict[str, Any]) -> tuple[int, int, int, int, int, int, int, int, int, int]:
-    """Lower is better for failover. Same policy: IP type -> risk/test quality -> latency."""
-    return node_candidate_score_key(node)
+    risk_rank = 0
+    if blacklist_count > 0:
+        risk_rank += 80 + min(blacklist_count, 9)
+    if risk_level == "blocked":
+        risk_rank += 70
+    elif risk_level == "high":
+        risk_rank += 45
+    elif risk_level == "medium":
+        risk_rank += 25
+    elif risk_level in {"unknown", ""}:
+        risk_rank += 15
+    if ip_type in {"proxy", "tor"}:
+        risk_rank += 35
+    elif ip_type in {"hosting", "datacenter"}:
+        risk_rank += 20
+    elif ip_type == "mobile":
+        risk_rank += 5
+    elif ip_type == "residential":
+        risk_rank -= 10
+
+    return (
+        risk_rank,
+        fraud_score,
+        node_ip_priority_rank(node),
+        parse_int(node.get("latency_ms")) or 999999,
+        parse_int(node.get("ping")) or 999999,
+        -parse_int(node.get("score")),
+    )
 
 DEFAULT_IP_TYPE_FALLBACK_ORDER = ["residential", "mobile", "normal", "hosting", "proxy", "tor"]
 
@@ -737,9 +729,8 @@ def choose_auto_failover_candidates(scoped_candidates: list[dict[str, Any]], all
     """Pick automatic failover candidates.
 
     Country remains the main scope. IP type is a preference chain, not a dead-end filter:
-    residential -> mobile -> normal/unknown -> hosting/datacenter -> proxy/Tor. Inside each
-    IP category, concrete detection state comes before latency: no blacklist, clean/low risk,
-    lower fraud score, complete risk data, then lower latency.
+    residential -> mobile -> normal/unknown -> hosting/datacenter -> proxy/Tor. Risk scoring
+    is used for ranking. It only becomes a hard block when strict mode and keep-running are disabled.
     """
     target_ip_types = get_target_ip_types()
     ip_type_label = target_ip_types_display(target_ip_types)
@@ -751,6 +742,9 @@ def choose_auto_failover_candidates(scoped_candidates: list[dict[str, Any]], all
         scoped_pool = list(scoped_candidates)
         all_pool = list(all_candidates)
 
+    clean_scoped = [n for n in scoped_pool if node_is_clean_for_connect(n)]
+    clean_all = [n for n in all_pool if node_is_clean_for_connect(n)]
+
     if AUTO_RISK_MODE == "loose" or ALLOW_RISKY_IP_CONNECT:
         candidates, tier_reason = tiered_ip_type_candidates(scoped_pool, target_ip_types)
         if not candidates and not STRICT_COUNTRY_FAILOVER:
@@ -761,21 +755,29 @@ def choose_auto_failover_candidates(scoped_candidates: list[dict[str, Any]], all
             return candidates, f"宽松模式：{tier_reason}"
         return [], f"没有可用节点；IP 类型策略 {ip_type_label}"
 
-    if AUTO_RISK_MODE == "strict" and not AUTO_MIN_KEEP_RUNNING:
-        scoped_pool = [n for n in scoped_pool if node_is_clean_for_connect(n)]
-        all_pool = [n for n in all_pool if node_is_clean_for_connect(n)]
-
-    candidates, candidate_reason = tiered_ip_type_candidates(scoped_pool, target_ip_types)
-    if candidates:
-        return candidates, f"同地区候选综合排序：IP类别优先，其次检测/风控质量，再看延迟；{candidate_reason}"
+    clean_candidates, clean_tier_reason = tiered_ip_type_candidates(clean_scoped, target_ip_types)
+    if clean_candidates:
+        clean_candidates.sort(key=node_sort_key)
+        return clean_candidates, f"优先选择同地区干净节点；{clean_tier_reason}"
 
     if not STRICT_COUNTRY_FAILOVER:
-        cross_candidates, cross_reason = tiered_ip_type_candidates(all_pool, target_ip_types)
-        if cross_candidates:
-            return cross_candidates, f"跨地区候选综合排序：IP类别优先，其次检测/风控质量，再看延迟；{cross_reason}"
+        clean_cross, cross_reason = tiered_ip_type_candidates(clean_all, target_ip_types)
+        if clean_cross:
+            clean_cross.sort(key=node_sort_key)
+            return clean_cross, f"同地区无干净节点，跨地区选择干净节点；{cross_reason}"
 
     if AUTO_RISK_MODE == "strict" and not AUTO_MIN_KEEP_RUNNING:
         return [], f"严格模式：没有符合阈值的干净节点；IP 类型策略 {ip_type_label}"
+
+    fallback_pool = scoped_pool
+    fallback_candidates, fallback_reason = tiered_ip_type_candidates(fallback_pool, target_ip_types)
+    if fallback_candidates:
+        return fallback_candidates, f"保活兜底：无干净 IP，按同地区 IP 类型优先级逐级选择；{fallback_reason}"
+
+    if not STRICT_COUNTRY_FAILOVER:
+        fallback_candidates, fallback_reason = tiered_ip_type_candidates(all_pool, target_ip_types)
+        if fallback_candidates:
+            return fallback_candidates, f"跨地区保活兜底：按 IP 类型优先级逐级选择；{fallback_reason}"
 
     return [], "没有可用节点；将继续后台拉取/检测"
 
@@ -887,8 +889,6 @@ def optimize_active_node_after_tests(reason: str = "") -> str:
 
     failover_targets = get_failover_targets(active_node)
     scoped = [n for n in available if node_matches_target_countries(n, failover_targets)] if failover_targets else list(available)
-    scoped = [n for n in scoped if not node_in_fail_quarantine(n)]
-    available = [n for n in available if not node_in_fail_quarantine(n)]
     candidates, candidate_reason = choose_auto_failover_candidates(scoped, available)
     if not candidates:
         msg = f"自动优选：没有符合当前地区/IP策略的可用节点；{candidate_reason}"
@@ -984,78 +984,6 @@ def set_state(**updates: Any) -> None:
     state.update(updates)
     write_json(STATE_FILE, state)
 
-def failed_node_map(now: float | None = None) -> dict[str, dict[str, Any]]:
-    now = time.time() if now is None else now
-    state = read_json(STATE_FILE, {})
-    raw = state.get("failed_nodes") or {}
-    if not isinstance(raw, dict):
-        return {}
-    cutoff = now - FAILED_NODE_QUARANTINE_SECONDS
-    cleaned: dict[str, dict[str, Any]] = {}
-    changed = False
-    for node_id, info in raw.items():
-        if not isinstance(info, dict):
-            changed = True
-            continue
-        failed_at = float(info.get("failed_at") or 0)
-        if failed_at and failed_at >= cutoff:
-            cleaned[str(node_id)] = info
-        else:
-            changed = True
-    if changed:
-        set_state(failed_nodes=cleaned)
-    return cleaned
-
-def node_in_fail_quarantine(node: dict[str, Any], now: float | None = None) -> bool:
-    node_id = str(node.get("id") or "")
-    if not node_id:
-        return False
-    return node_id in failed_node_map(now)
-
-def mark_node_failed_temporarily(node_id: str, reason: str, *, status: str = "unavailable") -> None:
-    node_id = str(node_id or "")
-    if not node_id:
-        return
-    now = time.time()
-    failed = failed_node_map(now)
-    failed[node_id] = {
-        "failed_at": now,
-        "reason": reason[-260:],
-    }
-    with lock:
-        nodes = read_json(NODES_FILE, [])
-        for node in nodes:
-            if node.get("id") == node_id:
-                node["last_failed_at"] = now
-                node["last_failure_reason"] = reason[-260:]
-                node["failure_count"] = parse_int(node.get("failure_count")) + 1
-                if status:
-                    node["probe_status"] = status
-                node["probe_message"] = reason[-260:]
-                break
-        write_json(NODES_FILE, sort_all_nodes(nodes))
-    set_state(failed_nodes=failed)
-
-def clear_node_temporary_failure(node_id: str) -> None:
-    node_id = str(node_id or "")
-    if not node_id:
-        return
-    failed = failed_node_map()
-    if node_id in failed:
-        failed.pop(node_id, None)
-        set_state(failed_nodes=failed)
-
-def clear_active_node_flags() -> None:
-    with lock:
-        nodes = read_json(NODES_FILE, [])
-        changed = False
-        for item in nodes:
-            if item.get("active"):
-                item["active"] = False
-                changed = True
-        if changed:
-            write_json(NODES_FILE, nodes)
-
 def get_state() -> dict[str, Any]:
     global active_openvpn_node_id, is_connecting
     state = read_json(STATE_FILE, {})
@@ -1111,14 +1039,10 @@ def get_state() -> dict[str, Any]:
     state.setdefault("active_connected_at", 0)
     state.setdefault("proxy_fail_count", 0)
     state.setdefault("last_auto_switch_attempt_at", 0)
-    state.setdefault("failed_nodes", {})
-    failed_nodes_state = state.get("failed_nodes")
-    state["failed_nodes_quarantined"] = len(failed_nodes_state) if isinstance(failed_nodes_state, dict) else 0
     state["proxy_fail_grace_seconds"] = PROXY_FAIL_GRACE_SECONDS
     state["proxy_fail_auto_switch_threshold"] = PROXY_FAIL_AUTO_SWITCH_THRESHOLD
     state["auto_switch_retry_cooldown_seconds"] = AUTO_SWITCH_RETRY_COOLDOWN_SECONDS
-    state["failed_node_quarantine_seconds"] = FAILED_NODE_QUARANTINE_SECONDS
-    state["auto_switch_max_chain_attempts"] = AUTO_SWITCH_MAX_CHAIN_ATTEMPTS
+
     return state
 
 def safe_name(value: str) -> str:
@@ -1703,11 +1627,11 @@ def fetch_ipspeed_candidates(target_countries: list[str], seen_keys: set[str]) -
 
 def parse_speed_mbps(value: Any) -> int:
     text = str(value or "").strip()
-    m = re.search(r"([\d.]+)", text)
-    if not m:
+    match = re.search(r"([\d.]+)", text)
+    if not match:
         return 0
     try:
-        return int(float(m.group(1)) * 1000 * 1000)
+        return int(float(match.group(1)) * 1000 * 1000)
     except ValueError:
         return 0
 
@@ -2365,7 +2289,7 @@ def test_multiple_nodes(node_ids: list[str], progress_prefix: str = "正在自�
             temp_path.write_text(config_text, encoding="utf-8")
         except Exception:
             pass
-            
+
         latency = vpn_utils.ping_latency_ms(h, p, fallback_ping)
         idx = get_free_test_index()
         try:
@@ -2385,7 +2309,7 @@ def test_multiple_nodes(node_ids: list[str], progress_prefix: str = "正在自�
                 temp_path.unlink()
         except Exception:
             pass
-            
+
         temp_node = {
             "id": node_id,
             "latency_ms": latency,
@@ -2559,11 +2483,10 @@ def run_vpnbook_safe_tests_background(node_ids: list[str]) -> None:
 
     threading.Thread(target=worker, daemon=True).start()
 
-def auto_switch_node(attempt: int = 0, tried_node_ids: set[str] | None = None) -> None:
-    tried_node_ids = set(tried_node_ids or set())
-    if attempt >= AUTO_SWITCH_MAX_CHAIN_ATTEMPTS:
-        print(f"[自动切换] 连续切换失败已达 {AUTO_SWITCH_MAX_CHAIN_ATTEMPTS} 次，停止本轮切换，将在后台重新加载节点...", flush=True)
-        set_state(last_check_message=f"自动切换连续失败 {AUTO_SWITCH_MAX_CHAIN_ATTEMPTS} 次，将等待下一轮节点维护")
+def auto_switch_node(attempt: int = 0) -> None:
+    if attempt >= 3:
+        print("[自动切换] 连续切换失败已达 3 次，停止切换以防止主线程死锁，将在后台重新加载节点...", flush=True)
+        set_state(last_check_message="自动切换连续失败，将等待下一轮节点维护")
         return
     if is_connecting:
         set_state(last_check_message="当前正在建立连接，暂不触发新的自动切换")
@@ -2585,8 +2508,6 @@ def auto_switch_node(attempt: int = 0, tried_node_ids: set[str] | None = None) -
             n for n in nodes 
             if n.get("probe_status") == "available" 
             and not n.get("active")
-            and str(n.get("id") or "") not in tried_node_ids
-            and not node_in_fail_quarantine(n, now)
         ]
         scoped_candidates = [n for n in all_candidates if node_matches_target_countries(n, failover_targets)] if failover_targets else all_candidates
         candidates, candidate_reason = choose_auto_failover_candidates(scoped_candidates, all_candidates)
@@ -2614,9 +2535,7 @@ def auto_switch_node(attempt: int = 0, tried_node_ids: set[str] | None = None) -
             err_msg = f"切换到备用节点 {next_node['id']} 失败: {e}，将尝试下一个..."
             print(f"[自动切换] {err_msg}", flush=True)
             log_to_json("WARNING", "VPN", err_msg)
-            mark_node_failed_temporarily(next_node["id"], f"自动切换失败: {e}", status="unavailable")
-            tried_node_ids.add(str(next_node["id"]))
-            auto_switch_node(attempt + 1, tried_node_ids)
+            auto_switch_node(attempt + 1)
     else:
         # 没有备用节点时不要直接清理当前连接。免费节点池波动大，
         # 直接 stop 会造成“连接成功 -> 没备用 -> 立即断开 -> 反复重连”。
@@ -2708,7 +2627,6 @@ def connect_node(node_id: str, update_failover_scope: bool = True, allow_manual_
             for item in nodes:
                 item["active"] = False
             write_json(NODES_FILE, nodes)
-            mark_node_failed_temporarily(node_id, f"OpenVPN 连接失败: {message}", status="unavailable")
             log_to_json("ERROR", "VPN", f"连接节点 {node_id} 失败: {message}")
             set_state(active_openvpn_node_id="", is_connecting=False, active_node_latency="无活动连接", last_check_message=f"连接失败: {message}")
             with lock:
@@ -2738,16 +2656,12 @@ def connect_node(node_id: str, update_failover_scope: bool = True, allow_manual_
                 last_active_latency = latency
         except Exception:
             pass
-        
+
         for item in nodes:
             item["active"] = item.get("id") == node_id
             if item["active"]:
-                item["probe_status"] = "available"
                 item["probe_message"] = f"Active node. HTTP proxy: http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}"
-                item["last_failed_at"] = 0
-                item["last_failure_reason"] = ""
         write_json(NODES_FILE, nodes)
-        clear_node_temporary_failure(node_id)
 
         set_state(last_check_message="正在测试本地代理出站联通性与出口 IP...")
         res = check_proxy_health()
@@ -4459,7 +4373,7 @@ INDEX_HTML = r"""<!doctype html>
               <option value="ipspeed">仅 IPSpeed</option>
               <option value="vpngate_scraper">仅 Vpngate-Scraper</option>
             </select>
-            <div style="font-size: 12px; color: var(--text-secondary); margin-top: 6px; line-height: 1.4;">IPSpeed 会从 ipspeed.info 读取 .ovpn 文件；Vpngate-Scraper 会从 fdciabdul/Vpngate-Scraper-API 的 Markdown 列表读取配置；VPNBook 密码会自动从官网读取。定时刷新只更新节点池，当前出口正常时不主动断线。</div>
+            <div style="font-size: 12px; color: var(--text-secondary); margin-top: 6px; line-height: 1.4;">IPSpeed 会从 ipspeed.info 的 OpenVPN 列表读取 .ovpn 文件；Vpngate-Scraper 会从 fdciabdul/Vpngate-Scraper-API 的 Markdown 列表读取配置；VPNBook 密码会自动从官网读取。定时刷新只更新节点池，当前出口正常时不主动断线。</div>
           </div>
 
           <div class="form-group" style="margin-bottom: 12px;">
@@ -5325,7 +5239,7 @@ function openSettingsModal() {
     $("settings_port").value = state.port || 8787;
     $("settings_suffix").value = state.secret_path || "EJsW2EeBo9lY";
     $("settings_target_countries").value = state.target_countries || "";
-    $("settings_node_sources").value = state.node_sources || "vpngate,vpnbook,ipspeed,vpngate_scraper";
+    $("settings_node_sources").value = state.node_sources || "vpngate,vpnbook,ipspeed";
     $("settings_auto_select_allow_active_switch").value = state.auto_select_allow_active_switch ? "1" : "0";
     const ipTypeValue = state.target_ip_types || "residential";
     const legacyIpTypeMap = {
@@ -5495,7 +5409,7 @@ def check_proxy_health() -> dict[str, Any]:
                 time_info = lines[1].strip().split()
                 if len(time_info) == 2:
                     total_time_str, http_code = time_info
-                    if http_code == "200" and is_valid_ip_text(ip):
+                    if http_code == "200" and ip:
                         latency_ms = int(float(total_time_str) * 1000)
                         return {"ok": True, "ip": ip, "latency_ms": latency_ms}
         
@@ -5509,7 +5423,7 @@ def check_proxy_health() -> dict[str, Any]:
                 time_info = lines[1].strip().split()
                 if len(time_info) == 2:
                     total_time_str, http_code = time_info
-                    if http_code == "200" and is_valid_ip_text(ip):
+                    if http_code == "200" and ip:
                         latency_ms = int(float(total_time_str) * 1000)
                         return {"ok": True, "ip": ip, "latency_ms": latency_ms}
                         
@@ -5567,10 +5481,10 @@ def background_proxy_checker() -> None:
                     nodes = read_json(NODES_FILE, [])
                     active_node = next((n for n in nodes if n.get("id") == active_openvpn_node_id), None)
                     if active_node:
-                        active_node["probe_status"] = "unavailable"
                         active_node["probe_message"] = f"代理连续失败 {fail_count} 次: {error_msg}"
+                        # 不马上把当前节点标成 unavailable，避免节点池只有当前节点时前端看起来“明明可用却不能连”。
+                        # 是否切换由 auto_switch_node 按备用节点情况决定。
                         write_json(NODES_FILE, nodes)
-                        mark_node_failed_temporarily(str(active_node.get("id") or active_openvpn_node_id), f"运行中出口连续失败 {fail_count} 次: {error_msg}", status="unavailable")
                 auto_switch_node()
         except Exception as e:
             print(f"[错误] 代理后台检测发生异常: {e}", flush=True)
