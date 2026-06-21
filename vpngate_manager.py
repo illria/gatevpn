@@ -139,17 +139,6 @@ PROXY_HEALTH_CHECK_URLS = [
     if url.strip()
 ]
 PROXY_HEALTH_CHECK_TIMEOUT_SECONDS = max(3, int(os.environ.get("PROXY_HEALTH_CHECK_TIMEOUT_SECONDS", "8")))
-PROXY_CONNECTIVITY_CHECK_URLS = [
-    url.strip()
-    for url in re.split(
-        r"[,，\s]+",
-        os.environ.get(
-            "PROXY_CONNECTIVITY_CHECK_URLS",
-            "http://connectivitycheck.gstatic.com/generate_204,https://www.gstatic.com/generate_204,https://www.cloudflare.com/cdn-cgi/trace,https://www.google.com/generate_204",
-        ),
-    )
-    if url.strip()
-]
 AUTO_SWITCH_RETRY_COOLDOWN_SECONDS = max(10, int(os.environ.get("AUTO_SWITCH_RETRY_COOLDOWN_SECONDS", "45")))
 # 出口检测失败后，短时间内不要再把同一个节点放回自动候选池。
 # 这可以避免 A 出口失败 -> B 出口失败 -> 又回到 A 的来回横跳。
@@ -1160,7 +1149,6 @@ def get_state() -> dict[str, Any]:
     state["proxy_fail_auto_switch_threshold"] = PROXY_FAIL_AUTO_SWITCH_THRESHOLD
     state["proxy_health_check_urls"] = PROXY_HEALTH_CHECK_URLS
     state["proxy_health_check_timeout_seconds"] = PROXY_HEALTH_CHECK_TIMEOUT_SECONDS
-    state["proxy_connectivity_check_urls"] = PROXY_CONNECTIVITY_CHECK_URLS
     state["auto_switch_retry_cooldown_seconds"] = AUTO_SWITCH_RETRY_COOLDOWN_SECONDS
     state["failed_node_quarantine_seconds"] = FAILED_NODE_QUARANTINE_SECONDS
     state["auto_switch_max_chain_attempts"] = AUTO_SWITCH_MAX_CHAIN_ATTEMPTS
@@ -2133,10 +2121,6 @@ def setup_policy_routing(interface: str = "tun0") -> None:
     except Exception:
         pass
     try:
-        subprocess.run(["ip", "rule", "del", "fwmark", "100", "table", "100"], capture_output=True, timeout=2)
-    except Exception:
-        pass
-    try:
         subprocess.run(["ip", "route", "flush", "table", "100"], capture_output=True, timeout=2)
     except Exception:
         pass
@@ -2145,7 +2129,6 @@ def setup_policy_routing(interface: str = "tun0") -> None:
     for attempt in range(1, 4):
         try:
             subprocess.run(["ip", "route", "add", "default", "dev", interface, "table", "100"], check=True, timeout=2)
-            subprocess.run(["ip", "rule", "add", "fwmark", "100", "table", "100"], check=True, timeout=2)
             subprocess.run(["ip", "rule", "add", "oif", interface, "table", "100"], check=True, timeout=2)
             print(f"[policy_routing] Enabled policy routing for interface {interface} (attempt {attempt} success)", flush=True)
             success = True
@@ -2160,7 +2143,6 @@ def setup_policy_routing(interface: str = "tun0") -> None:
 def cleanup_policy_routing() -> None:
     try:
         subprocess.run(["ip", "rule", "del", "table", "100"], capture_output=True, timeout=2)
-        subprocess.run(["ip", "rule", "del", "fwmark", "100", "table", "100"], capture_output=True, timeout=2)
         subprocess.run(["ip", "route", "flush", "table", "100"], capture_output=True, timeout=2)
         print("[policy_routing] Cleared policy routing table 100", flush=True)
     except Exception:
@@ -5593,32 +5575,7 @@ def check_proxy_health() -> dict[str, Any]:
         stderr = (res.stderr or "").strip()
         stdout_head = " ".join(lines[:2])[:120]
         errors.append(f"{url}: code={res.returncode}, out={stdout_head or '-'}, err={stderr or '-'}")
-
-    # IP 回显站都失败时，再用普通网页连通性兜底。普通访问能通就说明代理链路可用，
-    # 只是暂时拿不到出口 IP，不应该因此触发切换。
-    for url in PROXY_CONNECTIVITY_CHECK_URLS:
-        cmd = [
-            "curl", "-4", "-sS",
-            "--connect-timeout", str(max(2, min(timeout, 5))),
-            "--max-time", str(timeout),
-            "-o", "/dev/null",
-            "-w", "%{time_total} %{http_code}",
-            "-x", f"socks5h://127.0.0.1:{LOCAL_PROXY_PORT}",
-            url,
-        ]
-        try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 2)
-        except Exception as exc:
-            errors.append(f"{url}: 连通性异常 {exc}")
-            continue
-        parts = res.stdout.strip().split()
-        http_code = parts[1] if len(parts) >= 2 else "000"
-        if res.returncode == 0 and http_code in {"200", "204", "301", "302", "403"}:
-            latency_ms = int(float(parts[0]) * 1000) if parts else 0
-            return {"ok": True, "ip": "未知", "latency_ms": latency_ms, "check_url": url, "ip_lookup_failed": True}
-        stderr = (res.stderr or "").strip()
-        errors.append(f"{url}: code={res.returncode}, http={http_code}, err={stderr or '-'}")
-    return {"ok": False, "error": "代理连通性检测失败，IP回显与普通网页目标均不可用: " + " | ".join(errors[-4:])}
+    return {"ok": False, "error": "出口连接测试失败，所有检测目标均不可用: " + " | ".join(errors[-3:])}
 
 def background_proxy_checker() -> None:
     time.sleep(2)

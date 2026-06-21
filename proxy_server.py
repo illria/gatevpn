@@ -7,9 +7,6 @@ import urllib.parse
 import time
 from typing import Any
 
-SOCKET_MARK = 100
-SO_MARK = getattr(socket, "SO_MARK", 36)
-
 def parse_int(value: Any) -> int:
     try:
         return int(value)
@@ -52,10 +49,6 @@ def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.settimeout(timeout)
-        try:
-            sock.setsockopt(socket.SOL_SOCKET, SO_MARK, SOCKET_MARK)
-        except OSError:
-            pass
         try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"tun0")
         except OSError:
@@ -133,10 +126,6 @@ def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.s
         try:
             sock = socket.socket(af, socktype, proto)
             sock.settimeout(timeout)
-            try:
-                sock.setsockopt(socket.SOL_SOCKET, SO_MARK, SOCKET_MARK)
-            except OSError:
-                pass
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"tun0")
             sock.connect(sa)
             return sock
