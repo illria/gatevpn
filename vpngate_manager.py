@@ -1258,7 +1258,11 @@ def parse_vpnbook_servers(page_text: str) -> list[dict[str, str]]:
 
 def looks_like_openvpn_config(text: str) -> bool:
     lower = (text or "").lower()
-    return "client" in lower[:800] and "remote" in lower and ("<ca>" in lower or "-----begin certificate-----" in lower)
+    has_remote = re.search(r"(?m)^\s*remote\s+\S+\s+\d+", lower) is not None
+    has_tunnel = re.search(r"(?m)^\s*dev\s+(tun|tap)\b", lower) is not None
+    has_proto = re.search(r"(?m)^\s*proto\s+(tcp|udp)\b", lower) is not None
+    has_cert = "<ca>" in lower or "-----begin certificate-----" in lower
+    return has_remote and has_cert and ("client" in lower[:1200] or (has_tunnel and has_proto))
 
 def sanitize_openvpn_config_for_eianun(config_text: str) -> str:
     """Remove local OpenVPN directives that can hijack the VPS default route or run scripts.
