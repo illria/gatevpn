@@ -125,8 +125,20 @@ AUTO_SWITCH_MIN_LATENCY_DELTA_MS = int(os.environ.get("AUTO_SWITCH_MIN_LATENCY_D
 AUTO_SELECT_ALLOW_ACTIVE_SWITCH = os.environ.get("AUTO_SELECT_ALLOW_ACTIVE_SWITCH", "0").strip().lower() in {"1", "true", "yes", "on"}
 # 代理健康检查保护：OpenVPN 刚建立后，tun0/策略路由/本地代理有短暂稳定期。
 # 在保护期内或连续失败次数未达到阈值时，不会把当前节点判死并强制断开，避免“已连接 -> 立即清理 -> 反复重连”。
-PROXY_FAIL_GRACE_SECONDS = int(os.environ.get("PROXY_FAIL_GRACE_SECONDS", "75"))
-PROXY_FAIL_AUTO_SWITCH_THRESHOLD = max(1, int(os.environ.get("PROXY_FAIL_AUTO_SWITCH_THRESHOLD", "3")))
+PROXY_FAIL_GRACE_SECONDS = int(os.environ.get("PROXY_FAIL_GRACE_SECONDS", "120"))
+PROXY_FAIL_AUTO_SWITCH_THRESHOLD = max(1, int(os.environ.get("PROXY_FAIL_AUTO_SWITCH_THRESHOLD", "5")))
+PROXY_HEALTH_CHECK_URLS = [
+    url.strip()
+    for url in re.split(
+        r"[,，\s]+",
+        os.environ.get(
+            "PROXY_HEALTH_CHECK_URLS",
+            "https://api.ipify.org,http://api.ipify.org,https://ifconfig.me/ip,https://icanhazip.com,http://ip.sb",
+        ),
+    )
+    if url.strip()
+]
+PROXY_HEALTH_CHECK_TIMEOUT_SECONDS = max(3, int(os.environ.get("PROXY_HEALTH_CHECK_TIMEOUT_SECONDS", "8")))
 AUTO_SWITCH_RETRY_COOLDOWN_SECONDS = max(10, int(os.environ.get("AUTO_SWITCH_RETRY_COOLDOWN_SECONDS", "45")))
 # 出口检测失败后，短时间内不要再把同一个节点放回自动候选池。
 # 这可以避免 A 出口失败 -> B 出口失败 -> 又回到 A 的来回横跳。
@@ -658,10 +670,24 @@ def node_detection_quality_key(node: dict[str, Any]) -> tuple[int, int, int, int
         data_rank,
     )
 
-def node_candidate_score_key(node: dict[str, Any]) -> tuple[int, int, int, int, int, int, int, int, int, int]:
-    """Automatic node choice: IP category first, clean/risk state second, latency third."""
+def node_severe_risk_rank(node: dict[str, Any]) -> int:
+    """Lower is better. Keep clearly risky IPs out of the front of the candidate pool."""
+    if parse_int(node.get("blacklist_count")) > 0:
+        return 2
+    risk_level = str(node.get("risk_level") or "unknown").lower()
+    if risk_level in {"high", "blocked"}:
+        return 2
+    if risk_level == "medium":
+        return 1
+    if node_fraud_score(node, unknown=65) > max(50, MAX_AUTO_FRAUD_SCORE):
+        return 1
+    return 0
+
+def node_candidate_score_key(node: dict[str, Any]) -> tuple[int, int, int, int, int, int, int, int, int, int, int]:
+    """Automatic node choice: avoid severe risk, then IP category, risk/test quality, latency."""
     quality_key = node_detection_quality_key(node)
     return (
+        node_severe_risk_rank(node),
         node_ip_priority_rank(node),
         *quality_key,
         parse_int(node.get("latency_ms")) or 999999,
@@ -669,11 +695,11 @@ def node_candidate_score_key(node: dict[str, Any]) -> tuple[int, int, int, int, 
         -parse_int(node.get("score")),
     )
 
-def node_sort_key(node: dict[str, Any]) -> tuple[int, int, int, int, int, int, int, int, int, int]:
+def node_sort_key(node: dict[str, Any]) -> tuple[int, int, int, int, int, int, int, int, int, int, int]:
     return node_candidate_score_key(node)
 
-def node_auto_fallback_key(node: dict[str, Any]) -> tuple[int, int, int, int, int, int, int, int, int, int]:
-    """Lower is better for failover. Same policy: IP type -> risk/test quality -> latency."""
+def node_auto_fallback_key(node: dict[str, Any]) -> tuple[int, int, int, int, int, int, int, int, int, int, int]:
+    """Lower is better for failover. Same policy: severe risk -> IP type -> quality -> latency."""
     return node_candidate_score_key(node)
 
 DEFAULT_IP_TYPE_FALLBACK_ORDER = ["residential", "mobile", "normal", "hosting", "proxy", "tor"]
@@ -1121,6 +1147,8 @@ def get_state() -> dict[str, Any]:
     state["failed_nodes_quarantined"] = len(failed_nodes_state) if isinstance(failed_nodes_state, dict) else 0
     state["proxy_fail_grace_seconds"] = PROXY_FAIL_GRACE_SECONDS
     state["proxy_fail_auto_switch_threshold"] = PROXY_FAIL_AUTO_SWITCH_THRESHOLD
+    state["proxy_health_check_urls"] = PROXY_HEALTH_CHECK_URLS
+    state["proxy_health_check_timeout_seconds"] = PROXY_HEALTH_CHECK_TIMEOUT_SECONDS
     state["auto_switch_retry_cooldown_seconds"] = AUTO_SWITCH_RETRY_COOLDOWN_SECONDS
     state["failed_node_quarantine_seconds"] = FAILED_NODE_QUARANTINE_SECONDS
     state["auto_switch_max_chain_attempts"] = AUTO_SWITCH_MAX_CHAIN_ATTEMPTS
@@ -5518,44 +5546,36 @@ def check_proxy_health() -> dict[str, Any]:
             "error": "VPN 虚拟网卡 (tun0) 未启用，请确保当前已成功连接 VPN 节点"
         }
 
-    # 3. 使用 curl 通过本地 SOCKS5 代理接口测试 IP 与实际延迟
-    cmd = [
-        "curl", "-4", "-s",
-        "-w", "\n%{time_total} %{http_code}",
-        "-x", f"socks5h://127.0.0.1:{LOCAL_PROXY_PORT}",
-        "http://ip.sb",
-        "--max-time", "5"
-    ]
-    try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=6)
-        if res.returncode == 0:
-            lines = res.stdout.strip().splitlines()
-            if len(lines) >= 2:
-                ip = lines[0].strip()
-                time_info = lines[1].strip().split()
-                if len(time_info) == 2:
-                    total_time_str, http_code = time_info
-                    if http_code == "200" and is_valid_ip_text(ip):
-                        latency_ms = int(float(total_time_str) * 1000)
-                        return {"ok": True, "ip": ip, "latency_ms": latency_ms}
-        
-        # 如果 ip.sb 失败，使用备用地址 http://api.ipify.org
-        cmd[7] = "http://api.ipify.org"
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=6)
-        if res.returncode == 0:
-            lines = res.stdout.strip().splitlines()
-            if len(lines) >= 2:
-                ip = lines[0].strip()
-                time_info = lines[1].strip().split()
-                if len(time_info) == 2:
-                    total_time_str, http_code = time_info
-                    if http_code == "200" and is_valid_ip_text(ip):
-                        latency_ms = int(float(total_time_str) * 1000)
-                        return {"ok": True, "ip": ip, "latency_ms": latency_ms}
-                        
-        return {"ok": False, "error": f"出口连接测试失败 (curl 返回码: {res.returncode}, stderr: {res.stderr.strip()})"}
-    except Exception as e:
-        return {"ok": False, "error": f"出口连接测试异常: {e}"}
+    # 3. 使用多个公网 IP 回显服务测试代理出口，避免单个站点超时造成误判。
+    errors: list[str] = []
+    timeout = PROXY_HEALTH_CHECK_TIMEOUT_SECONDS
+    for url in PROXY_HEALTH_CHECK_URLS:
+        cmd = [
+            "curl", "-4", "-sS",
+            "--connect-timeout", str(max(2, min(timeout, 5))),
+            "--max-time", str(timeout),
+            "-w", "\n%{time_total} %{http_code}",
+            "-x", f"socks5h://127.0.0.1:{LOCAL_PROXY_PORT}",
+            url,
+        ]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 2)
+        except Exception as exc:
+            errors.append(f"{url}: 异常 {exc}")
+            continue
+        lines = res.stdout.strip().splitlines()
+        if res.returncode == 0 and len(lines) >= 2:
+            ip = lines[0].strip()
+            time_info = lines[-1].strip().split()
+            if len(time_info) == 2:
+                total_time_str, http_code = time_info
+                if http_code == "200" and is_valid_ip_text(ip):
+                    latency_ms = int(float(total_time_str) * 1000)
+                    return {"ok": True, "ip": ip, "latency_ms": latency_ms, "check_url": url}
+        stderr = (res.stderr or "").strip()
+        stdout_head = " ".join(lines[:2])[:120]
+        errors.append(f"{url}: code={res.returncode}, out={stdout_head or '-'}, err={stderr or '-'}")
+    return {"ok": False, "error": "出口连接测试失败，所有检测目标均不可用: " + " | ".join(errors[-3:])}
 
 def background_proxy_checker() -> None:
     time.sleep(2)
@@ -5581,9 +5601,10 @@ def background_proxy_checker() -> None:
             else:
                 error_msg = res.get("error", "未知错误")
                 state = read_json(STATE_FILE, {})
-                fail_count = int(state.get("proxy_fail_count") or 0) + 1
                 connected_at = float(state.get("active_connected_at") or 0)
                 in_grace = connected_at and time.time() - connected_at < PROXY_FAIL_GRACE_SECONDS
+                previous_fail_count = int(state.get("proxy_fail_count") or 0)
+                fail_count = previous_fail_count if in_grace else previous_fail_count + 1
                 print(f"[警告] 7928 端口本地代理当前不可用！第 {fail_count}/{PROXY_FAIL_AUTO_SWITCH_THRESHOLD} 次，原因: {error_msg}", flush=True)
                 log_to_json("WARNING", "Proxy", f"代理不可用({fail_count}/{PROXY_FAIL_AUTO_SWITCH_THRESHOLD}): {error_msg}")
                 set_state(
