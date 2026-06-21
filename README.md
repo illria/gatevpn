@@ -1,11 +1,11 @@
 # Eianun免费聚合落地IP 🌐
 
-基于 VPNGate / VPNBook / IPSpeed / Vpngate-Scraper + OpenVPN 的 Linux VPS 出站代理网关，新增多来源节点拉取、指定地区拉取、同地区故障转移、IP 类型优先级、非中断检测与自动兜底。
+基于 VPNGate / VPNBook / IPSpeed + OpenVPN 的 Linux VPS 出站代理网关，新增多来源节点拉取、指定地区拉取、同地区故障转移、IP 类型优先级、非中断检测与自动兜底。
 
 ## 主要改动
 
 - 名称 **Eianun免费聚合落地IP**。
-- 新增多节点来源：默认同时拉取 **VPNGate + VPNBook + IPSpeed + Vpngate-Scraper**；也可在面板里切换为任意单一或组合来源。
+- 新增多节点来源：默认同时拉取 **VPNGate + VPNBook + IPSpeed**；也可在面板里切换为任意单一或组合来源。
 - VPNBook 来源默认只抓取节点、不参与启动阶段批量 OpenVPN 检测，避免部分 VPS 因 VPNBook 节点握手/路由推送导致 SSH 卡死。
 - 新增后端节点地区过滤：可只保留指定国家/地区节点，不再默认把全部地区节点都写入节点池。
 - Web 管理后台“管理员设置”新增 **节点来源** 和 **拉取地区过滤** 配置。
@@ -65,7 +65,7 @@ RHEL / CentOS / Rocky / AlmaLinux 等系统会尝试自动安装 `epel-release`�
 默认来源为：
 
 ```text
-vpngate,vpnbook,ipspeed,vpngate_scraper
+vpngate,vpnbook
 ```
 
 可以在 Web 管理后台修改：
@@ -83,8 +83,8 @@ en source
 或写入 `/etc/default/eianun-vpngate`：
 
 ```bash
-NODE_SOURCES=vpngate,vpnbook,ipspeed,vpngate_scraper
-# 可选：vpngate / vpnbook / ipspeed / vpngate_scraper / 多个来源用逗号组合
+NODE_SOURCES=vpngate,vpnbook
+# 可选：vpngate / vpnbook / vpngate,vpnbook
 ```
 
 VPNBook 当前免费 OpenVPN 页面提供 US、CA、UK、DE、FR 等服务器，并展示通用账号密码；程序会自动抓取页面中的服务器和密码，再下载 `.ovpn` 配置。若 VPNBook 官网下载端点临时变化导致 `.ovpn` 直链失败，程序会使用公开 OpenVPN 模板替换当前服务器与协议后继续生成候选节点，避免 VPNBook 来源直接归零。
@@ -101,10 +101,6 @@ VPNBOOK_PROTOCOLS=tcp443
 ### IPSpeed 来源说明
 
 IPSpeed 来源会定时读取 `https://ipspeed.info/free-openvpn.php` 的免费 OpenVPN 列表，并下载页面中列出的 `.ovpn` 配置文件。该页面会显示更新时间、国家、配置文件、在线时长与 Ping，程序会把这些节点合并到统一节点池，再进行可用性与 IP 风控检测。
-
-### Vpngate-Scraper 来源说明
-
-Vpngate-Scraper 来源会读取 `https://github.com/fdciabdul/Vpngate-Scraper-API` 自动生成的 Markdown 节点表，并下载其中 `configs/*.ovpn` 配置文件。该列表包含 Hostname、IP、Ping、Speed、Country 和配置链接，程序会把这些节点合并到统一节点池，再进行可用性与 IP 风控检测。
 
 
 ## 指定地区拉取节点
@@ -133,7 +129,7 @@ en country
 
 ```bash
 VPNGATE_TARGET_COUNTRIES=JP,日本
-NODE_SOURCES=vpngate,vpnbook,ipspeed,vpngate_scraper
+NODE_SOURCES=vpngate,vpnbook
 # VPNBook 默认不参与批量自动检测，防止低配 VPS 卡死；需要时再手动开启
 VPNBOOK_AUTO_TEST=0
 VPNBOOK_PROTOCOLS=tcp443
@@ -161,7 +157,7 @@ TARGET_IP_TYPES=residential
 STRICT_COUNTRY_FAILOVER=0
 ```
 
-注意：VPNGate 节点由第三方志愿者提供；VPNBook 节点由 VPNBook 官网提供；IPSpeed 节点由 ipspeed.info 的免费 OpenVPN 列表提供；Vpngate-Scraper 节点由 fdciabdul/Vpngate-Scraper-API 提供。住宅/机房/代理类型识别依赖公开 IP 数据源，不能保证 100% 准确，但会作为自动切换的优先级依据。
+注意：VPNGate 节点由第三方志愿者提供；VPNBook 节点由 VPNBook 官网提供；IPSpeed 节点由 ipspeed.info 的免费 OpenVPN 列表提供。住宅/机房/代理类型识别依赖公开 IP 数据源，不能保证 100% 准确，但会作为自动切换的优先级依据。
 
 ## 常用命令
 
@@ -174,7 +170,7 @@ en logs        # 查看日志
 en web         # 修改网页绑定地址/安全后缀
 en port        # 修改网页端口
 en password    # 修改管理账号密码
-en source      # 设置节点来源：VPNGate / VPNBook / IPSpeed / Vpngate-Scraper
+en source      # 设置节点来源：VPNGate / VPNBook / IPSpeed
 en country     # 设置节点拉取地区
 en iptype      # 设置自动选择/故障转移 IP 类型，例如住宅IP
 en update      # 从 GitHub 拉取最新代码并重新安装/重启
@@ -189,7 +185,7 @@ en uninstall   # 卸载
 [ 3x-ui / Xray ]
       │ HTTP / SOCKS5
       ▼
-[ 本地代理服务器 :7928 ] --绑定 tun0--> [ OpenVPN / VPNGate / VPNBook / IPSpeed / Vpngate-Scraper 节点 ]
+[ 本地代理服务器 :7928 ] --绑定 tun0--> [ OpenVPN / VPNGate / VPNBook / IPSpeed 节点 ]
       │
       └─ SSH / Web UI 仍走物理网卡，避免 VPS 失联
 ```
