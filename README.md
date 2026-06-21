@@ -155,7 +155,7 @@ TARGET_IP_TYPES=residential
 - 如果当前国家没有住宅 IP，会继续按 `移动 IP -> 普通/未知 -> 机房 IP -> 代理 IP/Tor` 逐级兜底，尽量保持服务运行。
 - 如果你把 IP 类型设置成 `residential,mobile`，则会先找住宅，再找移动；仍然没有时继续按后续类型兜底。
 - 如果你设置成 `all`，自动切换会直接把全部类型放进综合风险/延迟排序。
-- 自动切换候选池的总排序逻辑是：先避开黑名单/high/blocked 等明显高风险 IP，再按 **IP 类别优先**（住宅优先，其次移动网、普通/未知、机房、代理/Tor），同类别内再看 **具体检测状态与 IP 质量**（可用状态、失败冷却、黑名单、风险等级、欺诈值、风控数据完整度），最后才看 **延迟**。
+- 自动切换候选池的总排序逻辑是：**IP 类别优先**（住宅优先，其次移动网、普通/未知、机房、代理/Tor），同类别内再看 **具体检测状态与 IP 质量**（可用状态、失败冷却、黑名单、风险等级、欺诈值、风控数据完整度），最后才看 **延迟**。
 - 默认开启严格同地区故障转移；如需在同地区无可用节点时允许跨地区兜底，可在环境变量中设置：
 
 ```bash
@@ -171,13 +171,8 @@ STRICT_COUNTRY_FAILOVER=0
 可选环境变量：
 
 ```bash
-# 出口连续失败几次后触发自动切换，默认 5；连接保护期内失败不计数
-PROXY_FAIL_AUTO_SWITCH_THRESHOLD=5
-PROXY_FAIL_GRACE_SECONDS=120
-
-# 多个出口检测目标，避免单个 IP 查询站超时造成误判
-PROXY_HEALTH_CHECK_URLS=https://api.ipify.org,http://api.ipify.org,https://ifconfig.me/ip,https://icanhazip.com,http://ip.sb
-PROXY_HEALTH_CHECK_TIMEOUT_SECONDS=8
+# 出口连续失败几次后触发自动切换，默认 3
+PROXY_FAIL_AUTO_SWITCH_THRESHOLD=3
 
 # 节点出口失败后的临时隔离时间，默认沿用 INVALID_BACKOFF_SECONDS，即 30 分钟
 FAILED_NODE_QUARANTINE_SECONDS=1800
