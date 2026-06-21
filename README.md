@@ -164,8 +164,8 @@ STRICT_COUNTRY_FAILOVER=0
 
 ### 出口失败与防反复横跳
 
-- OpenVPN 握手成功后会立即检测本地代理出口 IP；如果出口检测失败，会把该节点临时隔离并马上尝试下一个候选节点。
-- 运行中代理出口连续失败达到阈值后，也会把当前节点临时隔离，避免 A 节点失败切到 B、B 失败后又立刻回到 A。
+- OpenVPN 握手成功后仍按原始逻辑视为连接成功；本地代理出口检测只更新状态，不会因为一次检测超时立刻断开重连。
+- 运行中代理出口连续失败达到阈值后，才会把当前节点临时隔离，避免 A 节点失败切到 B、B 失败后又立刻回到 A。
 - 自动切换会跳过本轮已尝试节点和隔离期内的失败节点，在同地区内继续尝试 C/D 等候选；同地区没有可用节点时是否跨地区兜底由 `STRICT_COUNTRY_FAILOVER` 控制。
 
 可选环境变量：
@@ -179,11 +179,6 @@ FAILED_NODE_QUARANTINE_SECONDS=1800
 
 # 单轮自动故障转移最多尝试多少个候选节点，默认 8
 AUTO_SWITCH_MAX_CHAIN_ATTEMPTS=8
-
-# 连接成功后是否强制验证代理出口，默认开启
-PROXY_CONNECT_VERIFY_REQUIRED=1
-PROXY_CONNECT_VERIFY_ATTEMPTS=2
-PROXY_CONNECT_VERIFY_DELAY_SECONDS=3
 ```
 
 注意：VPNGate 节点由第三方志愿者提供；VPNBook 节点由 VPNBook 官网提供；IPSpeed 节点由 ipspeed.info 的免费 OpenVPN 列表提供；Vpngate-Scraper 节点由 fdciabdul/Vpngate-Scraper-API 提供。住宅/机房/代理类型识别依赖公开 IP 数据源，不能保证 100% 准确，但会作为自动切换的优先级依据。
