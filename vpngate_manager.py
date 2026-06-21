@@ -132,7 +132,8 @@ AUTO_SWITCH_RETRY_COOLDOWN_SECONDS = max(10, int(os.environ.get("AUTO_SWITCH_RET
 # 这可以避免 A 出口失败 -> B 出口失败 -> 又回到 A 的来回横跳。
 FAILED_NODE_QUARANTINE_SECONDS = max(60, int(os.environ.get("FAILED_NODE_QUARANTINE_SECONDS", str(INVALID_BACKOFF_SECONDS))))
 AUTO_SWITCH_MAX_CHAIN_ATTEMPTS = max(1, int(os.environ.get("AUTO_SWITCH_MAX_CHAIN_ATTEMPTS", "8")))
-# OpenVPN 握手成功不等于代理出口可用。默认连接后立刻验证出口，不通就快速换下一个节点。
+# OpenVPN 握手成功不等于代理出口可用。连接后只做一次软验证，不直接杀连接；
+# 后台健康检查会在连续失败达到阈值后再触发故障转移。
 PROXY_CONNECT_VERIFY_REQUIRED = os.environ.get("PROXY_CONNECT_VERIFY_REQUIRED", "1").strip().lower() not in {"0", "false", "no", "off"}
 PROXY_CONNECT_VERIFY_ATTEMPTS = max(1, int(os.environ.get("PROXY_CONNECT_VERIFY_ATTEMPTS", "2")))
 PROXY_CONNECT_VERIFY_DELAY_SECONDS = max(1, int(os.environ.get("PROXY_CONNECT_VERIFY_DELAY_SECONDS", "3")))
@@ -2578,9 +2579,42 @@ def verify_proxy_exit_after_connect(node_id: str) -> tuple[bool, dict[str, Any]]
             proxy_ip="-",
             proxy_latency_ms=0,
             proxy_error=last_result.get("error", "未知错误"),
-            last_check_message=f"节点 {node_id} OpenVPN 已连接，但出口检测失败 {attempt}/{PROXY_CONNECT_VERIFY_ATTEMPTS}，准备重试..."
+            last_check_message=f"节点 {node_id} OpenVPN 已连接，出口软验证失败 {attempt}/{PROXY_CONNECT_VERIFY_ATTEMPTS}，等待隧道稳定..."
         )
     return False, last_result
+
+def run_proxy_exit_soft_verify_background(node_id: str) -> None:
+    if not PROXY_CONNECT_VERIFY_REQUIRED:
+        return
+
+    def worker() -> None:
+        ok, res = verify_proxy_exit_after_connect(node_id)
+        with lock:
+            still_active = active_openvpn_node_id == node_id and active_openvpn_running()
+        if not still_active:
+            return
+        if ok:
+            clear_node_temporary_failure(node_id)
+            set_state(
+                proxy_ok=True,
+                proxy_ip=res["ip"],
+                proxy_latency_ms=res["latency_ms"],
+                proxy_error="",
+                proxy_fail_count=0,
+                last_check_message=f"Connected {node_id}，出口软验证通过"
+            )
+        else:
+            reason = res.get("error", "未知错误")
+            set_state(
+                proxy_ok=False,
+                proxy_ip="-",
+                proxy_latency_ms=0,
+                proxy_error=reason,
+                proxy_fail_count=0,
+                last_check_message=f"Connected {node_id}，出口软验证暂未通过；已保留连接，后台健康检查会继续确认: {reason}"
+            )
+
+    threading.Thread(target=worker, daemon=True).start()
 
 def auto_switch_node(attempt: int = 0, tried_node_ids: set[str] | None = None) -> None:
     tried_node_ids = set(tried_node_ids or set())
@@ -2762,34 +2796,6 @@ def connect_node(node_id: str, update_failover_scope: bool = True, allow_manual_
         except Exception:
             pass
         
-        set_state(last_check_message="正在测试本地代理出站联通性与出口 IP...")
-        if PROXY_CONNECT_VERIFY_REQUIRED:
-            _, res = verify_proxy_exit_after_connect(node_id)
-        else:
-            res = check_proxy_health()
-        if res["ok"]:
-            clear_node_temporary_failure(node_id)
-            set_state(
-                proxy_ok=True,
-                proxy_ip=res["ip"],
-                proxy_latency_ms=res["latency_ms"],
-                proxy_error=""
-            )
-        else:
-            reason = res.get("error", "未知错误")
-            mark_node_failed_temporarily(node_id, f"连接后出口检测失败: {reason}", status="unavailable")
-            set_state(
-                proxy_ok=False,
-                proxy_ip="-",
-                proxy_latency_ms=0,
-                proxy_error=reason,
-                proxy_fail_count=PROXY_FAIL_AUTO_SWITCH_THRESHOLD,
-                last_check_message=f"节点 {node_id} OpenVPN 已连接但出口不可用，已临时隔离并切换其他节点: {reason}"
-            )
-            stop_active_openvpn()
-            clear_active_node_flags()
-            raise RuntimeError(f"Proxy exit verification failed: {reason}")
-
         for item in nodes:
             item["active"] = item.get("id") == node_id
             if item["active"]:
@@ -2801,6 +2807,7 @@ def connect_node(node_id: str, update_failover_scope: bool = True, allow_manual_
             
         latency_str = f"{last_active_latency} ms" if last_active_latency > 0 else "检测超时"
         set_state(active_openvpn_node_id=node_id, is_connecting=False, last_check_message=f"Connected {node_id}", active_node_latency=latency_str)
+        run_proxy_exit_soft_verify_background(node_id)
         log_to_json("INFO", "VPN", f"节点 {node_id} 连接成功，出口网卡 tun0 已启用")
         return f"Connected {node_id}"
     finally:
