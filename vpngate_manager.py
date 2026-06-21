@@ -37,14 +37,22 @@ import proxy_server
 API_URL = "https://www.vpngate.net/api/iphone/"
 VPNBOOK_OPENVPN_URL = os.environ.get("VPNBOOK_OPENVPN_URL", "https://www.vpnbook.com/freevpn/openvpn")
 IPSPEED_OPENVPN_URL = os.environ.get("IPSPEED_OPENVPN_URL", "https://ipspeed.info/free-openvpn.php")
+VPNGATE_SCRAPER_README_URL = os.environ.get(
+    "VPNGATE_SCRAPER_README_URL",
+    "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/README.md",
+)
+VPNGATE_SCRAPER_BASE_URL = os.environ.get(
+    "VPNGATE_SCRAPER_BASE_URL",
+    "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/",
+)
 VPNBOOK_TEMPLATE_OVPN_URLS = os.environ.get(
     "VPNBOOK_TEMPLATE_OVPN_URLS",
     "https://raw.githubusercontent.com/Sadaqaty/VPNed-Wifi-Access-Point/refs/heads/main/vpnbook-openvpn-us16/vpnbook-us16-tcp443.ovpn"
 )
 _vpnbook_template_config_cache = ""
 NODE_SOURCES_ENV = os.environ.get("NODE_SOURCES") or os.environ.get("VPN_NODE_SOURCES") or ""
-# 默认启用 VPNGate + VPNBook；可在面板里调整为 vpngate / vpnbook / vpngate,vpnbook。
-DEFAULT_NODE_SOURCES = os.environ.get("DEFAULT_NODE_SOURCES", "vpngate,vpnbook,ipspeed")
+# 默认启用 VPNGate + VPNBook + IPSpeed + Vpngate-Scraper。
+DEFAULT_NODE_SOURCES = os.environ.get("DEFAULT_NODE_SOURCES", "vpngate,vpnbook,ipspeed,vpngate_scraper")
 # VPNBook 的免费节点经常推送较激进的路由/认证参数；默认只抓取 TCP 443，避免一次性生成太多待测节点。
 VPNBOOK_PROTOCOLS = os.environ.get("VPNBOOK_PROTOCOLS", "tcp443")
 # VPNBook 自动检测默认关闭：混合来源时只把 VPNBook 放入节点池，不在启动阶段批量跑 OpenVPN 握手。
@@ -208,7 +216,7 @@ def load_ui_config() -> dict[str, Any]:
                 data = json.loads(auth_file.read_text(encoding="utf-8"))
                 for key, val in data.items():
                     config[key] = val
-                if normalize_node_sources_input(config.get("node_sources")) == "vpngate,vpnbook" and not NODE_SOURCES_ENV:
+                if normalize_node_sources_input(config.get("node_sources")) in {"vpngate,vpnbook", "vpngate,vpnbook,ipspeed"} and not NODE_SOURCES_ENV:
                     config["node_sources"] = DEFAULT_NODE_SOURCES
                     updated = True
             except Exception:
@@ -349,6 +357,8 @@ def split_node_sources(value: Any) -> list[str]:
         "vpngate": "vpngate", "vpn_gate": "vpngate", "gate": "vpngate", "vg": "vpngate", "筑波": "vpngate",
         "vpnbook": "vpnbook", "book": "vpnbook", "vb": "vpnbook",
         "ipspeed": "ipspeed", "ip_speed": "ipspeed", "speed": "ipspeed", "is": "ipspeed",
+        "vpngate_scraper": "vpngate_scraper", "vpn_gate_scraper": "vpngate_scraper", "scraper": "vpngate_scraper",
+        "fdciabdul": "vpngate_scraper", "vpngate_scraper_api": "vpngate_scraper",
     }
     result: list[str] = []
     seen: set[str] = set()
@@ -358,13 +368,13 @@ def split_node_sources(value: Any) -> list[str]:
             continue
         canonical = aliases.get(token, token)
         if canonical in {"all", "全部", "*"}:
-            canonical = "vpngate,vpnbook,ipspeed"
+            canonical = DEFAULT_NODE_SOURCES
         for item in str(canonical).split(","):
             item = item.strip()
-            if item in {"vpngate", "vpnbook", "ipspeed"} and item not in seen:
+            if item in {"vpngate", "vpnbook", "ipspeed", "vpngate_scraper"} and item not in seen:
                 result.append(item)
                 seen.add(item)
-    return result or ["vpngate", "vpnbook", "ipspeed"]
+    return result or ["vpngate", "vpnbook", "ipspeed", "vpngate_scraper"]
 
 def normalize_node_sources_input(value: Any) -> str:
     return ",".join(split_node_sources(value))
@@ -374,7 +384,7 @@ def get_node_sources() -> list[str]:
     return split_node_sources(NODE_SOURCES_ENV or cfg.get("node_sources") or DEFAULT_NODE_SOURCES)
 
 def node_sources_display(value: Any) -> str:
-    labels = {"vpngate": "VPNGate", "vpnbook": "VPNBook", "ipspeed": "IPSpeed"}
+    labels = {"vpngate": "VPNGate", "vpnbook": "VPNBook", "ipspeed": "IPSpeed", "vpngate_scraper": "Vpngate-Scraper"}
     return " + ".join(labels.get(x, x) for x in split_node_sources(value))
 
 def get_target_countries() -> list[str]:
@@ -1044,6 +1054,14 @@ def parse_int(value: Any) -> int:
     except (TypeError, ValueError):
         return 0
 
+def is_valid_ip_text(value: Any) -> bool:
+    text = str(value or "").strip()
+    try:
+        socket.inet_aton(text)
+        return text.count(".") == 3
+    except OSError:
+        return False
+
 def resolve_ip_for_risk(host: str) -> str:
     host = str(host or "").strip()
     if not host:
@@ -1607,6 +1625,138 @@ def fetch_ipspeed_candidates(target_countries: list[str], seen_keys: set[str]) -
         log_to_json("ERROR", "IPSpeed", f"IPSpeed 节点拉取失败: {exc}")
     return candidates
 
+def parse_speed_mbps(value: Any) -> int:
+    text = str(value or "").strip()
+    match = re.search(r"([\d.]+)", text)
+    if not match:
+        return 0
+    try:
+        return int(float(match.group(1)) * 1000 * 1000)
+    except ValueError:
+        return 0
+
+def split_markdown_table_row(line: str) -> list[str]:
+    line = line.strip()
+    if not line.startswith("|") or not line.endswith("|"):
+        return []
+    return [cell.strip() for cell in line.strip("|").split("|")]
+
+def parse_vpngate_scraper_rows(readme_text: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for line in readme_text.splitlines():
+        cells = split_markdown_table_row(line)
+        if len(cells) < 6:
+            continue
+        if cells[0].lower() in {"hostname", "----------"} or set(cells[0]) <= {"-"}:
+            continue
+        host_name, ip, ping, speed, country, config_cell = cells[:6]
+        if not is_valid_ip_text(ip):
+            continue
+        link_match = re.search(r"\]\((?P<href>[^)]+\.ovpn)\)", config_cell, flags=re.I)
+        if not link_match:
+            continue
+        country_short = canonical_country_code(country) or ""
+        if not country_short:
+            href_code = re.search(r"_([A-Z]{2})\.ovpn\b", link_match.group("href"))
+            country_short = href_code.group(1) if href_code else "XX"
+        rows.append({
+            "host_name": host_name,
+            "ip": ip,
+            "ping": 0 if str(ping).strip() == "-" else parse_int(ping),
+            "speed": parse_speed_mbps(speed),
+            "country_long": country,
+            "country_short": country_short,
+            "url": urllib.parse.urljoin(VPNGATE_SCRAPER_BASE_URL, link_match.group("href").lstrip("./")),
+        })
+    return rows
+
+def vpngate_scraper_row_to_node(row: dict[str, Any], config_text: str) -> dict[str, Any]:
+    ip = str(row.get("ip") or "")
+    country_short = str(row.get("country_short") or "XX")
+    country_long = str(row.get("country_long") or country_short or "Unknown")
+    country_short, country_zh = canonicalize_country_fields(country_short, country_long)
+    text = sanitize_openvpn_config_for_eianun(config_text)
+    remote_host, remote_port, proto = vpn_utils.parse_remote(text, ip)
+    if not remote_host:
+        remote_host = ip
+    if not remote_port:
+        remote_port = 443
+    node_id = safe_name("_".join(["VGSCRAPER", country_short, ip or remote_host, str(remote_port), proto or "ovpn"]))
+    config_path = CONFIG_DIR / f"{node_id}.ovpn"
+    return {
+        "id": node_id,
+        "source": "vpngate_scraper",
+        "country": country_zh,
+        "country_short": country_short,
+        "host_name": str(row.get("host_name") or ip),
+        "auth_user": OPENVPN_AUTH_USER,
+        "auth_pass": OPENVPN_AUTH_PASS,
+        "ip": ip,
+        "score": parse_int(row.get("speed")),
+        "ping": parse_int(row.get("ping")),
+        "speed": parse_int(row.get("speed")),
+        "sessions": 0,
+        "owner": "",
+        "asn": "",
+        "as_name": "",
+        "location": "",
+        "ip_type": "",
+        "quality": "",
+        "fraud_score": 0,
+        "clean_score": 0,
+        "risk_level": "unknown",
+        "fraud_flags": [],
+        "risk_sources": [],
+        "blacklist_hits": [],
+        "blacklist_count": 0,
+        "ip_clean": False,
+        "latency_ms": 0,
+        "config_file": str(config_path),
+        "config_text": text,
+        "proto": proto,
+        "remote_host": remote_host,
+        "remote_port": remote_port,
+        "fetched_at": time.time(),
+        "probe_status": "not_checked",
+        "probe_message": "Vpngate-Scraper source; OpenVPN config fetched from fdciabdul/Vpngate-Scraper-API",
+        "probed_at": 0,
+    }
+
+def fetch_vpngate_scraper_candidates(target_countries: list[str], seen_keys: set[str]) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    target_display = normalize_target_countries_input(target_countries) or "全部地区"
+    try:
+        readme_text = http_get_bytes(VPNGATE_SCRAPER_README_URL, timeout=18, accept="text/markdown,text/plain,*/*").decode("utf-8", errors="replace")
+        rows = parse_vpngate_scraper_rows(readme_text)
+        matched = 0
+        filtered = 0
+        for row in rows:
+            country_row = {"CountryShort": row.get("country_short", ""), "CountryLong": row.get("country_long", "")}
+            if not row_matches_target_countries(country_row, target_countries):
+                filtered += 1
+                continue
+            matched += 1
+            if matched > MAX_SCAN_ROWS:
+                break
+            ip = str(row.get("ip") or "")
+            key = f"vpngate_scraper:{ip}:{row.get('url')}"
+            if not ip or key in seen_keys or ip in seen_keys:
+                continue
+            try:
+                text = http_get_bytes(str(row.get("url")), timeout=18, accept="application/x-openvpn-profile,text/plain,*/*").decode("utf-8", errors="replace")
+                if not looks_like_openvpn_config(text):
+                    log_to_json("WARNING", "Vpngate-Scraper", f"下载到的配置不像 OpenVPN 文件: {row.get('url')}")
+                    continue
+                node = vpngate_scraper_row_to_node(row, text)
+                candidates.append(node)
+                seen_keys.add(key)
+            except Exception as exc:
+                log_to_json("WARNING", "Vpngate-Scraper", f"下载 OpenVPN 配置失败 {ip}: {exc}")
+        log_to_json("INFO", "Vpngate-Scraper", f"Vpngate-Scraper 地区过滤 {target_display}: 匹配 {matched} 行，跳过 {filtered} 行，成功 {len(candidates)} 个")
+    except Exception as exc:
+        log_to_json("ERROR", "Vpngate-Scraper", f"Vpngate-Scraper 节点拉取失败: {exc}")
+    return candidates
+
 def fetch_candidates(target_override: list[str] | None = None) -> list[dict[str, Any]]:
     blacklist = load_blacklist()
     candidates: list[dict[str, Any]] = []
@@ -1624,6 +1774,8 @@ def fetch_candidates(target_override: list[str] | None = None) -> list[dict[str,
                 candidates.extend(fetch_vpnbook_candidates(target_countries, seen_keys))
             elif source == "ipspeed":
                 candidates.extend(fetch_ipspeed_candidates(target_countries, seen_keys))
+            elif source == "vpngate_scraper":
+                candidates.extend(fetch_vpngate_scraper_candidates(target_countries, seen_keys))
         except Exception as exc:
             log_to_json("ERROR", "Main", f"节点来源 {source} 拉取失败: {exc}")
         source_counts[source] = len(candidates) - before
@@ -4211,14 +4363,17 @@ INDEX_HTML = r"""<!doctype html>
           <div class="form-group" style="margin-bottom: 12px;">
             <label class="form-label" for="settings_node_sources">节点来源</label>
             <select id="settings_node_sources" class="input-field">
-              <option value="vpngate,vpnbook,ipspeed">VPNGate + VPNBook + IPSpeed（推荐）</option>
-              <option value="vpngate,ipspeed">VPNGate + IPSpeed</option>
+              <option value="vpngate,vpnbook,ipspeed,vpngate_scraper">VPNGate + VPNBook + IPSpeed + Vpngate-Scraper（推荐）</option>
+              <option value="vpngate,ipspeed,vpngate_scraper">VPNGate + IPSpeed + Vpngate-Scraper</option>
+              <option value="vpngate,vpngate_scraper">VPNGate + Vpngate-Scraper</option>
               <option value="vpngate,vpnbook">VPNGate + VPNBook</option>
+              <option value="vpngate,vpnbook,ipspeed">VPNGate + VPNBook + IPSpeed</option>
               <option value="vpngate">仅 VPNGate</option>
               <option value="vpnbook">仅 VPNBook</option>
               <option value="ipspeed">仅 IPSpeed</option>
+              <option value="vpngate_scraper">仅 Vpngate-Scraper</option>
             </select>
-            <div style="font-size: 12px; color: var(--text-secondary); margin-top: 6px; line-height: 1.4;">IPSpeed 会从 ipspeed.info 的 OpenVPN 列表读取 .ovpn 文件；VPNBook 密码会自动从官网读取。定时刷新只更新节点池，当前出口正常时不主动断线。</div>
+            <div style="font-size: 12px; color: var(--text-secondary); margin-top: 6px; line-height: 1.4;">IPSpeed 会从 ipspeed.info 的 OpenVPN 列表读取 .ovpn 文件；Vpngate-Scraper 会从 fdciabdul/Vpngate-Scraper-API 的 Markdown 列表读取配置；VPNBook 密码会自动从官网读取。定时刷新只更新节点池，当前出口正常时不主动断线。</div>
           </div>
 
           <div class="form-group" style="margin-bottom: 12px;">
@@ -4580,7 +4735,7 @@ function render(){
   const targetInfo = state.target_countries_display || state.target_countries || "全部地区";
   const ipTypeInfo = state.target_ip_types_display || "住宅IP";
   const failoverInfo = state.failover_country_display || targetInfo || "未固定";
-  const sourceInfo = state.node_sources_display || state.node_sources || "VPNGate + VPNBook + IPSpeed";
+  const sourceInfo = state.node_sources_display || state.node_sources || "VPNGate + VPNBook + IPSpeed + Vpngate-Scraper";
   $("status").innerHTML=`<span class="status-dot"></span>HTTP 代理本地接口：http://127.0.0.1:7928 | 来源：${esc(sourceInfo)} | 拉取地区：${esc(targetInfo)} | 自动IP优先级：${esc(ipTypeInfo)} | 故障转移地区：${esc(failoverInfo)} | 活动节点：${activeNodeInfo} | 状态：${statusMessage}`;
   
   // Update proxy test status card based on background checks
@@ -5084,7 +5239,7 @@ function openSettingsModal() {
     $("settings_port").value = state.port || 8787;
     $("settings_suffix").value = state.secret_path || "EJsW2EeBo9lY";
     $("settings_target_countries").value = state.target_countries || "";
-    $("settings_node_sources").value = state.node_sources || "vpngate,vpnbook,ipspeed";
+    $("settings_node_sources").value = state.node_sources || "vpngate,vpnbook,ipspeed,vpngate_scraper";
     $("settings_auto_select_allow_active_switch").value = state.auto_select_allow_active_switch ? "1" : "0";
     const ipTypeValue = state.target_ip_types || "residential";
     const legacyIpTypeMap = {
