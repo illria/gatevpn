@@ -164,7 +164,7 @@ STRICT_COUNTRY_FAILOVER=0
 
 ### 出口失败与防反复横跳
 
-- OpenVPN 握手成功后会立即做一次本地代理出口软验证；如果刚连接时出口暂时超时，会先保留连接，等待后台健康检查继续确认，避免刚连上就反复重连。
+- OpenVPN 握手成功后会立即检测本地代理出口 IP；如果出口检测失败，会把该节点临时隔离并马上尝试下一个候选节点。
 - 运行中代理出口连续失败达到阈值后，也会把当前节点临时隔离，避免 A 节点失败切到 B、B 失败后又立刻回到 A。
 - 自动切换会跳过本轮已尝试节点和隔离期内的失败节点，在同地区内继续尝试 C/D 等候选；同地区没有可用节点时是否跨地区兜底由 `STRICT_COUNTRY_FAILOVER` 控制。
 
@@ -180,7 +180,7 @@ FAILED_NODE_QUARANTINE_SECONDS=1800
 # 单轮自动故障转移最多尝试多少个候选节点，默认 8
 AUTO_SWITCH_MAX_CHAIN_ATTEMPTS=8
 
-# 连接成功后是否做出口软验证，默认开启；失败不会立刻断开，后台健康检查会继续确认
+# 连接成功后是否强制验证代理出口，默认开启
 PROXY_CONNECT_VERIFY_REQUIRED=1
 PROXY_CONNECT_VERIFY_ATTEMPTS=2
 PROXY_CONNECT_VERIFY_DELAY_SECONDS=3
