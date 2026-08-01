@@ -1,17 +1,30 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+
+import logging
+import os
+import random
 import select
 import socket
 import threading
-import urllib.parse
 import time
-from typing import Any
+import urllib.parse
+from dataclasses import dataclass
+from typing import Any, Callable
+
+
+LOG = logging.getLogger(__name__)
+TUN_INTERFACE = os.environ.get("GATEVPN_TUN_INTERFACE", "tun0")
+UDP_ASSOCIATE_IDLE_TIMEOUT = 120.0
+UDP_RELAY_SELECT_INTERVAL = 1.0
+
 
 def parse_int(value: Any) -> int:
     try:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
 
 def recv_exact(sock: socket.socket, size: int) -> bytes:
     data = b""
@@ -22,121 +35,151 @@ def recv_exact(sock: socket.socket, size: int) -> bytes:
         data += chunk
     return data
 
-def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float = 3.0) -> str | None:
+
+def bind_socket_to_interface(sock: socket.socket, interface: str = TUN_INTERFACE) -> None:
+    """Bind a socket to an interface, or raise without permitting fallback.
+
+    SO_BINDTODEVICE is Linux-specific.  Keeping this operation in one function
+    makes the fail-closed policy explicit and makes it straightforward to mock
+    in environments where tun0 or the capability is unavailable.
+    """
+
+    bind_option = getattr(socket, "SO_BINDTODEVICE", None)
+    if bind_option is None:
+        raise OSError("SO_BINDTODEVICE is not available on this platform")
+    if not interface:
+        raise OSError("The tunnel interface name is empty")
+    sock.setsockopt(socket.SOL_SOCKET, bind_option, interface.encode("ascii"))
+
+
+def _encode_dns_name(host: str) -> bytes:
+    labels = host.rstrip(".").split(".")
+    encoded = b""
+    for label in labels:
+        if not label:
+            continue
+        label_bytes = label.encode("idna")
+        if len(label_bytes) > 63:
+            raise ValueError("DNS label is too long")
+        encoded += bytes([len(label_bytes)]) + label_bytes
+    return encoded + b"\x00"
+
+
+def _skip_dns_name(packet: bytes, offset: int) -> int | None:
+    while offset < len(packet):
+        length = packet[offset]
+        if length == 0:
+            return offset + 1
+        if (length & 0xC0) == 0xC0:
+            return offset + 2 if offset + 1 < len(packet) else None
+        if length & 0xC0:
+            return None
+        offset += 1 + length
+    return None
+
+
+def resolve_dns_over_tun0(
+    host: str,
+    dns_server: str = "8.8.8.8",
+    timeout: float = 3.0,
+    interface: str = TUN_INTERFACE,
+) -> str | None:
+    """Resolve an A record through the tunnel only; never use system DNS."""
+
     try:
-        socket.inet_aton(host)
-        return host
+        return socket.inet_pton(socket.AF_INET, host) and host
     except OSError:
         pass
 
-    import random
-    tx_id = random.getrandbits(16).to_bytes(2, "big")
-    flags = b"\x01\x00"
-    questions = b"\x00\x01"
-    rrs = b"\x00\x00\x00\x00\x00\x00"
-
-    qname = b""
-    for part in host.split("."):
-        if not part:
-            continue
-        part_bytes = part.encode("idna")
-        qname += len(part_bytes).to_bytes(1, "big") + part_bytes
-    qname += b"\x00"
-
-    qtype_qclass = b"\x00\x01\x00\x01"
-    packet = tx_id + flags + questions + rrs + qname + qtype_qclass
+    try:
+        tx_id = random.getrandbits(16).to_bytes(2, "big")
+        packet = (
+            tx_id
+            + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+            + _encode_dns_name(host)
+            + b"\x00\x01\x00\x01"
+        )
+    except (UnicodeError, ValueError):
+        LOG.debug("Invalid DNS name: %s", host)
+        return None
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.settimeout(timeout)
-        try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"tun0")
-        except OSError:
-            return None
+        bind_socket_to_interface(sock, interface)
         sock.sendto(packet, (dns_server, 53))
-        resp, _ = sock.recvfrom(2048)
-    except Exception:
+        response, _ = sock.recvfrom(4096)
+    except OSError as exc:
+        LOG.debug("DNS over %s failed for %s: %s", interface, host, exc)
         return None
     finally:
         sock.close()
 
-    if len(resp) < 12:
+    if len(response) < 12 or response[:2] != tx_id:
         return None
-    if resp[:2] != tx_id:
-        return None
-
-    rcode = resp[3] & 0x0F
-    if rcode != 0:
+    if response[3] & 0x0F:
         return None
 
-    offset = 12
-    while offset < len(resp):
-        length = resp[offset]
-        if length == 0:
-            offset += 1
-            break
-        elif (length & 0xC0) == 0xC0:
-            offset += 2
-            break
-        else:
-            offset += 1 + length
-
+    offset = _skip_dns_name(response, 12)
+    if offset is None or offset + 4 > len(response):
+        return None
     offset += 4
-    answers_count = int.from_bytes(resp[6:8], "big")
-    if answers_count == 0:
-        return None
-
+    answers_count = int.from_bytes(response[6:8], "big")
     for _ in range(answers_count):
-        if offset >= len(resp):
-            break
-        while offset < len(resp):
-            length = resp[offset]
-            if length == 0:
-                offset += 1
-                break
-            elif (length & 0xC0) == 0xC0:
-                offset += 2
-                break
-            else:
-                offset += 1 + length
-        if offset + 10 > len(resp):
-            break
-        atype = int.from_bytes(resp[offset : offset + 2], "big")
-        aclass = int.from_bytes(resp[offset + 2 : offset + 4], "big")
-        rdlength = int.from_bytes(resp[offset + 8 : offset + 10], "big")
+        offset = _skip_dns_name(response, offset)
+        if offset is None or offset + 10 > len(response):
+            return None
+        record_type = int.from_bytes(response[offset : offset + 2], "big")
+        record_class = int.from_bytes(response[offset + 2 : offset + 4], "big")
+        record_length = int.from_bytes(response[offset + 8 : offset + 10], "big")
         offset += 10
-        if offset + rdlength > len(resp):
-            break
-        if atype == 1 and aclass == 1 and rdlength == 4:
-            ip_bytes = resp[offset : offset + 4]
-            return socket.inet_ntoa(ip_bytes)
-        offset += rdlength
+        if offset + record_length > len(response):
+            return None
+        if record_type == 1 and record_class == 1 and record_length == 4:
+            return socket.inet_ntop(socket.AF_INET, response[offset : offset + 4])
+        offset += record_length
     return None
 
-def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.socket:
+
+def create_connection(
+    address: tuple[str, int],
+    timeout: float = 20,
+    interface: str = TUN_INTERFACE,
+) -> socket.socket:
     host, port = address
-    resolved_ip = resolve_dns_over_tun0(host)
+    resolved_ip = resolve_dns_over_tun0(host, interface=interface)
     if resolved_ip:
         host = resolved_ip
+    else:
+        # Do not let getaddrinfo perform an implicit system-DNS lookup after
+        # the tunnel-only resolver failed.  Literal IPv6 remains usable for
+        # the existing TCP CONNECT path, but hostnames fail closed.
+        try:
+            socket.inet_pton(socket.AF_INET, host)
+        except OSError:
+            try:
+                socket.inet_pton(socket.AF_INET6, host)
+            except OSError as exc:
+                raise OSError(f"DNS resolution over {interface} failed for {host}") from exc
 
     err = None
     for res in socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM):
-        af, socktype, proto, canonname, sa = res
+        af, socktype, proto, _canonname, sockaddr = res
         sock = None
         try:
             sock = socket.socket(af, socktype, proto)
             sock.settimeout(timeout)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"tun0")
-            sock.connect(sa)
+            bind_socket_to_interface(sock, interface)
+            sock.connect(sockaddr)
             return sock
-        except OSError as e:
-            err = e
+        except OSError as exc:
+            err = exc
             if sock is not None:
                 sock.close()
     if err is not None:
         raise err
-    else:
-        raise OSError("getaddrinfo returns empty list")
+    raise OSError("getaddrinfo returns empty list")
+
 
 def relay(left: socket.socket, right: socket.socket) -> None:
     sockets = [left, right]
@@ -151,40 +194,336 @@ def relay(left: socket.socket, right: socket.socket) -> None:
                 return
             target.sendall(data)
 
-def socks5_client(client: socket.socket, first_byte: bytes) -> None:
-    upstream = None
+
+def _socks5_reply(
+    reply: int,
+    address_type: int = 1,
+    address: str = "0.0.0.0",
+    port: int = 0,
+) -> bytes:
+    if address_type == 1:
+        address_bytes = socket.inet_pton(socket.AF_INET, address)
+    elif address_type == 4:
+        address_bytes = socket.inet_pton(socket.AF_INET6, address)
+    else:
+        raise ValueError("SOCKS5 replies only use IPv4 or IPv6 addresses")
+    return b"\x05" + bytes([reply, 0, address_type]) + address_bytes + port.to_bytes(2, "big")
+
+
+@dataclass(frozen=True)
+class SOCKS5Address:
+    address_type: int
+    host: str
+    port: int
+
+
+class SOCKS5RequestError(ValueError):
+    def __init__(self, reply_code: int, message: str):
+        super().__init__(message)
+        self.reply_code = reply_code
+
+
+def read_socks5_address(client: socket.socket, address_type: int) -> SOCKS5Address:
+    """Consume an RFC 1928 address and port from a SOCKS5 control stream."""
+
     try:
-        methods_count = recv_exact(client, 1)[0]
-        recv_exact(client, methods_count)
-        client.sendall(b"\x05\x00")
-        version, command, _, address_type = recv_exact(client, 4)
-        if version != 5 or command != 1:
-            client.sendall(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")
-            return
         if address_type == 1:
-            host = socket.inet_ntoa(recv_exact(client, 4))
+            host = socket.inet_ntop(socket.AF_INET, recv_exact(client, 4))
         elif address_type == 3:
-            host = recv_exact(client, recv_exact(client, 1)[0]).decode("idna")
+            name_length = recv_exact(client, 1)[0]
+            if name_length == 0:
+                raise SOCKS5RequestError(8, "SOCKS5 domain name is empty")
+            host = recv_exact(client, name_length).decode("idna")
         elif address_type == 4:
             host = socket.inet_ntop(socket.AF_INET6, recv_exact(client, 16))
         else:
-            client.sendall(b"\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00")
-            return
+            raise SOCKS5RequestError(8, f"Unsupported SOCKS5 address type: {address_type}")
         port = int.from_bytes(recv_exact(client, 2), "big")
+    except UnicodeError as exc:
+        raise SOCKS5RequestError(8, "Invalid SOCKS5 domain name") from exc
+    except ConnectionError:
+        raise
+    except OSError as exc:
+        raise SOCKS5RequestError(8, "Invalid SOCKS5 address") from exc
+    return SOCKS5Address(address_type, host, port)
+
+
+@dataclass(frozen=True)
+class UDPRequest:
+    address_type: int
+    host: str
+    port: int
+    data: bytes
+
+
+class UDPHeaderError(ValueError):
+    pass
+
+
+class UnsupportedUDPAddressType(UDPHeaderError):
+    pass
+
+
+def parse_udp_request(packet: bytes) -> UDPRequest:
+    """Parse an RFC 1928 UDP request without resolving its destination."""
+
+    if len(packet) < 4:
+        raise UDPHeaderError("UDP request is shorter than the SOCKS5 header")
+    if packet[:2] != b"\x00\x00":
+        raise UDPHeaderError("SOCKS5 UDP RSV must be zero")
+    if packet[2] != 0:
+        raise UDPHeaderError("SOCKS5 UDP fragmentation is not supported")
+
+    address_type = packet[3]
+    offset = 4
+    if address_type == 1:
+        if len(packet) < offset + 4:
+            raise UDPHeaderError("Truncated IPv4 destination")
+        host = socket.inet_ntop(socket.AF_INET, packet[offset : offset + 4])
+        offset += 4
+    elif address_type == 3:
+        if len(packet) < offset + 1:
+            raise UDPHeaderError("Truncated domain destination length")
+        name_length = packet[offset]
+        offset += 1
+        if name_length == 0 or len(packet) < offset + name_length:
+            raise UDPHeaderError("Truncated domain destination")
         try:
-            upstream = create_connection((host, port), timeout=20)
+            host = packet[offset : offset + name_length].decode("idna")
+        except UnicodeError as exc:
+            raise UDPHeaderError("Invalid domain destination") from exc
+        offset += name_length
+    elif address_type == 4:
+        raise UnsupportedUDPAddressType("IPv6 UDP destinations are not supported")
+    else:
+        raise UnsupportedUDPAddressType(f"Unsupported UDP address type: {address_type}")
+
+    if len(packet) < offset + 2:
+        raise UDPHeaderError("Truncated UDP destination port")
+    port = int.from_bytes(packet[offset : offset + 2], "big")
+    return UDPRequest(address_type, host, port, packet[offset + 2 :])
+
+
+def encode_udp_response(source: tuple[str, int], data: bytes) -> bytes:
+    """Encode a remote IPv4 source address in an RFC 1928 UDP response."""
+
+    host, port = source[:2]
+    address = socket.inet_pton(socket.AF_INET, host)
+    return b"\x00\x00\x00\x01" + address + port.to_bytes(2, "big") + data
+
+
+def _client_ip(client: socket.socket, address: tuple[str, int]) -> str:
+    try:
+        peer = client.getpeername()
+        if isinstance(peer, tuple) and peer:
+            return peer[0]
+    except (IndexError, OSError, TypeError):
+        pass
+    try:
+        return address[0]
+    except (IndexError, TypeError):
+        return ""
+
+
+def _same_udp_endpoint(left: tuple[str, int], right: tuple[str, int]) -> bool:
+    return left[0] == right[0] and left[1] == right[1]
+
+
+def _validate_udp_associate_endpoint(
+    requested: SOCKS5Address,
+    client: socket.socket,
+    client_address: tuple[str, int],
+) -> tuple[str, int] | None:
+    """Validate the UDP ASSOCIATE client address without widening access."""
+
+    if requested.address_type != 1:
+        raise SOCKS5RequestError(2, "UDP ASSOCIATE requires an IPv4 client address")
+    allowed_ip = _client_ip(client, client_address)
+    if requested.host == "0.0.0.0" and requested.port == 0:
+        return None
+    if requested.host not in {"0.0.0.0", allowed_ip}:
+        raise SOCKS5RequestError(2, "UDP ASSOCIATE client address does not match control peer")
+    if requested.port == 0:
+        return None
+    return allowed_ip, requested.port
+
+
+def udp_associate(
+    client: socket.socket,
+    client_address: tuple[str, int],
+    interface: str = TUN_INTERFACE,
+    idle_timeout: float = UDP_ASSOCIATE_IDLE_TIMEOUT,
+    requested_endpoint: tuple[str, int] | None = None,
+    socket_factory: Callable[..., socket.socket] = socket.socket,
+) -> None:
+    """Run one UDP association until control disconnect, timeout, or failure."""
+
+    client_relay = None
+    upstream = None
+    try:
+        client_relay = socket_factory(socket.AF_INET, socket.SOCK_DGRAM)
+        client_relay.bind(("127.0.0.1", 0))
+
+        upstream = socket_factory(socket.AF_INET, socket.SOCK_DGRAM)
+        # This is deliberately before any send.  A failure terminates the
+        # association; there is no unbound/default-route fallback.
+        bind_socket_to_interface(upstream, interface)
+        upstream.bind(("0.0.0.0", 0))
+
+        relay_host, relay_port = client_relay.getsockname()[:2]
+        client.sendall(_socks5_reply(0, 1, relay_host, relay_port))
+        allowed_ip = _client_ip(client, client_address)
+        locked_endpoint: tuple[str, int] | None = None
+        last_activity = time.monotonic()
+        visited_udp_destinations: set[tuple[str, int]] = set()
+        control_open = True
+
+        while control_open:
+            remaining = idle_timeout - (time.monotonic() - last_activity)
+            if remaining <= 0:
+                LOG.debug("SOCKS5 UDP association idle timeout for %s", allowed_ip)
+                return
+            readable, _, errored = select.select(
+                [client, client_relay, upstream],
+                [],
+                [client, client_relay, upstream],
+                min(remaining, UDP_RELAY_SELECT_INTERVAL),
+            )
+            if errored:
+                LOG.error("SOCKS5 UDP association socket error; stopping fail-closed")
+                return
+            if client in readable:
+                try:
+                    if not client.recv(1, socket.MSG_PEEK):
+                        return
+                    LOG.debug("Unexpected data on SOCKS5 UDP control connection")
+                    return
+                except (BlockingIOError, ConnectionError, OSError):
+                    return
+
+            if client_relay in readable:
+                packet, source = client_relay.recvfrom(65535)
+                source_endpoint = (source[0], source[1])
+                if source_endpoint[0] != allowed_ip:
+                    LOG.debug("Dropped UDP packet from unauthorized client %s", source_endpoint)
+                    continue
+                if requested_endpoint is not None and not _same_udp_endpoint(requested_endpoint, source_endpoint):
+                    LOG.debug("Dropped UDP packet outside requested client endpoint %s", source_endpoint)
+                    continue
+                if locked_endpoint is not None and not _same_udp_endpoint(locked_endpoint, source_endpoint):
+                    LOG.debug("Dropped UDP packet from unlocked client endpoint %s", source_endpoint)
+                    continue
+                try:
+                    request = parse_udp_request(packet)
+                except UDPHeaderError as exc:
+                    LOG.debug("Dropped malformed SOCKS5 UDP request: %s", exc)
+                    continue
+                if locked_endpoint is None:
+                    locked_endpoint = source_endpoint
+
+                destination = request.host
+                if request.address_type == 3:
+                    destination = resolve_dns_over_tun0(destination, interface=interface) or ""
+                    if not destination:
+                        LOG.error("UDP DNS resolution failed over %s; dropping datagram", interface)
+                        continue
+                try:
+                    # The only public UDP socket is the interface-bound one.
+                    upstream.sendto(request.data, (destination, request.port))
+                except OSError as exc:
+                    LOG.error("UDP send over %s failed; stopping fail-closed: %s", interface, exc)
+                    return
+                visited_udp_destinations.add((destination, request.port))
+                last_activity = time.monotonic()
+
+            if upstream in readable:
+                response, source = upstream.recvfrom(65535)
+                if locked_endpoint is None:
+                    LOG.debug("Dropped unsolicited UDP response before client lock")
+                    continue
+                source_endpoint = (source[0], source[1])
+                if source_endpoint not in visited_udp_destinations:
+                    LOG.debug("Dropped UDP response from unvisited remote source %s", source_endpoint)
+                    continue
+                try:
+                    client_relay.sendto(encode_udp_response(source_endpoint, response), locked_endpoint)
+                except OSError as exc:
+                    LOG.debug("Unable to return UDP response to local client: %s", exc)
+                    return
+                last_activity = time.monotonic()
+    except OSError as exc:
+        LOG.error("SOCKS5 UDP association failed on %s; stopping fail-closed: %s", interface, exc)
+        try:
+            client.sendall(_socks5_reply(1))
+        except OSError:
+            pass
+    finally:
+        for sock in (client_relay, upstream):
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+
+def socks5_client(
+    client: socket.socket,
+    first_byte: bytes,
+    client_address: tuple[str, int] = ("127.0.0.1", 0),
+) -> None:
+    upstream = None
+    try:
+        methods_count = recv_exact(client, 1)[0]
+        methods = recv_exact(client, methods_count)
+        if 0 not in methods:
+            client.sendall(b"\x05\xff")
+            return
+        client.sendall(b"\x05\x00")
+        version, command, _, address_type = recv_exact(client, 4)
+        if version != 5:
+            return
+
+        try:
+            requested_address = read_socks5_address(client, address_type)
+        except SOCKS5RequestError as exc:
+            client.sendall(_socks5_reply(exc.reply_code))
+            return
+        except (ConnectionError, OSError):
+            try:
+                client.sendall(_socks5_reply(1))
+            except OSError:
+                pass
+            return
+
+        if command == 3:
+            try:
+                requested_endpoint = _validate_udp_associate_endpoint(
+                    requested_address, client, client_address
+                )
+            except SOCKS5RequestError as exc:
+                client.sendall(_socks5_reply(exc.reply_code))
+                return
+            udp_associate(client, client_address, requested_endpoint=requested_endpoint)
+            return
+        if command != 1:
+            client.sendall(_socks5_reply(7))
+            return
+
+        try:
+            upstream = create_connection((requested_address.host, requested_address.port), timeout=20)
         except Exception:
             try:
-                client.sendall(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")
+                client.sendall(_socks5_reply(4))
             except OSError:
                 pass
             raise
-        client.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+        client.sendall(_socks5_reply(0))
         relay(client, upstream)
     finally:
         client.close()
         if upstream:
             upstream.close()
+
 
 def read_http_header(client: socket.socket, first_byte: bytes) -> bytes:
     data = first_byte
@@ -194,6 +533,7 @@ def read_http_header(client: socket.socket, first_byte: bytes) -> bytes:
             break
         data += chunk
     return data
+
 
 def http_client(client: socket.socket, first_byte: bytes) -> None:
     upstream = None
@@ -233,12 +573,13 @@ def http_client(client: socket.socket, first_byte: bytes) -> None:
         if upstream:
             upstream.close()
 
+
 def proxy_client(client: socket.socket, address: tuple[str, int]) -> None:
     try:
         client.settimeout(30)
         first = recv_exact(client, 1)
         if first == b"\x05":
-            socks5_client(client, first)
+            socks5_client(client, first, address)
         else:
             http_client(client, first)
     except Exception:
@@ -247,13 +588,18 @@ def proxy_client(client: socket.socket, address: tuple[str, int]) -> None:
         except OSError:
             pass
 
+
 def start_proxy_server(host: str, port: int) -> None:
     try:
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind((host, port))
         server.listen(256)
-        print(f"HTTP/SOCKS5 proxy listening on {host}:{port}", flush=True)
+        print("HTTP proxy: TCP only", flush=True)
+        print("SOCKS5 proxy: TCP CONNECT + UDP ASSOCIATE", flush=True)
+        print(f"TCP control listener: {host}:{port}", flush=True)
+        print(f"UDP upstream interface: {TUN_INTERFACE}", flush=True)
+        print("UDP policy: fail closed, no default-route fallback", flush=True)
     except Exception as e:
         print(f"[ERROR] Failed to start HTTP/SOCKS5 proxy on {host}:{port}: {e}", flush=True)
         return
