@@ -34,6 +34,23 @@ def read_socks5_address(sock: socket.socket) -> tuple[str, int]:
     return host, int.from_bytes(recv_exact(sock, 2), "big")
 
 
+def parse_socks5_udp_response(packet: bytes) -> tuple[tuple[str, int], bytes]:
+    """Remove the RFC 1928 UDP response header and return source plus payload."""
+
+    if len(packet) < 4:
+        raise RuntimeError("Truncated SOCKS5 UDP response header")
+    if packet[:2] != b"\x00\x00":
+        raise RuntimeError("SOCKS5 UDP response RSV must be zero")
+    if packet[2] != 0:
+        raise RuntimeError("SOCKS5 UDP response fragmentation is not supported")
+    if packet[3] != 1:
+        raise RuntimeError("SOCKS5 UDP response source must use IPv4 ATYP")
+    if len(packet) < 10:
+        raise RuntimeError("Truncated SOCKS5 UDP IPv4 response header")
+    source = (socket.inet_ntop(socket.AF_INET, packet[4:8]), int.from_bytes(packet[8:10], "big"))
+    return source, packet[10:]
+
+
 def build_stun_binding_request() -> tuple[bytes, bytes]:
     transaction_id = secrets.token_bytes(12)
     # Binding Request, zero attributes, RFC 5389 magic cookie.
@@ -88,7 +105,8 @@ def run(args: argparse.Namespace) -> int:
         packet = b"\x00\x00\x00\x03" + bytes([len(domain_bytes)]) + domain_bytes + args.stun_port.to_bytes(2, "big") + stun_request
         udp.sendto(packet, (relay_host, relay_port))
         response, _ = udp.recvfrom(65535)
-        public_ip, public_port = parse_xor_mapped_address(response, transaction_id)
+        _remote_source, stun_payload = parse_socks5_udp_response(response)
+        public_ip, public_port = parse_xor_mapped_address(stun_payload, transaction_id)
         print(f"Detected public UDP endpoint: {public_ip}:{public_port}")
         print("Compare this IP with the current OpenVPN/tun0 egress IP.")
         return 0

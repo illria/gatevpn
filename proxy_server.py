@@ -211,6 +211,44 @@ def _socks5_reply(
 
 
 @dataclass(frozen=True)
+class SOCKS5Address:
+    address_type: int
+    host: str
+    port: int
+
+
+class SOCKS5RequestError(ValueError):
+    def __init__(self, reply_code: int, message: str):
+        super().__init__(message)
+        self.reply_code = reply_code
+
+
+def read_socks5_address(client: socket.socket, address_type: int) -> SOCKS5Address:
+    """Consume an RFC 1928 address and port from a SOCKS5 control stream."""
+
+    try:
+        if address_type == 1:
+            host = socket.inet_ntop(socket.AF_INET, recv_exact(client, 4))
+        elif address_type == 3:
+            name_length = recv_exact(client, 1)[0]
+            if name_length == 0:
+                raise SOCKS5RequestError(8, "SOCKS5 domain name is empty")
+            host = recv_exact(client, name_length).decode("idna")
+        elif address_type == 4:
+            host = socket.inet_ntop(socket.AF_INET6, recv_exact(client, 16))
+        else:
+            raise SOCKS5RequestError(8, f"Unsupported SOCKS5 address type: {address_type}")
+        port = int.from_bytes(recv_exact(client, 2), "big")
+    except UnicodeError as exc:
+        raise SOCKS5RequestError(8, "Invalid SOCKS5 domain name") from exc
+    except ConnectionError:
+        raise
+    except OSError as exc:
+        raise SOCKS5RequestError(8, "Invalid SOCKS5 address") from exc
+    return SOCKS5Address(address_type, host, port)
+
+
+@dataclass(frozen=True)
 class UDPRequest:
     address_type: int
     host: str
@@ -277,13 +315,37 @@ def encode_udp_response(source: tuple[str, int], data: bytes) -> bytes:
 def _client_ip(client: socket.socket, address: tuple[str, int]) -> str:
     try:
         peer = client.getpeername()
-        return peer[0]
-    except OSError:
+        if isinstance(peer, tuple) and peer:
+            return peer[0]
+    except (IndexError, OSError, TypeError):
+        pass
+    try:
         return address[0]
+    except (IndexError, TypeError):
+        return ""
 
 
 def _same_udp_endpoint(left: tuple[str, int], right: tuple[str, int]) -> bool:
     return left[0] == right[0] and left[1] == right[1]
+
+
+def _validate_udp_associate_endpoint(
+    requested: SOCKS5Address,
+    client: socket.socket,
+    client_address: tuple[str, int],
+) -> tuple[str, int] | None:
+    """Validate the UDP ASSOCIATE client address without widening access."""
+
+    if requested.address_type != 1:
+        raise SOCKS5RequestError(2, "UDP ASSOCIATE requires an IPv4 client address")
+    allowed_ip = _client_ip(client, client_address)
+    if requested.host == "0.0.0.0" and requested.port == 0:
+        return None
+    if requested.host not in {"0.0.0.0", allowed_ip}:
+        raise SOCKS5RequestError(2, "UDP ASSOCIATE client address does not match control peer")
+    if requested.port == 0:
+        return None
+    return allowed_ip, requested.port
 
 
 def udp_associate(
@@ -291,6 +353,7 @@ def udp_associate(
     client_address: tuple[str, int],
     interface: str = TUN_INTERFACE,
     idle_timeout: float = UDP_ASSOCIATE_IDLE_TIMEOUT,
+    requested_endpoint: tuple[str, int] | None = None,
     socket_factory: Callable[..., socket.socket] = socket.socket,
 ) -> None:
     """Run one UDP association until control disconnect, timeout, or failure."""
@@ -312,6 +375,7 @@ def udp_associate(
         allowed_ip = _client_ip(client, client_address)
         locked_endpoint: tuple[str, int] | None = None
         last_activity = time.monotonic()
+        visited_udp_destinations: set[tuple[str, int]] = set()
         control_open = True
 
         while control_open:
@@ -343,6 +407,9 @@ def udp_associate(
                 if source_endpoint[0] != allowed_ip:
                     LOG.debug("Dropped UDP packet from unauthorized client %s", source_endpoint)
                     continue
+                if requested_endpoint is not None and not _same_udp_endpoint(requested_endpoint, source_endpoint):
+                    LOG.debug("Dropped UDP packet outside requested client endpoint %s", source_endpoint)
+                    continue
                 if locked_endpoint is not None and not _same_udp_endpoint(locked_endpoint, source_endpoint):
                     LOG.debug("Dropped UDP packet from unlocked client endpoint %s", source_endpoint)
                     continue
@@ -366,6 +433,7 @@ def udp_associate(
                 except OSError as exc:
                     LOG.error("UDP send over %s failed; stopping fail-closed: %s", interface, exc)
                     return
+                visited_udp_destinations.add((destination, request.port))
                 last_activity = time.monotonic()
 
             if upstream in readable:
@@ -373,8 +441,12 @@ def udp_associate(
                 if locked_endpoint is None:
                     LOG.debug("Dropped unsolicited UDP response before client lock")
                     continue
+                source_endpoint = (source[0], source[1])
+                if source_endpoint not in visited_udp_destinations:
+                    LOG.debug("Dropped UDP response from unvisited remote source %s", source_endpoint)
+                    continue
                 try:
-                    client_relay.sendto(encode_udp_response((source[0], source[1]), response), locked_endpoint)
+                    client_relay.sendto(encode_udp_response(source_endpoint, response), locked_endpoint)
                 except OSError as exc:
                     LOG.debug("Unable to return UDP response to local client: %s", exc)
                     return
@@ -411,25 +483,34 @@ def socks5_client(
         if version != 5:
             return
 
+        try:
+            requested_address = read_socks5_address(client, address_type)
+        except SOCKS5RequestError as exc:
+            client.sendall(_socks5_reply(exc.reply_code))
+            return
+        except (ConnectionError, OSError):
+            try:
+                client.sendall(_socks5_reply(1))
+            except OSError:
+                pass
+            return
+
         if command == 3:
-            udp_associate(client, client_address)
+            try:
+                requested_endpoint = _validate_udp_associate_endpoint(
+                    requested_address, client, client_address
+                )
+            except SOCKS5RequestError as exc:
+                client.sendall(_socks5_reply(exc.reply_code))
+                return
+            udp_associate(client, client_address, requested_endpoint=requested_endpoint)
             return
         if command != 1:
             client.sendall(_socks5_reply(7))
             return
 
-        if address_type == 1:
-            host = socket.inet_ntoa(recv_exact(client, 4))
-        elif address_type == 3:
-            host = recv_exact(client, recv_exact(client, 1)[0]).decode("idna")
-        elif address_type == 4:
-            host = socket.inet_ntop(socket.AF_INET6, recv_exact(client, 16))
-        else:
-            client.sendall(_socks5_reply(8))
-            return
-        port = int.from_bytes(recv_exact(client, 2), "big")
         try:
-            upstream = create_connection((host, port), timeout=20)
+            upstream = create_connection((requested_address.host, requested_address.port), timeout=20)
         except Exception:
             try:
                 client.sendall(_socks5_reply(4))
