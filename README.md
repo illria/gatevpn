@@ -195,11 +195,44 @@ en uninstall   # 卸载
       └─ SSH / Web UI 仍走物理网卡，避免 VPS 失联
 ```
 
+## 本地代理与 UDP 出口
+
+代理端口 `7928` 同时提供 HTTP 和 SOCKS5，但两者能力不同：
+
+- HTTP：`http://127.0.0.1:7928`，仅支持 TCP 普通代理和 HTTP CONNECT，不支持 WebRTC/STUN UDP。
+- SOCKS5：`socks5://127.0.0.1:7928`，支持 TCP CONNECT 和 RFC 1928 UDP ASSOCIATE。
+
+SOCKS5 UDP ASSOCIATE 会为每个 TCP 控制连接创建独立的临时 UDP relay。接收本地客户端数据的 socket 与访问公网的 socket 分离，公网 UDP socket 强制绑定 `GATEVPN_TUN_INTERFACE` 指定的接口，默认是 `tun0`。`tun0` 不存在、绑定失败、DNS over tun0 失败或 UDP 发送遇到接口/路由错误时，不会回落到 VPS 默认出口；该 association 会停止或丢弃当前数据包。当前域名 UDP 目标只解析 IPv4 A 记录，暂不支持 IPv6 UDP 目标和 UDP fragmentation。
+
+mihomo 示例：
+
+```yaml
+proxies:
+  - name: gatevpn
+    type: socks5
+    server: 127.0.0.1
+    port: 7928
+    udp: true
+```
+
+客户端必须选择 SOCKS5；HTTP 出口不能传递 UDP。手动检测 SOCKS5 UDP 出口：
+
+```bash
+python3 tools/check_socks5_udp.py \
+  --proxy-host 127.0.0.1 \
+  --proxy-port 7928 \
+  --stun-host stun.l.google.com \
+  --stun-port 19302
+```
+
+脚本会输出 STUN 检测到的公网 UDP IP，并提示将它与当前 OpenVPN/tun0 出口进行比对。
+
 ## 文件说明
 
 - `vpngate_manager.py`：主程序、Web UI、节点拉取/检测/连接逻辑。
 - `vpn_utils.py`：IP 信息、延迟检测、OpenVPN 配置解析等工具函数。
-- `proxy_server.py`：本地 HTTP/SOCKS5 代理服务。
+- `proxy_server.py`：本地 HTTP/SOCKS5 代理服务；HTTP 仅 TCP，SOCKS5 支持 TCP CONNECT 和 UDP ASSOCIATE。
+- `tools/check_socks5_udp.py`：通过 SOCKS5 UDP relay 发送 STUN Binding Request 的手动检测工具。
 - `install.sh`：一键安装和 CLI 工具生成脚本。
 - `LICENSE`：原始许可证文件。
 
