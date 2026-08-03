@@ -29,4 +29,9 @@ jobs:
         run: sh -n install.sh
 
       - name: Check diff whitespace
-        run: git diff --check
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git diff --check "${{ github.event.pull_request.base.sha }}...HEAD"
+          else
+            git show --check --oneline HEAD
+          fi

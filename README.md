@@ -121,7 +121,7 @@ PUBLICVPNLIST_SNAPSHOT_FILE=
 
 每条记录只使用 `id`、国家、`host`/`ip`、`port`、`proto`、`speed`、`latency`、`checkedAt` 等元数据，以及有效的 `temporary_ovpn_url` 获取 `.ovpn` 配置。`download_page_url` 是 HTML 页面，不能当作 OpenVPN 配置；缺少或失效的 `temporary_ovpn_url` 会安全跳过节点并记录需要重新生成临时快照/配置下载链接。临时配置 URL 不会写入磁盘缓存；缓存只保存元数据和成功通过校验的配置文本，默认刷新周期为 21600 秒（6 小时）。
 
-PublicVPNList 是第三方聚合来源，节点数量、国家分布和配置可用性会动态变化。程序会先执行现有的 OpenVPN 配置清洗、远端地址/端口/协议校验，再加入统一节点池；快照返回 HTML challenge、HTTP 403/429、格式变化或下载失败时，该来源本轮返回空，其他来源仍继续工作。
+PublicVPNList 是第三方聚合来源，节点数量、国家分布和配置可用性会动态变化。程序会先执行现有的 OpenVPN 配置清洗、远端地址/端口/协议校验，再加入统一节点池；快照返回 HTML challenge、HTTP 403/429、格式变化或下载失败时，会保留保留期内的已验证缓存并标记 stale/failed，其他来源仍继续工作；没有可保留的已验证 profile 时本轮才返回空。
 
 PublicVPNList 的固定允许国家为 `PH, US, FR, GB, ID, FI, DE, TW, AU, NL`，实际结果还会与“拉取地区过滤”取交集：
 
@@ -138,9 +138,24 @@ PUBLICVPNLIST_SNAPSHOT_URL=
 PUBLICVPNLIST_SNAPSHOT_FILE=
 PUBLICVPNLIST_MAX_NODES=100
 PUBLICVPNLIST_MAX_SCAN_ROWS=500
+PUBLICVPNLIST_STALE_PROFILE_SECONDS=604800
+PUBLICVPNLIST_CONFIG_TIMEOUT_SECONDS=45
 ```
 
-PublicVPNList 与 VPNGate、IPSpeed 会按规范化的 `host/IP + port + tcp/udp` endpoint 去重；同一 endpoint 的优先级为 VPNGate > IPSpeed > PublicVPNList。VPNBook 和 Vpngate-Scraper 不参与这次跨来源优先级去重。DNS 临时失败仍保留 hostname key，协议或端口不同的 endpoint 不会误去重。`PUBLICVPNLIST_MAX_NODES` 限制最终节点数，`PUBLICVPNLIST_MAX_SCAN_ROWS` 限制扫描记录数；被美国住宅规则拒绝的节点不消耗最终配额。
+`PUBLICVPNLIST_REFRESH_SECONDS` 只是 URL 快照的刷新尝试间隔，不是已验证配置的硬过期时间。缓存按稳定的 `public id + normalized host + port + proto` 保存已清洗配置，并记录 `snapshot_source_hash`、`snapshot_fetched_at`、`last_refresh_attempt_at`、`last_refresh_success_at`、`config_validated_at`、`last_seen_at` 和 `snapshot_checked_at`。刷新失败、签名 URL 过期、临时配置链接失效或部分节点失败时，缓存会标记 stale/failed，但继续提供保留期内的旧验证配置；只有超过 `PUBLICVPNLIST_STALE_PROFILE_SECONDS` 的 profile 才会移除。地区过滤只在读取缓存后执行，切换 PH/FR 不会重新下载已经验证的配置。
+
+PublicVPNList 与 VPNGate、IPSpeed 会按规范化的 `host/IP + port + tcp/udp` endpoint 去重；同一 endpoint 的优先级为 VPNGate > IPSpeed > PublicVPNList。VPNBook 和 Vpngate-Scraper 不参与这次跨来源优先级去重。DNS 临时失败仍保留 hostname key，协议或端口不同的 endpoint 不会误去重。`PUBLICVPNLIST_MAX_NODES` 限制最终节点数，`PUBLICVPNLIST_MAX_SCAN_ROWS` 限制扫描记录数；被美国住宅规则拒绝的节点不消耗最终配额。美国风控按最多 100 个节点一批调用现有 `vpn_utils.enrich_ip_info()`。
+
+### PublicVPNList 手动真实快照冒烟测试
+
+该检查不会进入默认 CI，也不会启动 OpenVPN。必须由用户提供有效的临时快照 URL；脚本只选择一个 PH 或 FR 节点，验证快照结构、临时配置请求及重定向后的 OpenVPN 内容、remote/端口/proto 一致性和配置清理。脚本不会打印完整 URL、query、签名或 token：
+
+```bash
+export PUBLICVPNLIST_SNAPSHOT_URL='用户自己生成的临时签名快照 URL'
+python3 tools/publicvpnlist-smoke.py
+```
+
+fixture 单元测试只验证离线解析和缓存行为，不代表线上 PublicVPNList 当前可用。只有在用户实际提供 URL 并且上述脚本输出“通过”后，才能确认本次线上快照冒烟成功。
 
 
 ## 指定地区拉取节点
