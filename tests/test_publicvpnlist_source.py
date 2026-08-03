@@ -1,4 +1,6 @@
 import json
+import os
+import stat
 import tempfile
 import time
 import unittest
@@ -460,6 +462,98 @@ class PublicVPNListSourceTests(unittest.TestCase):
         self.assertEqual(result, [])
         config_builder.assert_not_called()
 
+    def test_existing_us_residential_profile_is_reclassified_before_reuse(self):
+        row = self.row("us-reclassified", "US", "198.51.100.52")
+
+        def residential(nodes):
+            nodes[0].update(ip_type="residential", risk_sources=["ip-api.com"])
+
+        first, _ = self.fetch_rows([row], target=["US"], enrich=residential)
+        self.assertEqual(len(first), 1)
+
+        def hosting(nodes):
+            nodes[0].update(ip_type="hosting", risk_sources=["ip-api.com"])
+
+        with mock.patch.object(vpngate_manager, "PUBLICVPNLIST_REFRESH_SECONDS", 0), mock.patch.object(
+            vpngate_manager, "fetch_publicvpnlist_snapshot", return_value={"data": [row]}
+        ), mock.patch.object(
+            vpngate_manager.vpn_utils, "enrich_ip_info", side_effect=hosting
+        ) as enrich_mock, mock.patch.object(
+            vpngate_manager, "fetch_publicvpnlist_config", side_effect=AssertionError("hosting must not download")
+        ):
+            result = vpngate_manager.fetch_publicvpnlist_candidates(["US"], set())
+
+        self.assertEqual(result, [])
+        enrich_mock.assert_called_once()
+        self.assertEqual(len(enrich_mock.call_args.args[0]), 1)
+        cached_state = json.loads(self.cache_file.read_text(encoding="utf-8"))
+        cached_profile = next(iter(cached_state["profiles"].values()))
+        self.assertEqual(cached_profile["ip_type"], "hosting")
+
+    def test_cache_only_expired_us_risk_fails_closed_but_non_us_cache_remains_usable(self):
+        us = self.row("cache-expired-us", "US", "198.51.100.53")
+        ph = self.row("cache-valid-ph", "PH", "198.51.100.54")
+
+        def residential(nodes):
+            for node in nodes:
+                node.update(ip_type="residential", risk_sources=["ip-api.com"])
+
+        self.fetch_rows([us, ph], enrich=residential)
+        with mock.patch.object(vpngate_manager, "PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS", frozenset()), mock.patch.object(
+            vpngate_manager.vpn_utils, "load_ip_cache", return_value={
+                us["ip"]: {
+                    "cached_at": time.time() - (25 * 3600),
+                    "ip_type": "residential",
+                    "risk_sources": ["ip-api.com"],
+                }
+            }
+        ), mock.patch.object(
+            vpngate_manager.vpn_utils, "save_ip_cache"
+        ), mock.patch.object(
+            vpngate_manager.vpn_utils, "dnsbl_hits", return_value=[]
+        ), mock.patch.object(
+            vpngate_manager.vpn_utils, "query_ipwhois", return_value=None
+        ), mock.patch.object(
+            vpngate_manager.vpn_utils, "query_proxycheck", return_value=None
+        ), mock.patch.object(
+            vpngate_manager, "fetch_publicvpnlist_snapshot", side_effect=AssertionError("cache-only refresh")
+        ), mock.patch.object(
+            vpngate_manager, "fetch_publicvpnlist_config", side_effect=AssertionError("cache-only config download")
+        ):
+            result = vpngate_manager.fetch_publicvpnlist_candidates([], set())
+
+        self.assertEqual([node["country_short"] for node in result], ["PH"])
+        self.assertNotIn(us["ip"], {node["ip"] for node in result})
+
+    def test_cached_us_risk_within_vpn_utils_ttl_does_not_query_network(self):
+        row = self.row("cache-fresh-us", "US", "198.51.100.55")
+        cached_profile = {
+            "cached_at": time.time(),
+            "ip_type": "residential",
+            "risk_sources": ["ip-api.com"],
+            "owner": "fixture",
+            "asn": "AS64500",
+            "as_name": "fixture",
+            "location": "US",
+            "quality": "clean_residential",
+            "fraud_score": 0,
+            "clean_score": 100,
+            "risk_level": "clean",
+            "fraud_flags": [],
+            "blacklist_hits": [],
+            "blacklist_count": 0,
+            "ip_clean": True,
+        }
+        self.fetch_rows([row], enrich=lambda nodes: nodes[0].update(**cached_profile))
+        with mock.patch.object(vpngate_manager, "PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS", frozenset()), mock.patch.object(
+            vpngate_manager.vpn_utils, "load_ip_cache", return_value={row["ip"]: cached_profile}
+        ), mock.patch.object(
+            vpngate_manager.vpn_utils.urllib.request, "urlopen", side_effect=AssertionError("fresh risk cache must not query")
+        ) as urlopen:
+            result = vpngate_manager.fetch_publicvpnlist_candidates(["US"], set())
+        self.assertEqual([node["ip"] for node in result], [row["ip"]])
+        urlopen.assert_not_called()
+
     def test_us_dnsbl_only_result_is_not_a_complete_classification(self):
         row = self.row("us-dnsbl", "US", "198.51.100.45")
 
@@ -528,6 +622,26 @@ class PublicVPNListSourceTests(unittest.TestCase):
         result, _ = self.fetch_rows([row], http_get=http_get)
         self.assertEqual(len(result), 1)
         self.assertEqual(calls, [row["temporary_ovpn_url"]])
+
+    def test_arbitrary_page_query_and_fragment_never_enter_sensitive_outputs(self):
+        row = self.row("page-secrets", "PH", "198.51.100.56")
+        secrets = ["token", "auth", "session", "key", "hash", "unknown"]
+        for name in secrets:
+            row["download_page_url"] = f"https://fixture.invalid/server/page?{name}=secret-value#fragment"
+            profile = vpngate_manager.publicvpnlist_cache_profile(row, self.config(row["host"], row["port"]))
+            self.assertEqual(profile["download_page_url"], "")
+            self.assertNotIn(name, json.dumps(profile, ensure_ascii=False))
+
+        result, _ = self.fetch_rows([row])
+        nodes_file = Path(self.temp_dir.name) / "nodes.json"
+        with mock.patch.object(vpngate_manager, "NODES_FILE", nodes_file):
+            stored_nodes = [dict(result[0], download_page_url=row["download_page_url"], temporary_ovpn_url=row["download_page_url"])]
+            vpngate_manager.write_json(nodes_file, stored_nodes)
+        cache_text = self.cache_file.read_text(encoding="utf-8")
+        node_text = nodes_file.read_text(encoding="utf-8")
+        self.assertNotIn("secret-value", cache_text + node_text)
+        self.assertNotIn("#fragment", cache_text + node_text)
+        self.assertNotIn("?token", cache_text + node_text)
 
     def test_download_page_url_html_is_skipped_without_config_build(self):
         row = self.row("html-page", "PH", "198.51.100.51", temporary=False, page=True)
@@ -819,6 +933,54 @@ class PublicVPNListSourceTests(unittest.TestCase):
             result, _ = self.fetch_rows(us_rows + other_rows, target=[], enrich=enrich)
         self.assertEqual([node["country_short"] for node in result], ["PH", "FR", "GB"])
 
+    def test_sensitive_cache_nodes_ovpn_auth_files_are_0600_and_atomic(self):
+        row = self.row("permissions", "PH", "198.51.100.57")
+        result, _ = self.fetch_rows([row])
+        self.assertEqual(stat.S_IMODE(self.cache_file.stat().st_mode), 0o600)
+
+        self.cache_file.chmod(0o644)
+        vpngate_manager.save_publicvpnlist_cache(json.loads(self.cache_file.read_text(encoding="utf-8")))
+        self.assertEqual(stat.S_IMODE(self.cache_file.stat().st_mode), 0o600)
+
+        nodes_file = Path(self.temp_dir.name) / "nodes.json"
+        with mock.patch.object(vpngate_manager, "NODES_FILE", nodes_file):
+            vpngate_manager.write_json(nodes_file, result)
+        self.assertEqual(stat.S_IMODE(nodes_file.stat().st_mode), 0o600)
+
+        config_dir = Path(self.temp_dir.name) / "configs"
+        auth_file = Path(self.temp_dir.name) / "vpngate_auth.txt"
+        config_dir.mkdir(mode=0o755)
+        with mock.patch.object(vpngate_manager, "CONFIG_DIR", config_dir), mock.patch.object(
+            vpngate_manager, "AUTH_FILE", auth_file
+        ):
+            vpngate_manager.ensure_dirs()
+            ovpn_path = config_dir / "permissions.ovpn"
+            auth_path = vpngate_manager.auth_file_for_node({"id": "permissions", "auth_user": "u", "auth_pass": "p"})
+            vpngate_manager.atomic_write_text(ovpn_path, self.config(row["host"], row["port"]), mode=0o600)
+        self.assertEqual(stat.S_IMODE(config_dir.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(ovpn_path.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(auth_path.stat().st_mode), 0o600)
+
+        observed = []
+        original_replace = os.replace
+
+        def inspect_replace(source, destination):
+            observed.append(stat.S_IMODE(Path(source).stat().st_mode))
+            original_replace(source, destination)
+
+        observed_path = Path(self.temp_dir.name) / "atomic.ovpn"
+        with mock.patch.object(vpngate_manager.os, "replace", side_effect=inspect_replace):
+            vpngate_manager.atomic_write_text(observed_path, "client\n", mode=0o600)
+        self.assertEqual(observed, [0o600])
+
+        observed_path.write_text("old\n", encoding="utf-8")
+        with mock.patch.object(vpngate_manager.os, "replace", side_effect=OSError("replace failed")):
+            with self.assertRaises(OSError):
+                vpngate_manager.atomic_write_text(observed_path, "new\n", mode=0o600)
+        self.assertEqual(observed_path.read_text(encoding="utf-8"), "old\n")
+        loaded = vpngate_manager.load_publicvpnlist_cache()
+        self.assertTrue(loaded and loaded["profiles"])
+
     def test_max_nodes_stops_later_us_enrichment_and_config_download(self):
         rows = [self.row(f"us-window-{i}", "US", f"198.23.{i // 250}.{(i % 250) + 1}") for i in range(500)]
         config_calls = []
@@ -838,6 +1000,31 @@ class PublicVPNListSourceTests(unittest.TestCase):
         self.assertEqual(enrich_mock.call_count, 1)
         self.assertEqual([len(call.args[0]) for call in enrich_mock.call_args_list], [100])
         self.assertEqual(config_calls, [rows[0]["temporary_ovpn_url"]])
+
+    def test_cache_only_max_nodes_one_stops_after_the_first_us_window(self):
+        rows = [self.row(f"us-cache-window-{i}", "US", f"198.26.{i // 256}.{(i % 256) + 1}") for i in range(500)]
+
+        def residential(nodes):
+            for node in nodes:
+                node.update(ip_type="residential", risk_sources=["ip-api.com"])
+
+        with mock.patch.object(vpngate_manager, "PUBLICVPNLIST_MAX_NODES", 500):
+            self.fetch_rows(rows, target=["US"], enrich=residential)
+
+        with mock.patch.object(vpngate_manager, "PUBLICVPNLIST_MAX_NODES", 1), mock.patch.object(
+            vpngate_manager, "PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS", frozenset()
+        ), mock.patch.object(
+            vpngate_manager.vpn_utils, "enrich_ip_info", side_effect=residential
+        ) as enrich_mock, mock.patch.object(
+            vpngate_manager, "fetch_publicvpnlist_snapshot", side_effect=AssertionError("cache-only refresh")
+        ), mock.patch.object(
+            vpngate_manager, "fetch_publicvpnlist_config", side_effect=AssertionError("cache-only config download")
+        ):
+            result = vpngate_manager.fetch_publicvpnlist_candidates(["US"], set())
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(enrich_mock.call_count, 1)
+        self.assertEqual([len(call.args[0]) for call in enrich_mock.call_args_list], [100])
 
     def test_windowed_us_enrichment_continues_after_hosting_batch(self):
         hosting_rows = [self.row(f"us-hosting-window-{i}", "US", f"198.24.{i // 250}.{(i % 250) + 1}") for i in range(100)]

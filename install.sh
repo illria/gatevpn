@@ -220,6 +220,28 @@ prepare_eianun_environment_file() {
 
 prepare_eianun_environment_file
 
+repair_sensitive_runtime_files() {
+    DATA_PATH="${INSTALL_DIR}/vpngate_data"
+    CONFIG_PATH="${DATA_PATH}/configs"
+    if [ -d "${CONFIG_PATH}" ] && ! chmod 700 "${CONFIG_PATH}"; then
+        say "${YELLOW}警告: 无法修复 OpenVPN 配置目录权限；未输出配置内容。${PLAIN}"
+    fi
+    for sensitive_file in \
+        "${DATA_PATH}/publicvpnlist_cache.json" \
+        "${DATA_PATH}/nodes.json" \
+        "${DATA_PATH}/vpngate_auth.txt" \
+        "${DATA_PATH}/ui_auth.json"; do
+        if [ -e "${sensitive_file}" ] && ! chmod 600 "${sensitive_file}"; then
+            say "${YELLOW}警告: 无法修复敏感文件权限: $(basename "${sensitive_file}")。${PLAIN}"
+        fi
+    done
+    if [ -d "${CONFIG_PATH}" ] && ! find "${CONFIG_PATH}" -type f \( -name '*.ovpn' -o -name '*.auth' \) -exec chmod 600 {} +; then
+        say "${YELLOW}警告: 无法完整修复 OpenVPN 配置文件权限；未输出配置内容。${PLAIN}"
+    fi
+}
+
+repair_sensitive_runtime_files
+
 configure_service() {
     SERVICE_MANAGER="$(detect_service_manager)"
     say "\n${YELLOW}[3/4] 正在配置系统服务 (${SERVICE_MANAGER})...${PLAIN}"
@@ -1473,6 +1495,7 @@ cfg = {
 with open(os.environ['AUTH_FILE'], 'w', encoding='utf-8') as f:
     json.dump(cfg, f, ensure_ascii=False, indent=2)
 PY_SAVE_AUTH
+    chmod 600 "${AUTH_FILE}" 2>/dev/null || say "${YELLOW}警告: 无法将面板认证文件权限设为 0600。${PLAIN}"
     say "${GREEN}面板配置已保存。${PLAIN}"
 else
     say "${GREEN}已保留现有面板配置。${PLAIN}"

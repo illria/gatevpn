@@ -32,6 +32,9 @@ jobs:
       - name: Run unit tests
         run: python3 -m unittest discover -s tests -p "test_*.py" -v
 
+      - name: Compile and exercise generated en command
+        run: python3 -m unittest discover -s tests -p "test_service_environment.py" -v
+
       - name: Check shell syntax
         run: sh -n install.sh
 

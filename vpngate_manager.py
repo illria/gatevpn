@@ -15,6 +15,7 @@ import socket
 import subprocess
 import threading
 import time
+import tempfile
 import urllib.parse
 import urllib.error
 import urllib.request
@@ -108,6 +109,7 @@ PUBLICVPNLIST_CLASSIFICATION_FIELDS = (
     "blacklist_hits",
     "blacklist_count",
     "ip_clean",
+    "risk_classified_at",
 )
 PUBLICVPNLIST_CLASSIFICATION_LIST_FIELDS = frozenset({"risk_sources", "fraud_flags", "blacklist_hits"})
 SOURCE_PRIORITY = {
@@ -196,19 +198,104 @@ last_active_latency = 0
 
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(exist_ok=True)
-    CONFIG_DIR.mkdir(exist_ok=True)
+    CONFIG_DIR.mkdir(exist_ok=True, mode=0o700)
+    try:
+        CONFIG_DIR.chmod(0o700)
+    except OSError as exc:
+        log_to_json("WARNING", "Storage", f"无法将配置目录权限设为 0700: {type(exc).__name__}")
     if not AUTH_FILE.exists():
-        AUTH_FILE.write_text(f"{OPENVPN_AUTH_USER}\n{OPENVPN_AUTH_PASS}\n", encoding="utf-8")
         try:
-            AUTH_FILE.chmod(0o600)
-        except OSError:
-            pass
+            atomic_write_text(AUTH_FILE, f"{OPENVPN_AUTH_USER}\n{OPENVPN_AUTH_PASS}\n", mode=0o600)
+        except OSError as exc:
+            log_to_json("WARNING", "Storage", f"无法创建认证文件: {type(exc).__name__}")
+    else:
+        repair_sensitive_file_permissions(AUTH_FILE)
+
+
+def is_sensitive_path(path: Path) -> bool:
+    """Return whether a file can contain VPN configs, credentials, or cached profiles."""
+
+    path = Path(path)
+    return (
+        path == NODES_FILE
+        or path == PUBLICVPNLIST_CACHE_FILE
+        or path == AUTH_FILE
+        or path.name == "vpngate_auth.txt"
+        or path.suffix.lower() in {".ovpn", ".auth"}
+    )
+
+
+def atomic_write_text(path: Path, content: str, mode: int | None = None) -> None:
+    """Write a file through a same-directory 0600 temp file and os.replace."""
+
+    path = Path(path)
+    path.parent.mkdir(exist_ok=True, parents=True)
+    requested_mode = 0o600 if mode is None else mode
+    temp_path: Path | None = None
+    fd = -1
+    try:
+        fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent), text=True)
+        temp_path = Path(temp_name)
+        os.fchmod(fd, requested_mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+        os.chmod(path, requested_mode)
+        temp_path = None
+    except Exception:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        raise
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+
+
+def repair_sensitive_file_permissions(path: Path) -> bool:
+    """Repair an existing sensitive file without ever logging its contents."""
+
+    path = Path(path)
+    if not path.exists():
+        return True
+    try:
+        os.chmod(path, 0o600)
+        return True
+    except OSError as exc:
+        log_to_json("WARNING", "Storage", f"无法修复敏感文件权限 {path.name}: {type(exc).__name__}")
+        return False
+
+
+def sanitize_nodes_for_storage(nodes: Any) -> Any:
+    """Keep transient/signed URL metadata out of the durable nodes file."""
+
+    if not isinstance(nodes, list):
+        return nodes
+    sanitized_nodes: list[Any] = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            sanitized_nodes.append(node)
+            continue
+        sanitized = dict(node)
+        for key in list(sanitized):
+            if key.endswith("_url") or key in {"url", "server_page_url"}:
+                sanitized.pop(key, None)
+        sanitized_nodes.append(sanitized)
+    return sanitized_nodes
 
 def write_json(path: Path, data: Any) -> None:
     with lock:
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(path)
+        mode = 0o600 if is_sensitive_path(path) else 0o644
+        stored_data = sanitize_nodes_for_storage(data) if Path(path) == NODES_FILE else data
+        atomic_write_text(path, json.dumps(stored_data, ensure_ascii=False, indent=2), mode=mode)
 
 def read_json(path: Path, default: Any) -> Any:
     with lock:
@@ -291,7 +378,7 @@ def load_ui_config() -> dict[str, Any]:
         if not auth_file.exists() or updated:
             try:
                 DATA_DIR.mkdir(exist_ok=True, parents=True)
-                auth_file.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+                atomic_write_text(auth_file, json.dumps(config, ensure_ascii=False, indent=2), mode=0o600)
             except Exception:
                 pass
                 
@@ -2375,19 +2462,28 @@ def publicvpnlist_profile_key(row: dict[str, Any]) -> str:
 
 
 def publicvpnlist_cache_page_url(row: dict[str, Any]) -> str:
-    """Keep harmless page metadata but never persist token-like query values."""
+    """Do not persist a third-party server page URL.
 
-    page_url = str(row.get("download_page_url") or row.get("server_page_url") or "").strip()
-    if not page_url:
-        return ""
-    try:
-        parsed = urllib.parse.urlsplit(page_url)
-        query_names = {key.lower() for key, _value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)}
-        if query_names & {"token", "access_token", "signature", "sig", "expires", "expires_at", "exp"}:
-            return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
-    except ValueError:
-        return ""
-    return page_url
+    The page is HTML metadata and is never used to build an OpenVPN profile.
+    Dropping it entirely also guarantees that no query, fragment, or embedded
+    credentials can enter the durable profile cache or generated nodes.
+    """
+
+    return ""
+
+
+def publicvpnlist_sanitize_cached_profile(profile: dict[str, Any]) -> dict[str, Any]:
+    """Remove all URL metadata from a durable PublicVPNList profile."""
+
+    sanitized = dict(profile)
+    # These values can be short-lived or signed, and none is needed to use a
+    # validated config_text.  Remove every URL variant, not just known query
+    # parameter names, so future provider fields cannot leak credentials.
+    for key in list(sanitized):
+        if key.endswith("_url") or key in {"url", "server_page_url"}:
+            sanitized.pop(key, None)
+    sanitized["download_page_url"] = ""
+    return sanitized
 
 
 def publicvpnlist_cache_profile(
@@ -2482,7 +2578,10 @@ def load_publicvpnlist_cache(target_countries: Any = None) -> dict[str, Any] | N
                 key = publicvpnlist_profile_key(profile)
                 if key:
                     profiles[key] = profile
-    normalized = publicvpnlist_cache_default(str(cache.get("snapshot_source_hash") or cache.get("snapshot_source") or ""))
+    raw_snapshot_hash = str(cache.get("snapshot_source_hash") or cache.get("snapshot_source") or "")
+    if "://" in raw_snapshot_hash or "?" in raw_snapshot_hash or "#" in raw_snapshot_hash:
+        raw_snapshot_hash = hashlib.sha256(raw_snapshot_hash.encode("utf-8")).hexdigest()
+    normalized = publicvpnlist_cache_default(raw_snapshot_hash)
     normalized.update(
         {
             "snapshot_fetched_at": 0.0 if legacy_cache else float(cache.get("snapshot_fetched_at") or cache.get("cached_at") or 0),
@@ -2493,7 +2592,7 @@ def load_publicvpnlist_cache(target_countries: Any = None) -> dict[str, Any] | N
             "partial": bool(cache.get("partial", False)),
             "last_refresh_stats": dict(cache.get("last_refresh_stats") or {}) if isinstance(cache.get("last_refresh_stats"), dict) else {},
             "profiles": {
-                str(key): value
+                str(key): publicvpnlist_sanitize_cached_profile(value)
                 for key, value in profiles.items()
                 if isinstance(value, dict) and publicvpnlist_country_allowed(value)
             },
@@ -2529,12 +2628,18 @@ def save_publicvpnlist_cache(cache: dict[str, Any] | list[dict[str, Any]], targe
         else:
             state = publicvpnlist_cache_default()
             state.update({key: value for key, value in cache.items() if not str(key).startswith("_")})
-            state["snapshot_source_hash"] = str(state.get("snapshot_source_hash") or publicvpnlist_snapshot_source_hash())
+            snapshot_hash = str(state.get("snapshot_source_hash") or publicvpnlist_snapshot_source_hash())
+            if "://" in snapshot_hash or "?" in snapshot_hash or "#" in snapshot_hash:
+                snapshot_hash = hashlib.sha256(snapshot_hash.encode("utf-8")).hexdigest()
+            state["snapshot_source_hash"] = snapshot_hash
             state["profiles"] = {
-                str(key): value
+                str(key): publicvpnlist_sanitize_cached_profile(value)
                 for key, value in (state.get("profiles") or {}).items()
                 if isinstance(value, dict) and publicvpnlist_country_allowed(value)
             }
+            for key in list(state):
+                if key.endswith("_url") or key in {"url", "server_page_url", "snapshot_source"}:
+                    state.pop(key, None)
             state["profile_order"] = [
                 str(key) for key in (state.get("profile_order") or []) if str(key) in state["profiles"]
             ]
@@ -2639,7 +2744,7 @@ def publicvpnlist_classification_defaults() -> dict[str, Any]:
     for field in PUBLICVPNLIST_CLASSIFICATION_FIELDS:
         if field in PUBLICVPNLIST_CLASSIFICATION_LIST_FIELDS:
             defaults[field] = []
-        elif field in {"fraud_score", "clean_score", "blacklist_count"}:
+        elif field in {"fraud_score", "clean_score", "blacklist_count", "risk_classified_at"}:
             defaults[field] = 0
         elif field == "ip_clean":
             defaults[field] = False
@@ -2673,7 +2778,7 @@ def publicvpnlist_normalize_classification(value: Any) -> dict[str, Any] | None:
                 classification[field] = item.strip().lower() in {"1", "true", "yes", "clean", "ok"}
             else:
                 classification[field] = bool(item)
-        elif field in {"fraud_score", "clean_score"}:
+        elif field in {"fraud_score", "clean_score", "risk_classified_at"}:
             try:
                 numeric_score = float(str(item).strip())
                 classification[field] = (
@@ -2733,8 +2838,17 @@ def publicvpnlist_enrich_us_rows(
             for item in batch:
                 item.update(publicvpnlist_classification_defaults())
             log_to_json("WARNING", "PublicVPNList", f"美国风控批次查询失败，整批 fail closed: {exc}")
+        checked_at = time.time()
         for (key, _row), item in zip(batch_rows, batch):
-            classifications[key] = publicvpnlist_normalize_classification(item) or publicvpnlist_classification_defaults()
+            classification = publicvpnlist_normalize_classification(item)
+            if classification:
+                classification["risk_classified_at"] = checked_at
+                classifications[key] = classification
+            else:
+                # Do not copy a stale profile classification into this batch.
+                # A failed or incomplete refresh must be rejected by the US
+                # policy before any temporary profile URL is requested.
+                classifications[key] = publicvpnlist_classification_defaults()
     return classifications, batch_failed
 
 
@@ -2746,6 +2860,10 @@ def refresh_publicvpnlist_cache(cache: dict[str, Any] | None = None) -> dict[str
     cache = cache or publicvpnlist_cache_default(source_hash)
     now = time.time()
     if not publicvpnlist_refresh_needed(cache, source_kind, source_hash, now):
+        # This map is only a same-call handoff from refresh to candidate
+        # assembly.  Never let an in-memory cache object turn it into a
+        # second, permanent risk cache on a later read.
+        cache.pop("_us_classifications", None)
         return cache
 
     cache = dict(cache)
@@ -2812,11 +2930,10 @@ def refresh_publicvpnlist_cache(cache: dict[str, Any] | None = None) -> dict[str
         for key, row in window:
             if row.get("country_short") != "US":
                 continue
-            existing_classification = publicvpnlist_normalize_classification(old_profiles.get(key))
-            if existing_classification:
-                classifications[key] = existing_classification
-            else:
-                rows_to_classify.append((key, row))
+            # Always pass the current window through vpn_utils.  It owns the
+            # IP risk cache and its IP_RISK_CACHE_TTL_SECONDS; a durable
+            # PublicVPNList profile must never become a second risk cache.
+            rows_to_classify.append((key, row))
         if rows_to_classify:
             new_classifications, batch_failed = publicvpnlist_enrich_us_rows(rows_to_classify)
             classifications.update(new_classifications)
@@ -2832,6 +2949,13 @@ def refresh_publicvpnlist_cache(cache: dict[str, Any] | None = None) -> dict[str
             if row.get("country_short") == "US":
                 classification = classifications.get(key)
                 if not publicvpnlist_us_classification_allowed(classification):
+                    if classification and float(classification.get("risk_classified_at") or 0) > 0:
+                        # Keep the validated config for stale-while-revalidate,
+                        # but persist the newest risk result so a later
+                        # cache-only read cannot resurrect an old residential
+                        # decision.
+                        if isinstance(old_profiles.get(key), dict):
+                            old_profiles[key].update(classification)
                     us_rejected += 1
                     continue
                 effective_row.update(classification or {})
@@ -3096,8 +3220,11 @@ def fetch_publicvpnlist_candidates(target_countries: list[str], seen_keys: set[s
     us_candidates: list[dict[str, Any]] = []
     ordered_rows: list[tuple[str, dict[str, Any]]] = []
     ordered_candidates: list[dict[str, Any]] = []
-    us_rows_to_classify: list[tuple[str, dict[str, Any]]] = []
-    us_classifications = cache.get("_us_classifications") if isinstance(cache.get("_us_classifications"), dict) else {}
+    us_classifications = (
+        dict(cache.get("_us_classifications"))
+        if isinstance(cache.get("_us_classifications"), dict)
+        else {}
+    )
     us_nonresidential = 0
     us_unclassified = 0
     fixed_filtered = 0
@@ -3125,44 +3252,52 @@ def fetch_publicvpnlist_candidates(target_countries: list[str], seen_keys: set[s
             target_filtered += 1
             continue
         ordered_rows.append((key, row))
-        if country_short == "US" and key not in us_classifications:
-            stored_classification = publicvpnlist_normalize_classification(row)
-            if stored_classification:
-                us_classifications[key] = stored_classification
-            elif download_hosts:
-                us_rows_to_classify.append((key, row))
 
     classification_cache_changed = False
-    if us_rows_to_classify and download_hosts:
-        new_classifications, _classification_failed = publicvpnlist_enrich_us_rows(us_rows_to_classify)
-        us_classifications.update(new_classifications)
+    # Cached profiles can be numerous even when MAX_NODES is small.  Process
+    # them in the same <=100 windows as snapshot refresh, so a first accepted
+    # window stops later US risk work immediately.
+    for window_start in range(0, len(ordered_rows), 100):
+        window = ordered_rows[window_start : window_start + 100]
+        rows_to_classify = [
+            (key, row)
+            for key, row in window
+            if str(row.get("country_short") or "").upper() == "US" and key not in us_classifications
+        ]
+        if rows_to_classify:
+            new_classifications, _classification_failed = publicvpnlist_enrich_us_rows(rows_to_classify)
+            us_classifications.update(new_classifications)
 
-    for key, row in ordered_rows:
-        country_short = str(row.get("country_short") or "").upper()
-        if country_short == "US":
-            classification = us_classifications.get(key) or publicvpnlist_normalize_classification(row)
-            if not publicvpnlist_us_classification_allowed(classification):
-                raw_sources = (classification or {}).get("risk_sources") or []
-                if isinstance(raw_sources, str):
-                    raw_sources = [raw_sources]
-                if any(str(item).strip().lower() != "dnsbl" for item in raw_sources if str(item).strip()):
-                    us_nonresidential += 1
-                else:
-                    us_unclassified += 1
-                continue
-            if classification:
+        for key, row in window:
+            country_short = str(row.get("country_short") or "").upper()
+            if country_short == "US":
+                classification = us_classifications.get(key)
+                if classification and float(classification.get("risk_classified_at") or 0) > 0:
+                    if isinstance(cache_profiles.get(key), dict):
+                        cache_profiles[key].update(classification)
+                        classification_cache_changed = True
+                if not publicvpnlist_us_classification_allowed(classification):
+                    raw_sources = (classification or {}).get("risk_sources") or []
+                    if isinstance(raw_sources, str):
+                        raw_sources = [raw_sources]
+                    if any(str(item).strip().lower() != "dnsbl" for item in raw_sources if str(item).strip()):
+                        us_nonresidential += 1
+                    else:
+                        us_unclassified += 1
+                    continue
                 row.update(classification)
-                if isinstance(cache_profiles.get(key), dict):
-                    cache_profiles[key].update(classification)
-                    classification_cache_changed = True
-        node = publicvpnlist_row_to_node(row, str(row.get("config_text") or ""))
-        if not node:
-            config_rejected += 1
-            log_to_json("WARNING", "PublicVPNList", f"配置校验失败，丢弃节点 {row.get('id') or row.get('host')}")
-            continue
-        ordered_candidates.append(node)
-        if country_short == "US":
-            us_candidates.append(node)
+            node = publicvpnlist_row_to_node(row, str(row.get("config_text") or ""))
+            if not node:
+                config_rejected += 1
+                log_to_json("WARNING", "PublicVPNList", f"配置校验失败，丢弃节点 {row.get('id') or row.get('host')}")
+                continue
+            ordered_candidates.append(node)
+            if country_short == "US":
+                us_candidates.append(node)
+            if len(ordered_candidates) >= PUBLICVPNLIST_MAX_NODES:
+                break
+        if len(ordered_candidates) >= PUBLICVPNLIST_MAX_NODES:
+            break
 
     if classification_cache_changed:
         cache["profiles"] = cache_profiles
@@ -3283,8 +3418,7 @@ def auth_file_for_node(node: dict[str, Any] | None) -> Path:
     node_id = safe_name(str(node.get("id") or node.get("remote_host") or "node"))
     path = CONFIG_DIR / f"{node_id}.auth"
     try:
-        path.write_text(f"{user}\n{pwd}\n", encoding="utf-8")
-        path.chmod(0o600)
+        atomic_write_text(path, f"{user}\n{pwd}\n", mode=0o600)
     except Exception:
         return AUTH_FILE
     return path
@@ -3634,8 +3768,9 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
 
     temp_path = Path(config_file)
     try:
-        CONFIG_DIR.mkdir(exist_ok=True, parents=True)
-        temp_path.write_text(sanitize_openvpn_config_for_eianun(config_text), encoding="utf-8")
+        CONFIG_DIR.mkdir(exist_ok=True, parents=True, mode=0o700)
+        CONFIG_DIR.chmod(0o700)
+        atomic_write_text(temp_path, sanitize_openvpn_config_for_eianun(config_text), mode=0o600)
     except Exception as e:
         raise RuntimeError(f"Failed to write temp config file: {e}")
 
@@ -3746,8 +3881,9 @@ def test_multiple_nodes(node_ids: list[str], progress_prefix: str = "正在自�
         
         temp_path = Path(config_file)
         try:
-            CONFIG_DIR.mkdir(exist_ok=True, parents=True)
-            temp_path.write_text(config_text, encoding="utf-8")
+            CONFIG_DIR.mkdir(exist_ok=True, parents=True, mode=0o700)
+            CONFIG_DIR.chmod(0o700)
+            atomic_write_text(temp_path, config_text, mode=0o600)
         except Exception:
             pass
             
@@ -4069,8 +4205,13 @@ def connect_node(node_id: str, update_failover_scope: bool = True, allow_manual_
         set_state(active_node_latency="写入配置", last_check_message="正在写入 OpenVPN 节点配置文件...")
         config_path = Path(node["config_file"])
         try:
-            CONFIG_DIR.mkdir(exist_ok=True, parents=True)
-            config_path.write_text(sanitize_openvpn_config_for_eianun(node.get("config_text") or ""), encoding="utf-8")
+            CONFIG_DIR.mkdir(exist_ok=True, parents=True, mode=0o700)
+            CONFIG_DIR.chmod(0o700)
+            atomic_write_text(
+                config_path,
+                sanitize_openvpn_config_for_eianun(node.get("config_text") or ""),
+                mode=0o600,
+            )
         except Exception as e:
             raise RuntimeError(f"Failed to write configuration: {e}")
 
@@ -4206,7 +4347,9 @@ def maintain_valid_nodes(force: bool = False, target_override: list[str] | None 
                 config_path = Path(n["config_file"])
                 if not config_path.exists():
                     try:
-                        config_path.write_text(n["config_text"], encoding="utf-8")
+                        CONFIG_DIR.mkdir(exist_ok=True, parents=True, mode=0o700)
+                        CONFIG_DIR.chmod(0o700)
+                        atomic_write_text(config_path, n["config_text"], mode=0o600)
                     except Exception:
                         pass
                         
@@ -6991,7 +7134,7 @@ class Handler(BaseHTTPRequestHandler):
         if not auth_file.exists():
             try:
                 DATA_DIR.mkdir(exist_ok=True)
-                auth_file.write_text(json.dumps({"secret_path": "EJsW2EeBo9lY"}), encoding="utf-8")
+                atomic_write_text(auth_file, json.dumps({"secret_path": "EJsW2EeBo9lY"}), mode=0o600)
             except Exception:
                 pass
             return "EJsW2EeBo9lY"
@@ -7002,7 +7145,7 @@ class Handler(BaseHTTPRequestHandler):
             elif "password" in creds:
                 secret_path = creds["password"]
                 try:
-                    auth_file.write_text(json.dumps({"secret_path": secret_path}), encoding="utf-8")
+                    atomic_write_text(auth_file, json.dumps({"secret_path": secret_path}), mode=0o600)
                 except Exception:
                     pass
                 return secret_path
@@ -7253,7 +7396,7 @@ class Handler(BaseHTTPRequestHandler):
                 auth_file = DATA_DIR / "ui_auth.json"
                 with lock:
                     DATA_DIR.mkdir(exist_ok=True, parents=True)
-                    auth_file.write_text(json.dumps(ui_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+                    atomic_write_text(auth_file, json.dumps(ui_cfg, ensure_ascii=False, indent=2), mode=0o600)
                 
                 self.send_json({"ok": True, "message": "配置更新成功，系统将在 2 秒内重启..."})
                 
