@@ -1,12 +1,12 @@
 # Eianun免费聚合落地IP 🌐
 
-基于 VPNGate / VPNBook / IPSpeed / Vpngate-Scraper + OpenVPN 的 Linux VPS 出站代理网关二改版。此版本已去除原项目广告入口，新增多来源节点拉取、指定地区拉取、同地区故障转移、IP 类型优先级、非中断检测与自动兜底。
+基于 VPNGate / VPNBook / IPSpeed / Vpngate-Scraper / PublicVPNList + OpenVPN 的 Linux VPS 出站代理网关二改版。此版本已去除原项目广告入口，新增多来源节点拉取、指定地区拉取、同地区故障转移、IP 类型优先级、非中断检测与自动兜底。
 
 ## 主要改动
 
 - 名称统一改为 **Eianun免费聚合落地IP**。
 - 移除 Web UI 里的 VPS 推广广告和 README 中的推广徽章/链接。
-- 新增多节点来源：默认同时拉取 **VPNGate + VPNBook + IPSpeed + Vpngate-Scraper**；也可在面板里切换为任意单一或组合来源。
+- 新增多节点来源：默认同时拉取 **VPNGate + VPNBook + IPSpeed + Vpngate-Scraper + PublicVPNList**；也可在面板里切换为任意单一或组合来源。
 - VPNBook 来源默认只抓取节点、不参与启动阶段批量 OpenVPN 检测，避免部分 VPS 因 VPNBook 节点握手/路由推送导致 SSH 卡死。
 - 新增后端节点地区过滤：可只保留指定国家/地区节点，不再默认把全部地区节点都写入节点池。
 - Web 管理后台“管理员设置”新增 **节点来源** 和 **拉取地区过滤** 配置。
@@ -66,7 +66,7 @@ RHEL / CentOS / Rocky / AlmaLinux 等系统会尝试自动安装 `epel-release`�
 默认来源为：
 
 ```text
-vpngate,vpnbook,ipspeed,vpngate_scraper
+vpngate,vpnbook,ipspeed,vpngate_scraper,publicvpnlist
 ```
 
 可以在 Web 管理后台修改：
@@ -84,8 +84,8 @@ en source
 或写入 `/etc/default/eianun-vpngate`：
 
 ```bash
-NODE_SOURCES=vpngate,vpnbook,ipspeed,vpngate_scraper
-# 可选：vpngate / vpnbook / ipspeed / vpngate_scraper / 多个来源用逗号组合
+NODE_SOURCES=vpngate,vpnbook,ipspeed,vpngate_scraper,publicvpnlist
+# 可选：vpngate / vpnbook / ipspeed / vpngate_scraper / publicvpnlist / 多个来源用逗号组合
 ```
 
 VPNBook 当前免费 OpenVPN 页面提供 US、CA、UK、DE、FR 等服务器，并展示通用账号密码；程序会自动抓取页面中的服务器和密码，再下载 `.ovpn` 配置。若 VPNBook 官网下载端点临时变化导致 `.ovpn` 直链失败，程序会使用公开 OpenVPN 模板替换当前服务器与协议后继续生成候选节点，避免 VPNBook 来源直接归零。
@@ -106,6 +106,30 @@ IPSpeed 来源会定时读取 `https://ipspeed.info/free-openvpn.php` 的免费 
 ### Vpngate-Scraper 来源说明
 
 Vpngate-Scraper 来源会读取 `https://github.com/fdciabdul/Vpngate-Scraper-API` 自动生成的 Markdown 节点表，并下载其中 `configs/*.ovpn` 配置文件。该列表包含 Hostname、IP、Ping、Speed、Country 和配置链接，程序会把这些节点合并到统一节点池，再进行可用性与 IP 风控检测。
+
+### PublicVPNList 来源说明
+
+PublicVPNList 来源默认读取官方 OpenVPN JSON 快照：
+`https://publicvpnlist.com/exports/openvpn-latest.json`。每条记录只使用 `id`、国家、`host`/`ip`、`port`、`proto`、`speed`、`latency`、`checkedAt` 等元数据，以及记录提供的 `temporary_ovpn_url` 或 `download_page_url` 获取 `.ovpn` 配置。短期配置 URL 不会写入磁盘缓存；缓存只保存元数据和成功通过校验的配置文本，默认刷新周期为 21600 秒（6 小时）。
+
+PublicVPNList 是第三方聚合来源，节点数量、国家分布和配置可用性会动态变化。程序会先执行现有的 OpenVPN 配置清洗、远端地址/端口/协议校验，再加入统一节点池；快照返回 HTML challenge、HTTP 403/429、格式变化或下载失败时，该来源本轮返回空，其他来源仍继续工作。
+
+PublicVPNList 的固定允许国家为 `PH, US, FR, GB, ID, FI, DE, TW, AU, NL`，实际结果还会与“拉取地区过滤”取交集：
+
+- `PH` 接受全部 IP 类型；
+- `US` 仅接受现有 `vpn_utils.enrich_ip_info()` 明确分类为 `residential` 的节点，风控接口失败或分类为空时拒绝；
+- 其他固定国家接受全部 IP 类型；
+- 其他国家无论用户是否选择，均不从 PublicVPNList 进入节点池。
+
+可选环境变量：
+
+```bash
+PUBLICVPNLIST_REFRESH_SECONDS=21600
+PUBLICVPNLIST_SNAPSHOT_URL=https://publicvpnlist.com/exports/openvpn-latest.json
+PUBLICVPNLIST_MAX_NODES=100
+```
+
+PublicVPNList 与其他来源会按规范化的 `host/IP + port + tcp/udp` endpoint 去重；同一 endpoint 的优先级为 VPNGate > IPSpeed > PublicVPNList。DNS 临时失败不会删除原节点，协议或端口不同的 endpoint 不会误去重。
 
 
 ## 指定地区拉取节点
@@ -162,7 +186,7 @@ TARGET_IP_TYPES=residential
 STRICT_COUNTRY_FAILOVER=0
 ```
 
-注意：VPNGate 节点由第三方志愿者提供；VPNBook 节点由 VPNBook 官网提供；IPSpeed 节点由 ipspeed.info 的免费 OpenVPN 列表提供；Vpngate-Scraper 节点由 fdciabdul/Vpngate-Scraper-API 提供。住宅/机房/代理类型识别依赖公开 IP 数据源，不能保证 100% 准确，但会作为自动切换的优先级依据。
+注意：VPNGate 节点由第三方志愿者提供；VPNBook 节点由 VPNBook 官网提供；IPSpeed 节点由 ipspeed.info 的免费 OpenVPN 列表提供；Vpngate-Scraper 节点由 fdciabdul/Vpngate-Scraper-API 提供；PublicVPNList 是第三方聚合来源。住宅/机房/代理类型识别依赖公开 IP 数据源，不能保证 100% 准确，但会作为自动切换的优先级依据。
 
 ## 常用命令
 
@@ -175,7 +199,7 @@ en logs        # 查看日志
 en web         # 修改网页绑定地址/安全后缀
 en port        # 修改网页端口
 en password    # 修改管理账号密码
-en source      # 设置节点来源：VPNGate / VPNBook / IPSpeed / Vpngate-Scraper
+en source      # 设置节点来源：VPNGate / VPNBook / IPSpeed / Vpngate-Scraper / PublicVPNList
 en country     # 设置节点拉取地区
 en iptype      # 设置自动选择/故障转移 IP 类型，例如住宅IP
 en update      # 从 GitHub 拉取最新代码并重新安装/重启
@@ -190,7 +214,7 @@ en uninstall   # 卸载
 [ 3x-ui / Xray ]
       │ HTTP / SOCKS5
       ▼
-[ 本地代理服务器 :7928 ] --绑定 tun0--> [ OpenVPN / VPNGate / VPNBook / IPSpeed / Vpngate-Scraper 节点 ]
+[ 本地代理服务器 :7928 ] --绑定 tun0--> [ OpenVPN / VPNGate / VPNBook / IPSpeed / Vpngate-Scraper / PublicVPNList 节点 ]
       │
       └─ SSH / Web UI 仍走物理网卡，避免 VPS 失联
 ```

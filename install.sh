@@ -341,7 +341,7 @@ def generate_random_suffix():
 def load_ui_cfg():
     import json
     path = "/opt/eianun-vpngate/vpngate_data/ui_auth.json"
-    cfg = {"host": "0.0.0.0", "port": 8787, "secret_path": "EJsW2EeBo9lY", "password": "", "target_countries": "", "target_ip_types": "residential", "node_sources": "vpngate,vpnbook,ipspeed,vpngate_scraper"}
+    cfg = {"host": "0.0.0.0", "port": 8787, "secret_path": "EJsW2EeBo9lY", "password": "", "target_countries": "", "target_ip_types": "residential", "node_sources": "vpngate,vpnbook,ipspeed,vpngate_scraper,publicvpnlist"}
     if os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -553,7 +553,7 @@ def print_status():
     curr_pwd = cfg.get("password", "")
     masked_pwd = curr_pwd if len(curr_pwd) <= 4 else curr_pwd[:3] + "********" + curr_pwd[-2:]
     print_line(format_line("网页管理密码", masked_pwd))
-    print_line(format_line("节点拉取来源", cfg.get("node_sources", "vpngate,vpnbook,ipspeed,vpngate_scraper") or "vpngate,vpnbook,ipspeed,vpngate_scraper"))
+    print_line(format_line("节点拉取来源", cfg.get("node_sources", "vpngate,vpnbook,ipspeed,vpngate_scraper,publicvpnlist") or "vpngate,vpnbook,ipspeed,vpngate_scraper,publicvpnlist"))
     print_line(format_line("节点拉取地区", cfg.get("target_countries", "") or "全部地区"))
     print_line(format_line("自动IP优先级", cfg.get("target_ip_types", "residential") or "全部类型"))
     print_line()
@@ -842,14 +842,14 @@ def configure_credentials():
 
 def configure_source():
     cfg = load_ui_cfg()
-    current = cfg.get('node_sources', 'vpngate,vpnbook,ipspeed,vpngate_scraper') or 'vpngate,vpnbook,ipspeed,vpngate_scraper'
+    current = cfg.get('node_sources', 'vpngate,vpnbook,ipspeed,vpngate_scraper,publicvpnlist') or 'vpngate,vpnbook,ipspeed,vpngate_scraper,publicvpnlist'
     print("\033[H\033[J", end="")
     print("=======================================================")
     print("                    节点来源配置                       ")
     print("=======================================================")
     print(f"当前节点来源: {current}")
-    print("  [1] VPNGate + VPNBook + IPSpeed + Vpngate-Scraper（推荐）")
-    print("  [2] VPNGate + IPSpeed + Vpngate-Scraper")
+    print("  [1] VPNGate + VPNBook + IPSpeed + Vpngate-Scraper + PublicVPNList（推荐）")
+    print("  [2] VPNGate + IPSpeed + Vpngate-Scraper + PublicVPNList")
     print("  [3] VPNGate + Vpngate-Scraper")
     print("  [4] VPNGate + VPNBook")
     print("  [5] VPNGate + VPNBook + IPSpeed")
@@ -857,12 +857,13 @@ def configure_source():
     print("  [7] 仅 VPNBook")
     print("  [8] 仅 IPSpeed")
     print("  [9] 仅 Vpngate-Scraper")
+    print("  [p] 仅 PublicVPNList")
     print("  [q] 返回主菜单")
     key = getch()
     if key == '1':
-        cfg['node_sources'] = 'vpngate,vpnbook,ipspeed,vpngate_scraper'
+        cfg['node_sources'] = 'vpngate,vpnbook,ipspeed,vpngate_scraper,publicvpnlist'
     elif key == '2':
-        cfg['node_sources'] = 'vpngate,ipspeed,vpngate_scraper'
+        cfg['node_sources'] = 'vpngate,ipspeed,vpngate_scraper,publicvpnlist'
     elif key == '3':
         cfg['node_sources'] = 'vpngate,vpngate_scraper'
     elif key == '4':
@@ -877,6 +878,8 @@ def configure_source():
         cfg['node_sources'] = 'ipspeed'
     elif key == '9':
         cfg['node_sources'] = 'vpngate_scraper'
+    elif key in ('p', 'P'):
+        cfg['node_sources'] = 'publicvpnlist'
     else:
         return
     save_ui_cfg(cfg)
@@ -1171,6 +1174,10 @@ TARGET_COUNTRIES_INPUT="$(${PYTHON_BIN} -c "import json; p='$AUTH_FILE'
 try:
  d=json.load(open(p,encoding='utf-8')); print(d.get('target_countries',''))
 except Exception: print('')" 2>/dev/null || echo '')"
+NODE_SOURCES_INPUT="$(${PYTHON_BIN} -c "import json; p='$AUTH_FILE'
+try:
+ d=json.load(open(p,encoding='utf-8')); print(d.get('node_sources',''))
+except Exception: print('')" 2>/dev/null || echo '')"
 TARGET_IP_TYPES_INPUT="$(${PYTHON_BIN} -c "import json; p='$AUTH_FILE'
 try:
  d=json.load(open(p,encoding='utf-8')); print(d.get('target_ip_types','residential'))
@@ -1183,7 +1190,7 @@ ${YELLOW}是否需要自定义配置网页面板参数？${PLAIN}"
 say "  -> 当前端口: ${GREEN}${UI_PORT}${PLAIN}"
 say "  -> 当前账号: ${GREEN}${UI_USERNAME}${PLAIN}"
 say "  -> 当前安全后缀: ${GREEN}${SECRET_PATH}${PLAIN}"
-say "  -> 当前节点来源: ${GREEN}${NODE_SOURCES_INPUT:-vpngate,vpnbook,ipspeed,vpngate_scraper}${PLAIN}"
+say "  -> 当前节点来源: ${GREEN}${NODE_SOURCES_INPUT:-vpngate,vpnbook,ipspeed,vpngate_scraper,publicvpnlist}${PLAIN}"
 say "  -> 当前拉取地区: ${GREEN}${TARGET_COUNTRIES_INPUT:-全部地区}${PLAIN}"
 say "  -> 当前自动IP类型: ${GREEN}${TARGET_IP_TYPES_INPUT:-residential}${PLAIN}"
 ask "是否现在配置端口/安全后缀/登录账号密码/拉取地区/IP类型？[y/N]: "
@@ -1228,7 +1235,7 @@ case "$is_custom" in
 esac
 
 if [ "$NEED_WRITE" = "1" ]; then
-    AUTH_FILE="$AUTH_FILE" UI_PORT="$UI_PORT" SECRET_PATH="$SECRET_PATH" UI_USERNAME="$UI_USERNAME" UI_PASSWORD="$UI_PASSWORD" TARGET_COUNTRIES_INPUT="$TARGET_COUNTRIES_INPUT" TARGET_IP_TYPES_INPUT="$TARGET_IP_TYPES_INPUT" ${PYTHON_BIN} - <<'PY_SAVE_AUTH'
+    AUTH_FILE="$AUTH_FILE" UI_PORT="$UI_PORT" SECRET_PATH="$SECRET_PATH" UI_USERNAME="$UI_USERNAME" UI_PASSWORD="$UI_PASSWORD" TARGET_COUNTRIES_INPUT="$TARGET_COUNTRIES_INPUT" NODE_SOURCES_INPUT="$NODE_SOURCES_INPUT" TARGET_IP_TYPES_INPUT="$TARGET_IP_TYPES_INPUT" ${PYTHON_BIN} - <<'PY_SAVE_AUTH'
 import json
 import os
 cfg = {
@@ -1238,7 +1245,7 @@ cfg = {
     'username': os.environ.get('UI_USERNAME') or 'admin',
     'password': os.environ.get('UI_PASSWORD') or 'admin',
     'target_countries': os.environ.get('TARGET_COUNTRIES_INPUT') or '',
-    'node_sources': os.environ.get('NODE_SOURCES_INPUT') or 'vpngate,vpnbook,ipspeed,vpngate_scraper',
+    'node_sources': os.environ.get('NODE_SOURCES_INPUT') or 'vpngate,vpnbook,ipspeed,vpngate_scraper,publicvpnlist',
     'target_ip_types': os.environ.get('TARGET_IP_TYPES_INPUT') or 'residential',
 }
 with open(os.environ['AUTH_FILE'], 'w', encoding='utf-8') as f:
