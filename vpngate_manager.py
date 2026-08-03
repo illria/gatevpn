@@ -2002,6 +2002,37 @@ def normalize_endpoint_keys(
     return keys
 
 
+def publicvpnlist_endpoint_aliases(
+    row: dict[str, Any],
+    dns_cache: dict[str, str | None] | None = None,
+) -> set[str]:
+    """Build endpoint aliases from snapshot/profile metadata before download."""
+
+    host = row.get("host") or row.get("hostname") or row.get("remote_host") or row.get("ip")
+    return normalize_endpoint_keys(
+        {
+            "ip": row.get("ip"),
+            "remote_host": host,
+            "host_name": host,
+            "remote_port": row.get("port") or row.get("remote_port"),
+            "proto": row.get("proto") or row.get("protocol") or row.get("transport"),
+        },
+        dns_cache,
+    )
+
+
+def publicvpnlist_blocking_endpoint_keys(nodes: list[dict[str, Any]]) -> set[str]:
+    """Return VPNGate/IPSpeed aliases that outrank PublicVPNList."""
+
+    blocked: set[str] = set()
+    dns_cache: dict[str, str | None] = {}
+    for node in nodes:
+        if str(node.get("source") or "").strip().lower() not in {"vpngate", "ipspeed"}:
+            continue
+        blocked.update(normalize_endpoint_keys(node, dns_cache))
+    return blocked
+
+
 def deduplicate_candidates(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """De-duplicate only the selected cross-source set in one stable pass.
 
@@ -2852,7 +2883,10 @@ def publicvpnlist_enrich_us_rows(
     return classifications, batch_failed
 
 
-def refresh_publicvpnlist_cache(cache: dict[str, Any] | None = None) -> dict[str, Any]:
+def refresh_publicvpnlist_cache(
+    cache: dict[str, Any] | None = None,
+    blocked_endpoint_keys: set[str] | None = None,
+) -> dict[str, Any]:
     """Refresh a source-wide cache and keep old profiles on every failure."""
 
     source_kind, _source_value = publicvpnlist_snapshot_source()
@@ -2918,16 +2952,24 @@ def refresh_publicvpnlist_cache(cache: dict[str, Any] | None = None) -> dict[str
     us_rejected = 0
     max_nodes_reached = False
     classification_failed = False
+    metadata_duplicate_skipped = 0
+    priority_duplicate_skipped = 0
+    actual_duplicate_skipped = 0
+    endpoint_dns_cache: dict[str, str | None] = {}
+    metadata_seen_endpoint_keys: set[str] = set()
+    accepted_endpoint_keys: set[str] = set()
+    priority_endpoint_keys = set(blocked_endpoint_keys or ())
 
-    def process_window(window: list[tuple[str, dict[str, Any]]]) -> bool:
+    def process_window(window: list[tuple[str, dict[str, Any], set[str]]]) -> bool:
         """Classify and download only the current <=100 eligible rows."""
 
-        nonlocal classification_failed, partial_failure, config_download_failed, us_rejected, max_nodes_reached
+        nonlocal classification_failed, partial_failure, config_download_failed
+        nonlocal us_rejected, max_nodes_reached, actual_duplicate_skipped
         if not window:
             return False
         classifications: dict[str, dict[str, Any]] = {}
         rows_to_classify: list[tuple[str, dict[str, Any]]] = []
-        for key, row in window:
+        for key, row, _metadata_keys in window:
             if row.get("country_short") != "US":
                 continue
             # Always pass the current window through vpn_utils.  It owns the
@@ -2941,10 +2983,16 @@ def refresh_publicvpnlist_cache(cache: dict[str, Any] | None = None) -> dict[str
             partial_failure = partial_failure or batch_failed
         cache["_us_classifications"].update(classifications)
 
-        for key, row in window:
+        for key, row, metadata_keys in window:
             if len(candidate_profiles) >= PUBLICVPNLIST_MAX_NODES:
                 max_nodes_reached = True
                 return True
+            # An earlier profile in this window may have added a newly
+            # resolved IP alias. Re-check before touching this row's temporary
+            # URL so that representation-only duplicates still cost no token.
+            if metadata_keys & (priority_endpoint_keys | accepted_endpoint_keys):
+                actual_duplicate_skipped += 1
+                continue
             effective_row = dict(row)
             if row.get("country_short") == "US":
                 classification = classifications.get(key)
@@ -2962,19 +3010,26 @@ def refresh_publicvpnlist_cache(cache: dict[str, Any] | None = None) -> dict[str
             existing = old_profiles.get(key)
             existing_config = str(existing.get("config_text") or "") if existing else ""
             if existing and looks_like_openvpn_config(existing_config):
-                profile = publicvpnlist_cache_profile(
-                    effective_row,
-                    existing_config,
-                    now=now,
-                    existing=existing,
-                    snapshot_checked_at=now,
-                )
-                candidate_profiles[key] = profile
-                candidate_order.append(key)
-                if len(candidate_profiles) >= PUBLICVPNLIST_MAX_NODES:
-                    max_nodes_reached = True
-                    return True
-                continue
+                node = publicvpnlist_row_to_node(effective_row, existing_config)
+                if node:
+                    actual_keys = normalize_endpoint_keys(node, endpoint_dns_cache)
+                    if actual_keys & (priority_endpoint_keys | accepted_endpoint_keys):
+                        actual_duplicate_skipped += 1
+                        continue
+                    profile = publicvpnlist_cache_profile(
+                        effective_row,
+                        node["config_text"],
+                        now=now,
+                        existing=existing,
+                        snapshot_checked_at=now,
+                    )
+                    candidate_profiles[key] = profile
+                    candidate_order.append(key)
+                    accepted_endpoint_keys.update(metadata_keys | actual_keys)
+                    if len(candidate_profiles) >= PUBLICVPNLIST_MAX_NODES:
+                        max_nodes_reached = True
+                        return True
+                    continue
 
             config_url = str(effective_row.get("temporary_ovpn_url") or "").strip()
             if not config_url:
@@ -2992,6 +3047,10 @@ def refresh_publicvpnlist_cache(cache: dict[str, Any] | None = None) -> dict[str
                 node = publicvpnlist_row_to_node(effective_row, config_text)
                 if not node:
                     raise PublicVPNListSnapshotError("OpenVPN remote/port/proto 校验失败")
+                actual_keys = normalize_endpoint_keys(node, endpoint_dns_cache)
+                if actual_keys & (priority_endpoint_keys | accepted_endpoint_keys):
+                    actual_duplicate_skipped += 1
+                    continue
                 profile = publicvpnlist_cache_profile(
                     effective_row,
                     node["config_text"],
@@ -3002,6 +3061,7 @@ def refresh_publicvpnlist_cache(cache: dict[str, Any] | None = None) -> dict[str
                 )
                 candidate_profiles[key] = profile
                 candidate_order.append(key)
+                accepted_endpoint_keys.update(metadata_keys | actual_keys)
                 if len(candidate_profiles) >= PUBLICVPNLIST_MAX_NODES:
                     max_nodes_reached = True
                     return True
@@ -3017,7 +3077,7 @@ def refresh_publicvpnlist_cache(cache: dict[str, Any] | None = None) -> dict[str
                 )
         return False
 
-    window: list[tuple[str, dict[str, Any]]] = []
+    window: list[tuple[str, dict[str, Any], set[str]]] = []
     for record in records:
         raw_scanned += 1
         if raw_scanned > PUBLICVPNLIST_MAX_RAW_ROWS:
@@ -3036,7 +3096,15 @@ def refresh_publicvpnlist_cache(cache: dict[str, Any] | None = None) -> dict[str
         key = publicvpnlist_profile_key(row)
         if not key:
             continue
-        window.append((key, row))
+        metadata_keys = publicvpnlist_endpoint_aliases(row, endpoint_dns_cache)
+        if metadata_keys & priority_endpoint_keys:
+            priority_duplicate_skipped += 1
+            continue
+        if metadata_keys & metadata_seen_endpoint_keys:
+            metadata_duplicate_skipped += 1
+            continue
+        metadata_seen_endpoint_keys.update(metadata_keys)
+        window.append((key, row, metadata_keys))
         if len(window) >= 100:
             if process_window(window):
                 break
@@ -3073,6 +3141,9 @@ def refresh_publicvpnlist_cache(cache: dict[str, Any] | None = None) -> dict[str
                 "raw_limit_hit": raw_limit_hit,
                 "eligible_limit_hit": eligible_limit_hit,
                 "max_nodes_reached": max_nodes_reached,
+                "metadata_duplicate_skipped": metadata_duplicate_skipped,
+                "priority_duplicate_skipped": priority_duplicate_skipped,
+                "actual_duplicate_skipped": actual_duplicate_skipped,
             },
         }
     )
@@ -3098,7 +3169,8 @@ def refresh_publicvpnlist_cache(cache: dict[str, Any] | None = None) -> dict[str
         f"快照扫描 raw={raw_scanned}/{PUBLICVPNLIST_MAX_RAW_ROWS}，"
         f"eligible={eligible_scanned}/{PUBLICVPNLIST_MAX_SCAN_ROWS}，"
         f"固定国家过滤={fixed_country_filtered}，raw_limit_hit={raw_limit_hit}，"
-        f"eligible_limit_hit={eligible_limit_hit}",
+        f"eligible_limit_hit={eligible_limit_hit}，元数据重复={metadata_duplicate_skipped}，"
+        f"高优先级重复={priority_duplicate_skipped}，配置端点重复={actual_duplicate_skipped}",
     )
     return cache
 
@@ -3127,6 +3199,188 @@ def publicvpnlist_hosts_match(row: dict[str, Any], config_host: str) -> bool:
     return False
 
 
+PUBLICVPNLIST_INLINE_BLOCKS = frozenset({"ca", "cert", "key", "tls-auth", "tls-crypt"})
+PUBLICVPNLIST_FILE_DIRECTIVES = frozenset(
+    {"ca", "cert", "key", "pkcs12", "secret", "tls-auth", "tls-crypt", "crl-verify"}
+)
+PUBLICVPNLIST_FORBIDDEN_DIRECTIVES = frozenset(
+    {
+        "http-proxy",
+        "http-proxy-user-pass",
+        "socks-proxy",
+        "socks-proxy-retry",
+        "plugin",
+        "config",
+        "include",
+        "askpass",
+        "log",
+        "log-append",
+        "status",
+        "writepid",
+        "daemon",
+        "cd",
+        "chroot",
+    }
+)
+PUBLICVPNLIST_PROTO_ALIASES = {
+    "tcp": "tcp",
+    "tcp-client": "tcp",
+    "tcp4": "tcp",
+    "tcp4-client": "tcp",
+    "udp": "udp",
+    "udp4": "udp",
+}
+
+
+def _publicvpnlist_config_lines(config_text: str) -> list[str]:
+    return config_text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+
+
+def _publicvpnlist_directive_tokens(raw: str) -> list[str]:
+    try:
+        return shlex.split(raw, comments=True, posix=True)
+    except ValueError as exc:
+        raise PublicVPNListSnapshotError("OpenVPN 配置包含无法解析的指令") from exc
+
+
+def _publicvpnlist_directive_name(value: Any) -> str:
+    name = str(value or "").strip().lower()
+    return name[2:] if name.startswith("--") else name
+
+
+def _publicvpnlist_strict_proto(value: Any) -> str:
+    return PUBLICVPNLIST_PROTO_ALIASES.get(str(value or "").strip().lower(), "")
+
+
+def parse_publicvpnlist_openvpn_remotes(config_text: str) -> tuple[list[dict[str, Any]], str]:
+    """Parse every active PublicVPNList remote and the normalized global proto."""
+
+    remotes: list[dict[str, Any]] = []
+    global_protos: list[str] = []
+    inline_block = ""
+    for raw in _publicvpnlist_config_lines(config_text):
+        stripped = raw.strip()
+        lower = stripped.lower()
+        if inline_block:
+            if lower == f"</{inline_block}>":
+                inline_block = ""
+            continue
+        tag_match = re.fullmatch(r"<(/?)([a-z0-9-]+)>", lower)
+        if tag_match:
+            closing, tag = tag_match.groups()
+            if closing or tag not in PUBLICVPNLIST_INLINE_BLOCKS:
+                raise PublicVPNListSnapshotError("OpenVPN 配置包含不允许的内嵌区块")
+            inline_block = tag
+            continue
+        if not stripped or stripped.startswith(("#", ";")):
+            continue
+        if stripped.endswith("\\"):
+            raise PublicVPNListSnapshotError("OpenVPN 配置不允许续行指令")
+        tokens = _publicvpnlist_directive_tokens(stripped)
+        if not tokens:
+            continue
+        directive = _publicvpnlist_directive_name(tokens[0])
+        if directive == "proto":
+            if len(tokens) != 2:
+                raise PublicVPNListSnapshotError("OpenVPN proto 指令格式无效")
+            proto = _publicvpnlist_strict_proto(tokens[1])
+            if not proto:
+                raise PublicVPNListSnapshotError("OpenVPN proto 不受支持")
+            global_protos.append(proto)
+        elif directive == "remote":
+            if len(tokens) not in {3, 4}:
+                raise PublicVPNListSnapshotError("OpenVPN remote 指令格式无效")
+            port = parse_int(tokens[2])
+            if not tokens[1].strip() or port <= 0 or port > 65535:
+                raise PublicVPNListSnapshotError("OpenVPN remote endpoint 无效")
+            remote_proto = ""
+            if len(tokens) == 4:
+                remote_proto = _publicvpnlist_strict_proto(tokens[3])
+                if not remote_proto:
+                    raise PublicVPNListSnapshotError("OpenVPN per-remote proto 不受支持")
+            remotes.append({"host": tokens[1], "port": port, "proto": remote_proto})
+    if inline_block:
+        raise PublicVPNListSnapshotError("OpenVPN 内嵌证书区块未闭合")
+    if len(set(global_protos)) > 1:
+        raise PublicVPNListSnapshotError("OpenVPN 配置包含冲突的全局 proto")
+    return remotes, global_protos[0] if global_protos else ""
+
+
+def sanitize_publicvpnlist_openvpn_config(config_text: str, row: dict[str, Any]) -> str:
+    """Validate and normalize one third-party profile to one safe endpoint."""
+
+    remotes, global_proto = parse_publicvpnlist_openvpn_remotes(config_text)
+    expected_proto = _publicvpnlist_strict_proto(row.get("proto"))
+    expected_port = parse_int(row.get("port") or row.get("remote_port"))
+    if not remotes or not expected_proto or expected_port <= 0:
+        raise PublicVPNListSnapshotError("OpenVPN 配置缺少可验证 endpoint")
+    if global_proto and global_proto != expected_proto:
+        raise PublicVPNListSnapshotError("OpenVPN 全局 proto 与快照不一致")
+    for remote in remotes:
+        remote_proto = str(remote.get("proto") or global_proto or expected_proto)
+        if remote.get("proto") and global_proto and remote.get("proto") != global_proto:
+            raise PublicVPNListSnapshotError("OpenVPN per-remote proto 与全局 proto 冲突")
+        if remote_proto != expected_proto:
+            raise PublicVPNListSnapshotError("OpenVPN remote proto 与快照不一致")
+        if int(remote["port"]) != expected_port or not publicvpnlist_hosts_match(row, str(remote["host"])):
+            raise PublicVPNListSnapshotError("OpenVPN remote endpoint 与快照不一致")
+
+    kept: list[str] = []
+    inline_block = ""
+    for raw in _publicvpnlist_config_lines(config_text):
+        stripped = raw.strip()
+        lower = stripped.lower()
+        if inline_block:
+            kept.append(raw)
+            if lower == f"</{inline_block}>":
+                inline_block = ""
+            continue
+        tag_match = re.fullmatch(r"<(/?)([a-z0-9-]+)>", lower)
+        if tag_match:
+            closing, tag = tag_match.groups()
+            if closing or tag not in PUBLICVPNLIST_INLINE_BLOCKS:
+                raise PublicVPNListSnapshotError("OpenVPN 配置包含不允许的内嵌区块")
+            inline_block = tag
+            kept.append(raw)
+            continue
+        if not stripped or stripped.startswith(("#", ";")):
+            kept.append(raw)
+            continue
+        tokens = _publicvpnlist_directive_tokens(stripped)
+        if not tokens:
+            kept.append(raw)
+            continue
+        directive = _publicvpnlist_directive_name(tokens[0])
+        if directive in {"remote", "proto", "remote-random", "remote-random-hostname"}:
+            continue
+        if directive == "auth-user-pass":
+            if len(tokens) != 1:
+                raise PublicVPNListSnapshotError("PublicVPNList 不允许配置指定本地认证文件")
+            # Authentication is supplied by the project through --auth-user-pass.
+            continue
+        if (
+            directive in PUBLICVPNLIST_FILE_DIRECTIVES
+            or directive in PUBLICVPNLIST_FORBIDDEN_DIRECTIVES
+            or directive.startswith("management-")
+            or directive == "management"
+            or directive.startswith("http-proxy-")
+            or directive.startswith("socks-proxy-")
+        ):
+            raise PublicVPNListSnapshotError(f"PublicVPNList 配置包含不允许的指令: {directive}")
+        kept.append(raw)
+
+    explicit_ip = row.get("ip") if is_valid_ip_text(row.get("ip")) else ""
+    canonical_host = normalize_endpoint_host(explicit_ip or row.get("host"))
+    if not canonical_host:
+        raise PublicVPNListSnapshotError("PublicVPNList 快照 endpoint host 无效")
+    body = sanitize_openvpn_config_for_eianun("\n".join(kept)).strip()
+    normalized = f"proto {expected_proto}\nremote {canonical_host} {expected_port}\n{body}\n"
+    final_remotes, final_proto = parse_publicvpnlist_openvpn_remotes(normalized)
+    if len(final_remotes) != 1 or final_proto != expected_proto:
+        raise PublicVPNListSnapshotError("PublicVPNList 配置未能规范化为唯一 endpoint")
+    return normalized
+
+
 def publicvpnlist_metric_int(value: Any) -> int:
     try:
         return int(float(str(value or "").strip()))
@@ -3137,10 +3391,15 @@ def publicvpnlist_metric_int(value: Any) -> int:
 def publicvpnlist_row_to_node(row: dict[str, Any], config_text: str) -> dict[str, Any] | None:
     if not looks_like_openvpn_config(config_text):
         return None
-    sanitized = sanitize_openvpn_config_for_eianun(config_text)
-    remote_host, remote_port, parsed_proto = vpn_utils.parse_remote(sanitized, str(row.get("host") or row.get("ip") or ""))
-    if not remote_host or not remote_port or normalize_endpoint_proto(parsed_proto) != normalize_endpoint_proto(row.get("proto")):
+    try:
+        sanitized = sanitize_publicvpnlist_openvpn_config(config_text, row)
+        remotes, parsed_proto = parse_publicvpnlist_openvpn_remotes(sanitized)
+    except PublicVPNListSnapshotError:
         return None
+    if len(remotes) != 1:
+        return None
+    remote_host = str(remotes[0]["host"])
+    remote_port = int(remotes[0]["port"])
     if parse_int(row.get("port")) != remote_port or not publicvpnlist_hosts_match(row, remote_host):
         return None
     ip = str(row.get("ip") or "") or resolve_publicvpnlist_ipv4(remote_host)
@@ -3178,7 +3437,11 @@ def publicvpnlist_row_to_node(row: dict[str, Any], config_text: str) -> dict[str
     return node
 
 
-def fetch_publicvpnlist_candidates(target_countries: list[str], seen_keys: set[str]) -> list[dict[str, Any]]:
+def fetch_publicvpnlist_candidates(
+    target_countries: list[str],
+    seen_keys: set[str],
+    blocked_endpoint_keys: set[str] | None = None,
+) -> list[dict[str, Any]]:
     source_kind, _source_value = publicvpnlist_snapshot_source()
     if not source_kind:
         log_to_json(
@@ -3205,7 +3468,7 @@ def fetch_publicvpnlist_candidates(target_countries: list[str], seen_keys: set[s
         )
         cache = cache or publicvpnlist_cache_default(publicvpnlist_snapshot_source_hash())
     else:
-        cache = refresh_publicvpnlist_cache(cache)
+        cache = refresh_publicvpnlist_cache(cache, blocked_endpoint_keys=blocked_endpoint_keys)
     cache = cache or publicvpnlist_cache_default(publicvpnlist_snapshot_source_hash())
     if publicvpnlist_prune_stale_profiles(cache):
         save_publicvpnlist_cache(cache)
@@ -3218,8 +3481,7 @@ def fetch_publicvpnlist_candidates(target_countries: list[str], seen_keys: set[s
             cache_order.append(key)
 
     us_candidates: list[dict[str, Any]] = []
-    ordered_rows: list[tuple[str, dict[str, Any]]] = []
-    ordered_candidates: list[dict[str, Any]] = []
+    ordered_rows: list[tuple[str, dict[str, Any], set[str]]] = []
     us_classifications = (
         dict(cache.get("_us_classifications"))
         if isinstance(cache.get("_us_classifications"), dict)
@@ -3231,11 +3493,13 @@ def fetch_publicvpnlist_candidates(target_countries: list[str], seen_keys: set[s
     target_filtered = 0
     config_rejected = 0
     scanned_rows = 0
+    metadata_duplicate_skipped = 0
+    priority_duplicate_skipped = 0
+    dns_cache: dict[str, str | None] = {}
+    metadata_seen_keys: set[str] = set()
+    priority_keys = set(blocked_endpoint_keys or ())
 
     for key in cache_order:
-        if scanned_rows >= PUBLICVPNLIST_MAX_SCAN_ROWS:
-            break
-        scanned_rows += 1
         profile = cache_profiles.get(key)
         if not isinstance(profile, dict):
             continue
@@ -3251,9 +3515,22 @@ def fetch_publicvpnlist_candidates(target_countries: list[str], seen_keys: set[s
         if not row_matches_target_countries(pseudo_row, target_countries):
             target_filtered += 1
             continue
-        ordered_rows.append((key, row))
+        metadata_keys = publicvpnlist_endpoint_aliases(row, dns_cache)
+        if metadata_keys & priority_keys:
+            priority_duplicate_skipped += 1
+            continue
+        if metadata_keys & metadata_seen_keys:
+            metadata_duplicate_skipped += 1
+            continue
+        if scanned_rows >= PUBLICVPNLIST_MAX_SCAN_ROWS:
+            break
+        scanned_rows += 1
+        metadata_seen_keys.update(metadata_keys)
+        ordered_rows.append((key, row, metadata_keys))
 
     classification_cache_changed = False
+    accepted_endpoint_keys: set[str] = set()
+    result: list[dict[str, Any]] = []
     # Cached profiles can be numerous even when MAX_NODES is small.  Process
     # them in the same <=100 windows as snapshot refresh, so a first accepted
     # window stops later US risk work immediately.
@@ -3261,14 +3538,14 @@ def fetch_publicvpnlist_candidates(target_countries: list[str], seen_keys: set[s
         window = ordered_rows[window_start : window_start + 100]
         rows_to_classify = [
             (key, row)
-            for key, row in window
+            for key, row, _metadata_keys in window
             if str(row.get("country_short") or "").upper() == "US" and key not in us_classifications
         ]
         if rows_to_classify:
             new_classifications, _classification_failed = publicvpnlist_enrich_us_rows(rows_to_classify)
             us_classifications.update(new_classifications)
 
-        for key, row in window:
+        for key, row, metadata_keys in window:
             country_short = str(row.get("country_short") or "").upper()
             if country_short == "US":
                 classification = us_classifications.get(key)
@@ -3291,38 +3568,32 @@ def fetch_publicvpnlist_candidates(target_countries: list[str], seen_keys: set[s
                 config_rejected += 1
                 log_to_json("WARNING", "PublicVPNList", f"配置校验失败，丢弃节点 {row.get('id') or row.get('host')}")
                 continue
-            ordered_candidates.append(node)
+            actual_keys = normalize_endpoint_keys(node, dns_cache)
+            if actual_keys & (priority_keys | accepted_endpoint_keys):
+                metadata_duplicate_skipped += 1
+                continue
+            accepted_endpoint_keys.update(metadata_keys | actual_keys)
+            result.append(node)
             if country_short == "US":
                 us_candidates.append(node)
-            if len(ordered_candidates) >= PUBLICVPNLIST_MAX_NODES:
+            primary_key = normalize_endpoint_key(node)
+            if primary_key:
+                seen_keys.add(primary_key)
+            if len(result) >= PUBLICVPNLIST_MAX_NODES:
                 break
-        if len(ordered_candidates) >= PUBLICVPNLIST_MAX_NODES:
+        if len(result) >= PUBLICVPNLIST_MAX_NODES:
             break
 
     if classification_cache_changed:
         cache["profiles"] = cache_profiles
         save_publicvpnlist_cache(cache)
 
-    local_keys: set[str] = set()
-    dns_cache: dict[str, str | None] = {}
-    result: list[dict[str, Any]] = []
-    for node in ordered_candidates:
-        keys = normalize_endpoint_keys(node, dns_cache)
-        if keys and keys & local_keys:
-            continue
-        local_keys.update(keys)
-        result.append(node)
-        primary_key = normalize_endpoint_key(node)
-        if primary_key:
-            seen_keys.add(primary_key)
-        if len(result) >= PUBLICVPNLIST_MAX_NODES:
-            break
-
     log_to_json(
         "INFO",
         "PublicVPNList",
         f"固定国家过滤丢弃 {fixed_filtered}，用户地区 {target_display} 丢弃 {target_filtered}，"
         f"配置校验/下载丢弃 {config_rejected}，扫描 {scanned_rows}/{PUBLICVPNLIST_MAX_SCAN_ROWS} 条，"
+        f"元数据/配置重复 {metadata_duplicate_skipped}，高优先级重复 {priority_duplicate_skipped}，"
         f"最终候选 {len(result)}，cache_stale={bool(cache.get('cache_stale'))}，refresh_failed={bool(cache.get('refresh_failed'))}",
     )
     log_to_json(
@@ -3340,8 +3611,12 @@ def fetch_candidates(target_override: list[str] | None = None) -> list[dict[str,
     target_countries = target_override if target_override is not None else get_target_countries()
     target_display = normalize_target_countries_input(target_countries) or "全部地区"
     sources = get_node_sources()
-    source_counts: dict[str, int] = {}
+    source_counts: dict[str, int] = {source: 0 for source in sources}
     for source in sources:
+        # PublicVPNList is fetched after VPNGate/IPSpeed so their higher
+        # priority endpoints can block short-lived profile downloads.
+        if source == "publicvpnlist":
+            continue
         before = len(candidates)
         # Source-local de-duplication keeps the final cross-source pass in
         # control of port/protocol distinctions and source priority.
@@ -3355,11 +3630,24 @@ def fetch_candidates(target_override: list[str] | None = None) -> list[dict[str,
                 candidates.extend(fetch_ipspeed_candidates(target_countries, source_seen_keys))
             elif source == "vpngate_scraper":
                 candidates.extend(fetch_vpngate_scraper_candidates(target_countries, source_seen_keys))
-            elif source == "publicvpnlist":
-                candidates.extend(fetch_publicvpnlist_candidates(target_countries, source_seen_keys))
         except Exception as exc:
             log_to_json("ERROR", "Main", f"节点来源 {source} 拉取失败: {exc}")
         source_counts[source] = len(candidates) - before
+    if "publicvpnlist" in sources:
+        before = len(candidates)
+        source_seen_keys: set[str] = set()
+        try:
+            blocked_endpoint_keys = publicvpnlist_blocking_endpoint_keys(candidates)
+            candidates.extend(
+                fetch_publicvpnlist_candidates(
+                    target_countries,
+                    source_seen_keys,
+                    blocked_endpoint_keys=blocked_endpoint_keys,
+                )
+            )
+        except Exception as exc:
+            log_to_json("ERROR", "Main", f"节点来源 publicvpnlist 拉取失败: {exc}")
+        source_counts["publicvpnlist"] = len(candidates) - before
     before_dedup = len(candidates)
     candidates = deduplicate_candidates(candidates)
     after_dedup = len(candidates)

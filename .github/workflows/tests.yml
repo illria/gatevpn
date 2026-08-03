@@ -27,7 +27,8 @@ jobs:
             vpngate_manager.py \
             vpn_utils.py \
             proxy_server.py \
-            tools/publicvpnlist-smoke.py
+            tools/publicvpnlist-smoke.py \
+            tools/repair_gatevpn_permissions.py
 
       - name: Run unit tests
         run: python3 -m unittest discover -s tests -p "test_*.py" -v

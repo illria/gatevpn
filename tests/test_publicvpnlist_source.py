@@ -117,7 +117,7 @@ class PublicVPNListSourceTests(unittest.TestCase):
             row["download_page_url"] = f"https://fixture.invalid/servers/{node_id}"
         return row
 
-    def fetch_rows(self, rows, target=None, enrich=None, snapshot=None, http_get=None):
+    def fetch_rows(self, rows, target=None, enrich=None, snapshot=None, http_get=None, blocked_endpoint_keys=None):
         configs = {}
         pages = {}
         for row in rows:
@@ -151,7 +151,9 @@ class PublicVPNListSourceTests(unittest.TestCase):
         with mock.patch.object(vpngate_manager, "fetch_publicvpnlist_snapshot", return_value=snapshot), mock.patch.object(
             vpngate_manager, "publicvpnlist_http_get", side_effect=fixture_http_get
         ), mock.patch.object(vpngate_manager.vpn_utils, "enrich_ip_info", side_effect=enrich) as enrich_mock:
-            result = vpngate_manager.fetch_publicvpnlist_candidates(target or [], set())
+            result = vpngate_manager.fetch_publicvpnlist_candidates(
+                target or [], set(), blocked_endpoint_keys=blocked_endpoint_keys
+            )
         return result, enrich_mock
 
     def candidate(self, source, ip, port=443, proto="tcp", host=None):
@@ -800,6 +802,121 @@ class PublicVPNListSourceTests(unittest.TestCase):
         result, _ = self.fetch_rows([row], http_get=lambda *args, **kwargs: bad_config.encode())
         self.assertEqual(result, [])
 
+    def test_all_remote_lines_are_validated_regardless_of_order(self):
+        row = self.row("all-remotes", "PH", "198.51.100.59", port=443, proto="tcp")
+        marker = f"remote {row['host']} {row['port']}\n"
+        bad_first = self.config(row["host"], row["port"]).replace(
+            marker,
+            f"remote 198.51.100.250 {row['port']}\n{marker}",
+        )
+        bad_last = self.config(row["host"], row["port"]).replace(
+            marker,
+            f"{marker}remote 198.51.100.250 {row['port']}\n",
+        )
+        self.assertIsNone(vpngate_manager.publicvpnlist_row_to_node(row, bad_first))
+        self.assertIsNone(vpngate_manager.publicvpnlist_row_to_node(row, bad_last))
+
+    def test_identical_remotes_are_folded_and_remote_random_is_removed(self):
+        row = self.row("fold-remotes", "PH", "198.51.100.61", port=443, proto="tcp")
+        marker = f"remote {row['host']} {row['port']}\n"
+        config = self.config(row["host"], row["port"]).replace(
+            marker,
+            f"{marker}remote {row['host']} {row['port']} tcp-client\nremote-random\nremote-random-hostname\n",
+        )
+        node = vpngate_manager.publicvpnlist_row_to_node(row, config)
+        self.assertIsNotNone(node)
+        remotes, proto = vpngate_manager.parse_publicvpnlist_openvpn_remotes(node["config_text"])
+        self.assertEqual(remotes, [{"host": row["host"], "port": row["port"], "proto": ""}])
+        self.assertEqual(proto, "tcp")
+        self.assertNotIn("remote-random", node["config_text"])
+
+    def test_per_remote_proto_conflicting_with_global_proto_is_rejected(self):
+        row = self.row("proto-conflict", "PH", "198.51.100.62", port=443, proto="tcp")
+        config = self.config(row["host"], row["port"]).replace(
+            f"remote {row['host']} {row['port']}\n",
+            f"remote {row['host']} {row['port']} udp\n",
+        )
+        self.assertIsNone(vpngate_manager.publicvpnlist_row_to_node(row, config))
+
+    def test_publicvpnlist_strict_boundary_rejects_local_and_control_directives(self):
+        row = self.row("strict-boundary", "PH", "198.51.100.63")
+        dangerous_directives = (
+            "http-proxy proxy.example 8080",
+            "http-proxy-user-pass /tmp/proxy.auth",
+            "socks-proxy proxy.example 1080",
+            "socks-proxy-retry",
+            "plugin /tmp/plugin.so",
+            "--plugin /tmp/plugin.so",
+            "management 127.0.0.1 7505",
+            "management-client",
+            "config /tmp/extra.conf",
+            "include /tmp/extra.conf",
+            "askpass /tmp/pass",
+            "auth-user-pass /tmp/auth",
+            "--auth-user-pass /tmp/auth",
+            "log /tmp/openvpn.log",
+            "log-append /tmp/openvpn.log",
+            "status /tmp/openvpn.status",
+            "writepid /tmp/openvpn.pid",
+            "daemon",
+            "cd /tmp",
+            "chroot /tmp",
+            "ca /tmp/ca.crt",
+            "cert /tmp/client.crt",
+            "key /tmp/client.key",
+            "pkcs12 /tmp/client.p12",
+            "secret /tmp/static.key",
+            "tls-auth /tmp/ta.key 1",
+            "tls-crypt /tmp/tc.key",
+            "crl-verify /tmp/crl.pem",
+        )
+        for directive in dangerous_directives:
+            with self.subTest(directive=directive):
+                config = self.config(row["host"], row["port"], row["proto"]) + directive + "\n"
+                self.assertIsNone(vpngate_manager.publicvpnlist_row_to_node(row, config))
+
+    def test_publicvpnlist_strict_boundary_keeps_allowed_inline_key_material(self):
+        row = self.row("inline-blocks", "PH", "198.51.100.66")
+        config = self.config(row["host"], row["port"], row["proto"])
+        for tag in ("cert", "key", "tls-auth", "tls-crypt"):
+            config += f"<{tag}>\nINLINE-{tag}\n</{tag}>\n"
+        node = vpngate_manager.publicvpnlist_row_to_node(row, config)
+        self.assertIsNotNone(node)
+        for tag in ("ca", "cert", "key", "tls-auth", "tls-crypt"):
+            self.assertIn(f"<{tag}>", node["config_text"])
+
+    def test_normalized_profile_is_the_only_config_read_by_openvpn_command(self):
+        row = self.row("strict-output", "PH", "198.51.100.64")
+        config = (
+            self.config(row["host"], row["port"], row["proto"])
+            + f"remote {row['host']} {row['port']} tcp-client\n"
+            + "remote-random\nremote-random-hostname\nauth-user-pass\n"
+        )
+        node = vpngate_manager.publicvpnlist_row_to_node(row, config)
+        self.assertIsNotNone(node)
+        config_path = Path(node["config_file"])
+        vpngate_manager.atomic_write_text(config_path, node["config_text"], mode=0o600)
+        with mock.patch.object(vpngate_manager, "_openvpn_version", 2.6):
+            command = vpngate_manager.openvpn_command(str(config_path), route_nopull=True)
+        command_config = Path(command[command.index("--config") + 1]).read_text(encoding="utf-8")
+        remotes, proto = vpngate_manager.parse_publicvpnlist_openvpn_remotes(command_config)
+        self.assertEqual(len(remotes), 1)
+        self.assertEqual(proto, "tcp")
+        self.assertNotIn("remote-random", command_config)
+        self.assertNotIn("auth-user-pass", command_config)
+
+    def test_rejected_dangerous_profile_never_enters_cache_nodes_or_ovpn(self):
+        row = self.row("rejected-output", "PH", "198.51.100.65")
+        config = self.config(row["host"], row["port"], row["proto"]) + "http-proxy proxy.example 8080\n"
+        result, _ = self.fetch_rows([row], http_get=lambda *args, **kwargs: config.encode())
+        self.assertEqual(result, [])
+        self.assertNotIn("http-proxy", self.cache_file.read_text(encoding="utf-8"))
+        nodes_file = Path(self.temp_dir.name) / "nodes.json"
+        with mock.patch.object(vpngate_manager, "NODES_FILE", nodes_file):
+            vpngate_manager.write_json(nodes_file, result)
+        self.assertNotIn("http-proxy", nodes_file.read_text(encoding="utf-8"))
+        self.assertEqual(list((Path(self.temp_dir.name) / "configs").glob("*.ovpn")), [])
+
     def test_dangerous_route_directive_is_sanitized_before_node_is_returned(self):
         row = self.row("unsafe-directive", "PH", "198.51.100.60")
         config = self.config(row["host"], row["port"], row["proto"]) + "redirect-gateway def1\n"
@@ -873,6 +990,83 @@ class PublicVPNListSourceTests(unittest.TestCase):
         ]
         result = vpngate_manager.deduplicate_candidates(nodes)
         self.assertEqual(len(result), 3)
+
+    def test_publicvpnlist_duplicate_endpoints_do_not_consume_max_nodes(self):
+        duplicates = [self.row(f"duplicate-{index}", "PH", "198.51.100.90") for index in range(100)]
+        unique = [
+            self.row("unique-one", "FR", "198.51.100.91"),
+            self.row("unique-two", "GB", "198.51.100.92"),
+        ]
+        rows = duplicates + unique
+        by_url = {row["temporary_ovpn_url"]: row for row in rows}
+        requested_urls = []
+
+        def http_get(url, **_kwargs):
+            requested_urls.append(url)
+            row = by_url[url]
+            return self.config(row["host"], row["port"], row["proto"]).encode()
+
+        with mock.patch.object(vpngate_manager, "PUBLICVPNLIST_MAX_NODES", 3):
+            result, _ = self.fetch_rows(rows, http_get=http_get)
+
+        self.assertEqual([node["ip"] for node in result], ["198.51.100.90", "198.51.100.91", "198.51.100.92"])
+        self.assertEqual(len(requested_urls), 3)
+        self.assertEqual(requested_urls[0], duplicates[0]["temporary_ovpn_url"])
+        for duplicate in duplicates[1:]:
+            self.assertNotIn(duplicate["temporary_ovpn_url"], requested_urls)
+
+    def test_vpngate_duplicate_rows_are_blocked_before_profile_download(self):
+        duplicate_rows = [self.row(f"vpngate-duplicate-{index}", "PH", "198.51.100.93") for index in range(100)]
+        independent = self.row("after-vpngate", "PH", "198.51.100.94")
+        rows = duplicate_rows + [independent]
+        requested_urls = []
+
+        def http_get(url, **_kwargs):
+            requested_urls.append(url)
+            return self.config(independent["host"], independent["port"], independent["proto"]).encode()
+
+        blocked = vpngate_manager.publicvpnlist_blocking_endpoint_keys(
+            [self.candidate("vpngate", "198.51.100.93")]
+        )
+        with mock.patch.object(vpngate_manager, "PUBLICVPNLIST_MAX_NODES", 1):
+            result, _ = self.fetch_rows(rows, http_get=http_get, blocked_endpoint_keys=blocked)
+
+        self.assertEqual([node["ip"] for node in result], [independent["ip"]])
+        self.assertEqual(requested_urls, [independent["temporary_ovpn_url"]])
+        for duplicate in duplicate_rows:
+            self.assertNotIn(duplicate["temporary_ovpn_url"], requested_urls)
+
+    def test_ipspeed_duplicate_rows_are_blocked_before_profile_download(self):
+        duplicate_rows = [self.row(f"ipspeed-duplicate-{index}", "PH", "198.51.100.95") for index in range(100)]
+        independent = self.row("after-ipspeed", "PH", "198.51.100.96")
+        rows = duplicate_rows + [independent]
+        requested_urls = []
+
+        def http_get(url, **_kwargs):
+            requested_urls.append(url)
+            return self.config(independent["host"], independent["port"], independent["proto"]).encode()
+
+        blocked = vpngate_manager.publicvpnlist_blocking_endpoint_keys(
+            [self.candidate("ipspeed", "198.51.100.95")]
+        )
+        with mock.patch.object(vpngate_manager, "PUBLICVPNLIST_MAX_NODES", 1):
+            result, _ = self.fetch_rows(rows, http_get=http_get, blocked_endpoint_keys=blocked)
+
+        self.assertEqual([node["ip"] for node in result], [independent["ip"]])
+        self.assertEqual(requested_urls, [independent["temporary_ovpn_url"]])
+
+    def test_publicvpnlist_dedupe_keeps_different_ports_and_protocols(self):
+        rows = [
+            self.row("tcp-443", "PH", "198.51.100.97", port=443, proto="tcp"),
+            self.row("tcp-1194", "PH", "198.51.100.97", port=1194, proto="tcp"),
+            self.row("udp-443", "PH", "198.51.100.97", port=443, proto="udp"),
+        ]
+        with mock.patch.object(vpngate_manager, "PUBLICVPNLIST_MAX_NODES", 3):
+            result, _ = self.fetch_rows(rows)
+        self.assertEqual(
+            [(node["remote_port"], node["proto"]) for node in result],
+            [(443, "tcp"), (1194, "tcp"), (443, "udp")],
+        )
 
     def test_dns_failure_keeps_hostname_endpoint(self):
         node = self.candidate("publicvpnlist", "", host="temporary.example", port=443, proto="tcp")
@@ -1128,6 +1322,37 @@ class PublicVPNListSourceTests(unittest.TestCase):
         ), mock.patch.object(vpngate_manager, "set_state"):
             result = vpngate_manager.fetch_candidates()
         self.assertEqual(result, [healthy])
+
+    def test_fetch_candidates_passes_vpngate_and_ipspeed_blockers_before_publicvpnlist(self):
+        vpngate_node = self.candidate("vpngate", "198.51.100.78")
+        ipspeed_node = self.candidate("ipspeed", "198.51.100.79")
+        call_order = []
+
+        def fetch_vpngate(*_args, **_kwargs):
+            call_order.append("vpngate")
+            return [vpngate_node]
+
+        def fetch_ipspeed(*_args, **_kwargs):
+            call_order.append("ipspeed")
+            return [ipspeed_node]
+
+        def fetch_publicvpnlist(_target, _seen, blocked_endpoint_keys=None):
+            call_order.append("publicvpnlist")
+            self.assertIn("198.51.100.78:443:tcp", blocked_endpoint_keys)
+            self.assertIn("198.51.100.79:443:tcp", blocked_endpoint_keys)
+            return []
+
+        with mock.patch.object(
+            vpngate_manager, "get_node_sources", return_value=["publicvpnlist", "vpngate", "ipspeed"]
+        ), mock.patch.object(vpngate_manager, "load_blacklist", return_value={}), mock.patch.object(
+            vpngate_manager, "fetch_vpngate_candidates", side_effect=fetch_vpngate
+        ), mock.patch.object(vpngate_manager, "fetch_ipspeed_candidates", side_effect=fetch_ipspeed), mock.patch.object(
+            vpngate_manager, "fetch_publicvpnlist_candidates", side_effect=fetch_publicvpnlist
+        ), mock.patch.object(vpngate_manager, "set_state"):
+            result = vpngate_manager.fetch_candidates()
+
+        self.assertEqual(call_order, ["vpngate", "ipspeed", "publicvpnlist"])
+        self.assertEqual(result, [vpngate_node, ipspeed_node])
 
     def test_snapshot_http_403_and_429_are_fail_closed(self):
         for status in (403, 429):

@@ -221,22 +221,11 @@ prepare_eianun_environment_file() {
 prepare_eianun_environment_file
 
 repair_sensitive_runtime_files() {
-    DATA_PATH="${INSTALL_DIR}/vpngate_data"
-    CONFIG_PATH="${DATA_PATH}/configs"
-    if [ -d "${CONFIG_PATH}" ] && ! chmod 700 "${CONFIG_PATH}"; then
-        say "${YELLOW}警告: 无法修复 OpenVPN 配置目录权限；未输出配置内容。${PLAIN}"
-    fi
-    for sensitive_file in \
-        "${DATA_PATH}/publicvpnlist_cache.json" \
-        "${DATA_PATH}/nodes.json" \
-        "${DATA_PATH}/vpngate_auth.txt" \
-        "${DATA_PATH}/ui_auth.json"; do
-        if [ -e "${sensitive_file}" ] && ! chmod 600 "${sensitive_file}"; then
-            say "${YELLOW}警告: 无法修复敏感文件权限: $(basename "${sensitive_file}")。${PLAIN}"
-        fi
-    done
-    if [ -d "${CONFIG_PATH}" ] && ! find "${CONFIG_PATH}" -type f \( -name '*.ovpn' -o -name '*.auth' \) -exec chmod 600 {} +; then
-        say "${YELLOW}警告: 无法完整修复 OpenVPN 配置文件权限；未输出配置内容。${PLAIN}"
+    if ! "${PYTHON_BIN}" "${INSTALL_DIR}/tools/repair_gatevpn_permissions.py" \
+        --install-dir "${INSTALL_DIR}" \
+        --env-file "${EIANUN_ENV_FILE}" \
+        --legacy-env-file "${LEGACY_ENV_FILE}"; then
+        say "${YELLOW}警告: 无法完整修复敏感运行文件权限；未输出环境变量或配置内容。${PLAIN}"
     fi
 }
 
