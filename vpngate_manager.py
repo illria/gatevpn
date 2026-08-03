@@ -3799,6 +3799,7 @@ def fetch_publicvpnlist_candidates(
                 return []
             log_to_json(
                 "INFO",
+                "PublicVPNList",
                 "PublicVPNList 仅使用缓存：未配置 PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS，不尝试下载新的 profile",
             )
             cache = cache or publicvpnlist_cache_default(publicvpnlist_snapshot_source_hash())

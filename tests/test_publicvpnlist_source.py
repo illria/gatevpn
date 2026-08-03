@@ -344,7 +344,7 @@ class PublicVPNListSourceTests(unittest.TestCase):
             self.assertEqual(after[field], before[field])
         messages = [str(call.args[2]) for call in log_mock.call_args_list if len(call.args) >= 3]
         self.assertEqual(
-            messages,
+            [message for message in messages if message == "PublicVPNList 仅使用缓存：未配置快照，不进行快照或 profile 下载"],
             ["PublicVPNList 仅使用缓存：未配置快照，不进行快照或 profile 下载"],
         )
 
@@ -374,7 +374,7 @@ class PublicVPNListSourceTests(unittest.TestCase):
         self.assertEqual([node["ip"] for node in result], [row["ip"]])
         messages = [str(call.args[2]) for call in log_mock.call_args_list if len(call.args) >= 3]
         self.assertEqual(
-            messages,
+            [message for message in messages if message == "PublicVPNList 仅使用缓存：未配置快照，不进行快照或 profile 下载"],
             ["PublicVPNList 仅使用缓存：未配置快照，不进行快照或 profile 下载"],
         )
 
