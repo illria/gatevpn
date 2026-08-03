@@ -21,6 +21,14 @@ def main() -> int:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     import vpngate_manager
 
+    if not vpngate_manager.publicvpnlist_allowed_download_hosts():
+        print(
+            "失败：请同时设置 PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS，填写真实冒烟确认的配置下载域名；"
+            "脚本不会猜测或自动放行域名。",
+            file=sys.stderr,
+        )
+        return 2
+
     try:
         payload = vpngate_manager.fetch_publicvpnlist_snapshot()
         records = vpngate_manager.publicvpnlist_payload_records(payload)
@@ -28,7 +36,7 @@ def main() -> int:
         print("失败：临时快照请求或 JSON 解析失败。", file=sys.stderr)
         return 1
 
-    print(f"快照结构：有效记录数组，共 {len(records)} 条")
+    print("快照结构验证通过")
     selected = None
     for record in records:
         row = vpngate_manager.normalize_publicvpnlist_row(record)
@@ -42,7 +50,10 @@ def main() -> int:
         return 1
 
     try:
-        config_text = vpngate_manager.fetch_publicvpnlist_config(str(selected["temporary_ovpn_url"]))
+        download_metadata = {}
+        config_text = vpngate_manager.fetch_publicvpnlist_config(
+            str(selected["temporary_ovpn_url"]), metadata=download_metadata
+        )
     except Exception:
         print("失败：temporary_ovpn_url 请求、重定向或配置读取失败。", file=sys.stderr)
         return 1
@@ -55,15 +66,17 @@ def main() -> int:
         print("失败：remote、port、proto 不一致，或配置清理/校验失败。", file=sys.stderr)
         return 1
 
-    # urllib follows ordinary HTTP redirects before fetch_publicvpnlist_config
-    # validates the body. Do not start OpenVPN or print any signed URL.
+    # Do not start OpenVPN or print any signed URL. Only report non-sensitive
+    # host/endpoint metadata and the redirect count.
     print(
-        "通过：已验证 1 个 {country} 节点，remote={host}:{port} proto={proto}；"
-        "配置已完成清理（未启动 OpenVPN）。".format(
+        "通过：country={country} remote={host}:{port} proto={proto} redirects={redirects} "
+        "final_download_host={download_host} config=valid cleaned=true openvpn=not_started".format(
             country=node.get("country_short", ""),
             host=node.get("remote_host", ""),
             port=node.get("remote_port", ""),
             proto=node.get("proto", ""),
+            redirects=download_metadata.get("redirect_count", 0),
+            download_host=download_metadata.get("final_download_host", ""),
         )
     )
     return 0

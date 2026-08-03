@@ -138,11 +138,16 @@ PUBLICVPNLIST_SNAPSHOT_URL=
 PUBLICVPNLIST_SNAPSHOT_FILE=
 PUBLICVPNLIST_MAX_NODES=100
 PUBLICVPNLIST_MAX_SCAN_ROWS=500
+PUBLICVPNLIST_MAX_RAW_ROWS=5000
 PUBLICVPNLIST_STALE_PROFILE_SECONDS=604800
 PUBLICVPNLIST_CONFIG_TIMEOUT_SECONDS=45
+PUBLICVPNLIST_MAX_REDIRECTS=5
+PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS=
 ```
 
 `PUBLICVPNLIST_REFRESH_SECONDS` 只是 URL 快照的刷新尝试间隔，不是已验证配置的硬过期时间。缓存按稳定的 `public id + normalized host + port + proto` 保存已清洗配置，并记录 `snapshot_source_hash`、`snapshot_fetched_at`、`last_refresh_attempt_at`、`last_refresh_success_at`、`config_validated_at`、`last_seen_at` 和 `snapshot_checked_at`。刷新失败、签名 URL 过期、临时配置链接失效或部分节点失败时，缓存会标记 stale/failed，但继续提供保留期内的旧验证配置；只有超过 `PUBLICVPNLIST_STALE_PROFILE_SECONDS` 的 profile 才会移除。地区过滤只在读取缓存后执行，切换 PH/FR 不会重新下载已经验证的配置。
+
+临时 `temporary_ovpn_url` 只允许 HTTPS，并且必须命中 `PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS` 中由用户确认的精确下载域名；程序会拒绝用户名密码、localhost、回环/私网/链路本地/云元数据地址，并在每次重定向时重新执行相同检查，超过 `PUBLICVPNLIST_MAX_REDIRECTS` 也会 fail closed。默认允许列表为空，因为项目不会猜测 PublicVPNList 的 CDN 或配置域名；用户应在一次真实冒烟确认后填入域名。临时 URL、query、签名和 token 不写日志或缓存。`PUBLICVPNLIST_MAX_RAW_ROWS` 是原始记录安全上限，`PUBLICVPNLIST_MAX_SCAN_ROWS` 只计算规范化后属于固定允许国家的记录；美国节点会先按最多 100 条批量风控，非住宅或无法分类的节点不会消耗配置下载和最终配额。
 
 PublicVPNList 与 VPNGate、IPSpeed 会按规范化的 `host/IP + port + tcp/udp` endpoint 去重；同一 endpoint 的优先级为 VPNGate > IPSpeed > PublicVPNList。VPNBook 和 Vpngate-Scraper 不参与这次跨来源优先级去重。DNS 临时失败仍保留 hostname key，协议或端口不同的 endpoint 不会误去重。`PUBLICVPNLIST_MAX_NODES` 限制最终节点数，`PUBLICVPNLIST_MAX_SCAN_ROWS` 限制扫描记录数；被美国住宅规则拒绝的节点不消耗最终配额。美国风控按最多 100 个节点一批调用现有 `vpn_utils.enrich_ip_info()`。
 
@@ -152,10 +157,11 @@ PublicVPNList 与 VPNGate、IPSpeed 会按规范化的 `host/IP + port + tcp/udp
 
 ```bash
 export PUBLICVPNLIST_SNAPSHOT_URL='用户自己生成的临时签名快照 URL'
+export PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS='真实冒烟确认的配置下载域名'
 python3 tools/publicvpnlist-smoke.py
 ```
 
-fixture 单元测试只验证离线解析和缓存行为，不代表线上 PublicVPNList 当前可用。只有在用户实际提供 URL 并且上述脚本输出“通过”后，才能确认本次线上快照冒烟成功。
+脚本只输出成功/失败、国家、remote/port/proto、重定向次数、最终下载域名和配置验证结果，不会输出完整 URL、query、签名或 token。fixture 单元测试只验证离线解析和缓存行为，不代表线上 PublicVPNList 当前可用；在用户提供真实临时 URL 并且脚本输出“通过”前，不应声称线上可用。
 
 
 ## 指定地区拉取节点
