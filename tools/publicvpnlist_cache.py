@@ -70,7 +70,7 @@ def profile_is_usable(
     if not math.isfinite(timestamp_value) or timestamp_value <= 0:
         return False
     current = time.time() if now is None else now
-    return current - timestamp_value < stale_profile_seconds
+    return current - timestamp_value < stale_seconds
 
 
 def cache_profile_summary(
