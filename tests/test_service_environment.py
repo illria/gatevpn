@@ -1,12 +1,15 @@
 import contextlib
 import importlib.util
 import io
+import json
+import py_compile
 import stat
 import subprocess
 import sys
 import unittest
 from pathlib import Path
 import tempfile
+from unittest import mock
 
 
 class ServiceEnvironmentTests(unittest.TestCase):
@@ -142,10 +145,11 @@ class ServiceEnvironmentTests(unittest.TestCase):
         start = self.install_text.index(marker) + len(marker)
         end = self.install_text.index("\nEOF\n", start)
         source = self.install_text[start:end]
-        compile(source, "install.sh:generated-en", "exec")
-
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
+            source_path = root / "generated-en.py"
+            source_path.write_text(source, encoding="utf-8")
+            py_compile.compile(str(source_path), doraise=True)
             env_file = root / "eianun-vpngate.env"
             legacy_env_file = root / "legacy.env"
             install_dir = root / "install"
@@ -177,6 +181,69 @@ class ServiceEnvironmentTests(unittest.TestCase):
             self.assertEqual(cleared.get("PUBLICVPNLIST_SNAPSHOT_URL"), "")
             self.assertEqual(cleared.get("PUBLICVPNLIST_SNAPSHOT_FILE"), "")
             self.assertEqual(cleared.get("PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS"), "")
+
+            old_contents = "KEEP_SETTING=unchanged\nPUBLICVPNLIST_SNAPSHOT_URL=https://old.example/old.json\n"
+            env_file.write_text(old_contents, encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(
+                namespace["os"], "replace", side_effect=OSError("replace failed")
+            ):
+                self.assertFalse(
+                    namespace["save_publicvpnlist_environment"](
+                        {"PUBLICVPNLIST_SNAPSHOT_URL": "https://new.example/new.json"}
+                    )
+                )
+            self.assertEqual(env_file.read_text(encoding="utf-8"), old_contents)
+
+    def test_generated_en_and_manager_share_cache_state_for_same_fixture(self):
+        marker = "cat > /usr/bin/en <<'EOF'\n"
+        start = self.install_text.index(marker) + len(marker)
+        end = self.install_text.index("\nEOF\n", start)
+        source = self.install_text[start:end]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_dir = root / "custom-data"
+            data_dir.mkdir()
+            cache_path = data_dir / "publicvpnlist_cache.json"
+            cache_path.write_text(
+                json.dumps(
+                    {
+                        "profiles": {
+                            "ph": {
+                                "country_short": "PH",
+                                "config_text": "client\ndev tun\nproto tcp\nremote fixture.example 443\n<ca>\nCERT\n</ca>\n",
+                                "last_seen_at": 2_000_000_000,
+                                "config_validated_at": 2_000_000_000,
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            namespace = {"__name__": "generated_en_ci"}
+            exec(compile(source, "install.sh:generated-en", "exec"), namespace)
+            values = {
+                "VPNGATE_DATA_DIR": str(data_dir),
+                "PUBLICVPNLIST_STALE_PROFILE_SECONDS": "604800",
+                "PUBLICVPNLIST_SNAPSHOT_URL": "",
+                "PUBLICVPNLIST_SNAPSHOT_FILE": "",
+                "PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS": "",
+            }
+            generated_state = namespace["publicvpnlist_state"](values)
+
+            import vpngate_manager
+
+            with mock.patch.object(vpngate_manager, "DATA_DIR", data_dir), mock.patch.object(
+                vpngate_manager, "PUBLICVPNLIST_CACHE_FILE", cache_path
+            ), mock.patch.object(vpngate_manager, "PUBLICVPNLIST_SNAPSHOT_URL", ""), mock.patch.object(
+                vpngate_manager, "PUBLICVPNLIST_SNAPSHOT_FILE", ""
+            ), mock.patch.object(vpngate_manager, "PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS", frozenset()), mock.patch.object(
+                vpngate_manager, "PUBLICVPNLIST_STALE_PROFILE_SECONDS", 604800
+            ):
+                manager_state = vpngate_manager.publicvpnlist_web_status()
+            self.assertEqual(generated_state["status"], manager_state["status"])
+            self.assertEqual(generated_state["effective_source_active"], manager_state["effective_source_active"])
+            self.assertEqual(generated_state["refresh_ready"], manager_state["refresh_ready"])
+            self.assertEqual(generated_state["cache_only"], manager_state["cache_only"])
 
 
 if __name__ == "__main__":

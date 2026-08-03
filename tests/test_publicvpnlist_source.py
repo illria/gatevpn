@@ -175,6 +175,81 @@ class PublicVPNListSourceTests(unittest.TestCase):
         self.assertEqual(vpngate_manager.split_node_sources("public_vpn_list,pvl"), ["publicvpnlist"])
         self.assertIn("PublicVPNList", vpngate_manager.node_sources_display("publicvpnlist"))
 
+    def test_split_node_sources_accepts_sequences_without_using_list_repr(self):
+        value = ["vpngate", "ipspeed", "publicvpnlist", "vpngate", "vpnbook"]
+        self.assertEqual(
+            vpngate_manager.split_node_sources(value),
+            ["vpngate", "ipspeed", "publicvpnlist", "vpnbook"],
+        )
+        self.assertEqual(
+            vpngate_manager.split_node_sources(("vpnbook", "vpngate", "vpnbook")),
+            ["vpnbook", "vpngate"],
+        )
+
+    def test_configured_and_effective_sources_are_separate(self):
+        with mock.patch.object(vpngate_manager, "NODE_SOURCES_ENV", ""), mock.patch.object(
+            vpngate_manager, "load_ui_config", return_value={"node_sources": "vpngate,publicvpnlist"}
+        ), mock.patch.object(vpngate_manager, "PUBLICVPNLIST_SNAPSHOT_URL", ""), mock.patch.object(
+            vpngate_manager, "PUBLICVPNLIST_SNAPSHOT_FILE", ""
+        ):
+            configured = vpngate_manager._configured_node_sources()
+            effective = vpngate_manager._effective_node_sources(configured, cache={}, source_active=False)
+            self.assertEqual(configured, ["vpngate", "publicvpnlist"])
+            self.assertEqual(effective, ["vpngate"])
+            self.assertIn("未配置快照", vpngate_manager.configured_node_sources_display(configured, "snapshot_missing"))
+            self.assertEqual(vpngate_manager.effective_node_sources_display(effective), "VPNGate")
+
+        with mock.patch.object(vpngate_manager, "NODE_SOURCES_ENV", ""), mock.patch.object(
+            vpngate_manager, "load_ui_config", return_value={"node_sources": "vpngate"}
+        ), mock.patch.object(vpngate_manager, "PUBLICVPNLIST_SNAPSHOT_URL", "https://fixture.invalid/snapshot"):
+            self.assertEqual(vpngate_manager.get_node_sources(), ["vpngate", "publicvpnlist"])
+
+    def test_get_state_reads_publicvpnlist_cache_once(self):
+        with mock.patch.object(
+            vpngate_manager,
+            "load_publicvpnlist_cache",
+            wraps=vpngate_manager.load_publicvpnlist_cache,
+        ) as cache_loader:
+            vpngate_manager.get_state()
+        self.assertEqual(cache_loader.call_count, 1)
+
+    def test_publicvpnlist_web_status_redacts_signed_url_and_local_path(self):
+        signed_url = "https://downloads.example/export.json?signature=secret&token=hidden"
+        local_path = str(Path(self.temp_dir.name) / "private-snapshot.json")
+        with mock.patch.object(vpngate_manager, "PUBLICVPNLIST_SNAPSHOT_URL", signed_url):
+            status = vpngate_manager.publicvpnlist_web_status()
+        encoded = json.dumps(status, ensure_ascii=False)
+        self.assertNotIn("signature=secret", encoded)
+        self.assertNotIn("token=hidden", encoded)
+        self.assertNotIn(local_path, encoded)
+        self.assertEqual(status["snapshot_file"], {"configured": False, "name": ""})
+
+        with mock.patch.object(vpngate_manager, "PUBLICVPNLIST_SNAPSHOT_URL", ""), mock.patch.object(
+            vpngate_manager, "PUBLICVPNLIST_SNAPSHOT_FILE", local_path
+        ):
+            status = vpngate_manager.publicvpnlist_web_status()
+        encoded = json.dumps(status, ensure_ascii=False)
+        self.assertNotIn(local_path, encoded)
+        self.assertEqual(status["snapshot_file"], {"configured": True, "name": "private-snapshot.json"})
+
+    def test_publicvpnlist_management_credentials_must_be_supplied_again(self):
+        with mock.patch.object(
+            vpngate_manager,
+            "load_ui_config",
+            return_value={"username": "admin", "password": "correct"},
+        ):
+            self.assertIsNotNone(vpngate_manager.validate_current_management_credentials({}))
+            self.assertIsNotNone(
+                vpngate_manager.validate_current_management_credentials(
+                    {"curr_username": "admin", "curr_password": "wrong"}
+                )
+            )
+            self.assertIsNone(
+                vpngate_manager.validate_current_management_credentials(
+                    {"curr_username": "admin", "curr_password": "correct"}
+                )
+            )
+
     def test_unconfigured_publicvpnlist_returns_empty_without_network(self):
         with mock.patch.object(vpngate_manager, "PUBLICVPNLIST_SNAPSHOT_URL", ""), mock.patch.object(
             vpngate_manager, "PUBLICVPNLIST_SNAPSHOT_FILE", ""
@@ -210,7 +285,7 @@ class PublicVPNListSourceTests(unittest.TestCase):
             cache["refresh_failed"] = True
             self.assertEqual(vpngate_manager.publicvpnlist_configuration_status(cache), "refresh_failed")
 
-    def test_missing_download_hosts_logs_once_and_cache_only_skips_refresh(self):
+    def test_missing_download_hosts_reuses_cache_without_refresh(self):
         row = self.row("cache-only-status", "PH", "198.51.100.55")
         first, _ = self.fetch_rows([row], target=["PH"])
         self.assertEqual(len(first), 1)
@@ -221,8 +296,12 @@ class PublicVPNListSourceTests(unittest.TestCase):
         ), mock.patch.object(vpngate_manager, "log_to_json") as log_mock:
             result = vpngate_manager.fetch_publicvpnlist_candidates(["PH"], set())
             status = vpngate_manager.publicvpnlist_configuration_status()
+            web_status = vpngate_manager.publicvpnlist_web_status()
         self.assertEqual([node["ip"] for node in result], [row["ip"]])
-        self.assertEqual(status, "cache_only")
+        self.assertEqual(status, "download_hosts_missing")
+        self.assertTrue(web_status["effective_source_active"])
+        self.assertFalse(web_status["refresh_ready"])
+        self.assertFalse(web_status["cache_only"])
         messages = [str(call.args[2]) for call in log_mock.call_args_list if len(call.args) >= 3]
         self.assertEqual(sum("仅使用缓存" in message for message in messages), 1)
 

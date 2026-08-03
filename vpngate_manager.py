@@ -37,6 +37,11 @@ socket.getaddrinfo = _ipv4_getaddrinfo
 
 import vpn_utils
 import proxy_server
+from tools.publicvpnlist_cache import (
+    cache_profile_summary as publicvpnlist_shared_cache_profile_summary,
+    resolve_vpngate_data_dir as publicvpnlist_resolve_data_dir,
+    stale_profile_seconds as publicvpnlist_shared_stale_profile_seconds,
+)
 
 API_URL = "https://www.vpngate.net/api/iphone/"
 VPNBOOK_OPENVPN_URL = os.environ.get("VPNBOOK_OPENVPN_URL", "https://www.vpnbook.com/freevpn/openvpn")
@@ -80,14 +85,9 @@ MAX_SCAN_ROWS = int(os.environ.get("MAX_SCAN_ROWS", "300"))
 # This is the interval at which a URL snapshot is attempted again. It is not
 # the lifetime of an already validated OpenVPN profile.
 PUBLICVPNLIST_REFRESH_SECONDS = max(0, int(os.environ.get("PUBLICVPNLIST_REFRESH_SECONDS", str(6 * 3600))))
-try:
-    PUBLICVPNLIST_STALE_PROFILE_SECONDS = int(
-        os.environ.get("PUBLICVPNLIST_STALE_PROFILE_SECONDS", str(7 * 24 * 3600))
-    )
-    if PUBLICVPNLIST_STALE_PROFILE_SECONDS <= 0:
-        raise ValueError()
-except (TypeError, ValueError):
-    PUBLICVPNLIST_STALE_PROFILE_SECONDS = 7 * 24 * 3600
+PUBLICVPNLIST_STALE_PROFILE_SECONDS = publicvpnlist_shared_stale_profile_seconds(
+    os.environ.get("PUBLICVPNLIST_STALE_PROFILE_SECONDS")
+)
 PUBLICVPNLIST_CONFIG_TIMEOUT_SECONDS = max(1, int(os.environ.get("PUBLICVPNLIST_CONFIG_TIMEOUT_SECONDS", "45")))
 PUBLICVPNLIST_MAX_NODES = max(1, int(os.environ.get("PUBLICVPNLIST_MAX_NODES", "100")))
 PUBLICVPNLIST_MAX_SCAN_ROWS = max(1, int(os.environ.get("PUBLICVPNLIST_MAX_SCAN_ROWS", "500")))
@@ -189,7 +189,7 @@ PROXY_FAIL_AUTO_SWITCH_THRESHOLD = max(1, int(os.environ.get("PROXY_FAIL_AUTO_SW
 AUTO_SWITCH_RETRY_COOLDOWN_SECONDS = max(10, int(os.environ.get("AUTO_SWITCH_RETRY_COOLDOWN_SECONDS", "45")))
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
+DATA_DIR = publicvpnlist_resolve_data_dir(os.environ.get("VPNGATE_DATA_DIR"), ROOT_DIR)
 CONFIG_DIR = DATA_DIR / "configs"
 NODES_FILE = DATA_DIR / "nodes.json"
 STATE_FILE = DATA_DIR / "state.json"
@@ -2812,19 +2812,12 @@ def publicvpnlist_cache_has_usable_profiles(cache: dict[str, Any] | None = None,
     """Return whether cache-only mode has at least one retained validated profile."""
 
     cache = cache if isinstance(cache, dict) else load_publicvpnlist_cache()
-    if not cache:
-        return False
-    now = time.time() if now is None else now
-    for profile in (cache.get("profiles") or {}).values():
-        if not isinstance(profile, dict) or not looks_like_openvpn_config(str(profile.get("config_text") or "")):
-            continue
-        try:
-            last_seen = float(profile.get("last_seen_at") or profile.get("config_validated_at") or 0)
-        except (TypeError, ValueError):
-            last_seen = 0.0
-        if last_seen and now - last_seen < PUBLICVPNLIST_STALE_PROFILE_SECONDS:
-            return True
-    return False
+    _count, usable = publicvpnlist_shared_cache_profile_summary(
+        cache,
+        now=now,
+        stale_seconds=PUBLICVPNLIST_STALE_PROFILE_SECONDS,
+    )
+    return usable > 0
 
 
 def publicvpnlist_configuration_status(cache: dict[str, Any] | None = None) -> str:
@@ -2962,13 +2955,11 @@ def publicvpnlist_redacted_snapshot_url(value: Any) -> dict[str, Any]:
 
 
 def publicvpnlist_cache_profile_count(cache: dict[str, Any] | None) -> int:
-    if not isinstance(cache, dict):
-        return 0
-    return sum(
-        1
-        for profile in (cache.get("profiles") or {}).values()
-        if isinstance(profile, dict) and str(profile.get("config_text") or "").strip()
+    count, _usable = publicvpnlist_shared_cache_profile_summary(
+        cache,
+        stale_seconds=PUBLICVPNLIST_STALE_PROFILE_SECONDS,
     )
+    return count
 
 
 def publicvpnlist_web_status() -> dict[str, Any]:
@@ -2977,7 +2968,11 @@ def publicvpnlist_web_status() -> dict[str, Any]:
     source_kind, _source_value = publicvpnlist_snapshot_source()
     hosts = sorted(publicvpnlist_allowed_download_hosts())
     effective_active = publicvpnlist_should_enable_source(cache, status=status)
-    has_cache = publicvpnlist_cache_has_usable_profiles(cache)
+    profile_count, usable_profile_count = publicvpnlist_shared_cache_profile_summary(
+        cache,
+        stale_seconds=PUBLICVPNLIST_STALE_PROFILE_SECONDS,
+    )
+    has_cache = usable_profile_count > 0
     refresh_ready = bool(source_kind and hosts)
     cache_only = bool(not source_kind and has_cache)
     readiness_message = ""
@@ -2997,13 +2992,13 @@ def publicvpnlist_web_status() -> dict[str, Any]:
         "snapshot": publicvpnlist_redacted_snapshot_url(PUBLICVPNLIST_SNAPSHOT_URL),
         "snapshot_file": {
             "configured": bool(PUBLICVPNLIST_SNAPSHOT_FILE),
-            "path": PUBLICVPNLIST_SNAPSHOT_FILE if PUBLICVPNLIST_SNAPSHOT_FILE else "",
+            "name": Path(PUBLICVPNLIST_SNAPSHOT_FILE).name if PUBLICVPNLIST_SNAPSHOT_FILE else "",
         },
         "download_hosts": hosts,
         "download_hosts_configured": bool(hosts),
         "cache": {
-            "usable_profiles": publicvpnlist_cache_has_usable_profiles(cache),
-            "profile_count": publicvpnlist_cache_profile_count(cache),
+            "usable_profiles": has_cache,
+            "profile_count": profile_count,
             "cache_stale": bool(cache and cache.get("cache_stale")),
             "refresh_failed": bool(cache and cache.get("refresh_failed")),
             "partial": bool(cache and cache.get("partial")),
@@ -7476,6 +7471,7 @@ if (adminBtn && adminDropdown) {
 function renderPublicVPNListSettings(data) {
   const status = data || {};
   const snapshot = status.snapshot || {};
+  const snapshotFile = status.snapshot_file || {};
   const cache = status.cache || {};
   const statusEl = $("settings_publicvpnlist_status");
   if (!statusEl) return;
@@ -7483,19 +7479,32 @@ function renderPublicVPNListSettings(data) {
   const hostState = status.download_hosts_configured ? "已配置" : "未配置下载域名";
   const snapshotState = snapshot.configured
     ? `${snapshot.scheme || "https"}://${snapshot.hostname || "已隐藏"}（已配置）`
-    : "未配置快照";
+    : snapshotFile.configured
+      ? "本地快照文件（已配置）"
+      : "未配置快照";
   const readiness = status.readiness_message ? `；${status.readiness_message}` : "";
-  statusEl.textContent = `${status.status_label || "PublicVPNList"}；快照：${snapshotState}；下载域名：${hostState}；缓存 profile：${cache.profile_count || 0}；effective source active: ${active}${readiness}`;
+  const refreshReady = status.refresh_ready ? "yes" : "no";
+  const cacheOnly = status.cache_only ? "yes" : "no";
+  statusEl.textContent = `${status.status_label || "PublicVPNList"}；快照：${snapshotState}；下载域名：${hostState}；缓存 profile：${cache.profile_count || 0}；effective source active: ${active}；refresh_ready: ${refreshReady}；cache_only: ${cacheOnly}${readiness}`;
   const fileEl = $("settings_publicvpnlist_file");
   const hostsEl = $("settings_publicvpnlist_hosts");
   const urlEl = $("settings_publicvpnlist_url");
-  if (fileEl) fileEl.value = (status.snapshot_file && status.snapshot_file.path) || "";
+  if (fileEl) {
+    fileEl.value = "";
+    fileEl.placeholder = snapshotFile.configured
+      ? "本地快照文件（已配置，输入新路径可替换）"
+      : "例如 /etc/eianun-vpngate/publicvpnlist.json";
+  }
   if (hostsEl) hostsEl.value = (status.download_hosts || []).join(",");
   if (urlEl) {
     urlEl.value = "";
-    urlEl.placeholder = snapshot.configured
-      ? `${snapshot.scheme || "https"}://${snapshot.hostname || "已隐藏"}（已配置，输入新 URL 可替换）`
-      : "输入用户提供的临时 HTTPS 快照 URL（不会回显）";
+    if (snapshot.configured) {
+      urlEl.placeholder = `${snapshot.scheme || "https"}://${snapshot.hostname || "已隐藏"}（已配置，输入新 URL 可替换）`;
+    } else if (snapshotFile.configured) {
+      urlEl.placeholder = "本地快照文件已配置，输入临时 HTTPS URL 可切换";
+    } else {
+      urlEl.placeholder = "输入用户提供的临时 HTTPS 快照 URL（不会回显）";
+    }
   }
 }
 
