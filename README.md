@@ -119,6 +119,8 @@ PUBLICVPNLIST_SNAPSHOT_FILE=
 
 `PUBLICVPNLIST_SNAPSHOT_URL` 只能填写用户自己生成的、短期有效的签名快照 URL；`PUBLICVPNLIST_SNAPSHOT_FILE` 填写用户已经下载到本地的 JSON 快照路径。项目不会自动操作 Export Builder，不猜测永久 API/feed，也不会绕过站点的 token、限流或反滥用设计。未配置 URL 或文件时，PublicVPNList 状态显示“未配置快照”、本轮返回空且不发起网络请求。
 
+要下载新的 `temporary_ovpn_url`，还必须设置用户在真实冒烟发现阶段确认过的 `PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS`。因此状态可能显示“未配置下载域名”；允许列表为空且已有保留期内的有效 profile 时，来源显示“仅使用缓存”，继续提供旧配置但不发起新的 profile 下载。快照和下载域名都可以通过安装后的 `en publicvpnlist` 管理，统一配置文件为 `/etc/eianun-vpngate.env`（权限 0600、root 所有），旧的 `/etc/default/eianun-vpngate` 会被兼容读取。
+
 每条记录只使用 `id`、国家、`host`/`ip`、`port`、`proto`、`speed`、`latency`、`checkedAt` 等元数据，以及有效的 `temporary_ovpn_url` 获取 `.ovpn` 配置。`download_page_url` 是 HTML 页面，不能当作 OpenVPN 配置；缺少或失效的 `temporary_ovpn_url` 会安全跳过节点并记录需要重新生成临时快照/配置下载链接。临时配置 URL 不会写入磁盘缓存；缓存只保存元数据和成功通过校验的配置文本，默认刷新周期为 21600 秒（6 小时）。
 
 PublicVPNList 是第三方聚合来源，节点数量、国家分布和配置可用性会动态变化。程序会先执行现有的 OpenVPN 配置清洗、远端地址/端口/协议校验，再加入统一节点池；快照返回 HTML challenge、HTTP 403/429、格式变化或下载失败时，会保留保留期内的已验证缓存并标记 stale/failed，其他来源仍继续工作；没有可保留的已验证 profile 时本轮才返回空。
@@ -149,15 +151,21 @@ PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS=
 
 临时 `temporary_ovpn_url` 只允许 HTTPS，并且必须命中 `PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS` 中由用户确认的精确下载域名；程序会拒绝用户名密码、localhost、回环/私网/链路本地/云元数据地址，并在每次重定向时重新执行相同检查，超过 `PUBLICVPNLIST_MAX_REDIRECTS` 也会 fail closed。默认允许列表为空，因为项目不会猜测 PublicVPNList 的 CDN 或配置域名；用户应在一次真实冒烟确认后填入域名。临时 URL、query、签名和 token 不写日志或缓存。`PUBLICVPNLIST_MAX_RAW_ROWS` 是原始记录安全上限，`PUBLICVPNLIST_MAX_SCAN_ROWS` 只计算规范化后属于固定允许国家的记录；美国节点会先按最多 100 条批量风控，非住宅或无法分类的节点不会消耗配置下载和最终配额。
 
+刷新按快照顺序以最多 100 条 eligible 记录为窗口，只对当前窗口的美国元数据执行批量 IP 类型查询；达到 `PUBLICVPNLIST_MAX_NODES` 后停止后续风控和配置请求。前 `PUBLICVPNLIST_MAX_RAW_ROWS` 条原始记录是额外安全上限，不允许国家不会消耗 eligible 扫描配额，也不会消耗配置下载令牌。
+
 PublicVPNList 与 VPNGate、IPSpeed 会按规范化的 `host/IP + port + tcp/udp` endpoint 去重；同一 endpoint 的优先级为 VPNGate > IPSpeed > PublicVPNList。VPNBook 和 Vpngate-Scraper 不参与这次跨来源优先级去重。DNS 临时失败仍保留 hostname key，协议或端口不同的 endpoint 不会误去重。`PUBLICVPNLIST_MAX_NODES` 限制最终节点数，`PUBLICVPNLIST_MAX_SCAN_ROWS` 限制扫描记录数；被美国住宅规则拒绝的节点不消耗最终配额。美国风控按最多 100 个节点一批调用现有 `vpn_utils.enrich_ip_info()`。
 
 ### PublicVPNList 手动真实快照冒烟测试
 
-该检查不会进入默认 CI，也不会启动 OpenVPN。必须由用户提供有效的临时快照 URL；脚本只选择一个 PH 或 FR 节点，验证快照结构、临时配置请求及重定向后的 OpenVPN 内容、remote/端口/proto 一致性和配置清理。脚本不会打印完整 URL、query、签名或 token：
+该检查不会进入默认 CI，也不会启动 OpenVPN。脚本分两阶段运行：第一次只需要快照 URL，读取并解析快照、选择一个 PH/FR 节点、验证 `temporary_ovpn_url` 的 HTTPS 和地址安全性，然后只输出需要加入允许列表的 hostname 并以退出码 2 结束，不会请求配置；加入 hostname 后再次运行，才会下载配置、逐次验证重定向，并检查 OpenVPN 内容、remote/端口/proto 一致性和配置清理。脚本不会打印完整 URL、query、签名或 token：
 
 ```bash
 export PUBLICVPNLIST_SNAPSHOT_URL='用户自己生成的临时签名快照 URL'
-export PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS='真实冒烟确认的配置下载域名'
+# 第一次运行：从输出中取得 hostname；退出码 2 表示发现阶段完成
+python3 tools/publicvpnlist-smoke.py
+
+export PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS='上一步确认的配置下载 hostname'
+# 第二次运行：执行真实配置下载和校验
 python3 tools/publicvpnlist-smoke.py
 ```
 
@@ -232,6 +240,12 @@ en web         # 修改网页绑定地址/安全后缀
 en port        # 修改网页端口
 en password    # 修改管理账号密码
 en source      # 设置节点来源：VPNGate / VPNBook / IPSpeed / Vpngate-Scraper / PublicVPNList
+en publicvpnlist status                         # 查看脱敏状态
+en publicvpnlist set-url                        # 交互设置临时快照 URL
+en publicvpnlist set-file /path/to/snapshot.json # 设置本地快照文件
+en publicvpnlist set-hosts download.example     # 设置下载域名允许列表
+en publicvpnlist clear                          # 清除快照/允许列表，保留缓存
+en publicvpnlist restart                        # 重启服务
 en country     # 设置节点拉取地区
 en iptype      # 设置自动选择/故障转移 IP 类型，例如住宅IP
 en update      # 从 GitHub 拉取最新代码并重新安装/重启

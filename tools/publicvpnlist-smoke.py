@@ -1,11 +1,27 @@
 #!/usr/bin/env python3
-"""Validate one user-provided PublicVPNList snapshot/profile without OpenVPN."""
+"""Validate one user-provided PublicVPNList snapshot/profile without OpenVPN.
+
+The first run is intentionally a discovery step.  It can run with only the
+temporary snapshot URL, validates the profile host without opening it, and
+prints the hostname that the user may add to the explicit download allowlist.
+The second run performs the bounded profile download and configuration checks.
+"""
 
 from __future__ import annotations
 
 import os
 import sys
 from pathlib import Path
+
+
+def _select_row(vpngate_manager, records):
+    for record in records:
+        row = vpngate_manager.normalize_publicvpnlist_row(record)
+        if not row or row.get("country_short") not in {"PH", "FR"}:
+            continue
+        if row.get("temporary_ovpn_url"):
+            return row
+    return None
 
 
 def main() -> int:
@@ -21,14 +37,6 @@ def main() -> int:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     import vpngate_manager
 
-    if not vpngate_manager.publicvpnlist_allowed_download_hosts():
-        print(
-            "失败：请同时设置 PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS，填写真实冒烟确认的配置下载域名；"
-            "脚本不会猜测或自动放行域名。",
-            file=sys.stderr,
-        )
-        return 2
-
     try:
         payload = vpngate_manager.fetch_publicvpnlist_snapshot()
         records = vpngate_manager.publicvpnlist_payload_records(payload)
@@ -37,25 +45,45 @@ def main() -> int:
         return 1
 
     print("快照结构验证通过")
-    selected = None
-    for record in records:
-        row = vpngate_manager.normalize_publicvpnlist_row(record)
-        if not row or row.get("country_short") not in {"PH", "FR"}:
-            continue
-        if row.get("temporary_ovpn_url"):
-            selected = row
-            break
+    selected = _select_row(vpngate_manager, records)
     if selected is None:
         print("失败：快照中没有带 temporary_ovpn_url 的 PH/FR 节点。", file=sys.stderr)
         return 1
 
+    temporary_url = str(selected["temporary_ovpn_url"])
     try:
-        download_metadata = {}
-        config_text = vpngate_manager.fetch_publicvpnlist_config(
-            str(selected["temporary_ovpn_url"]), metadata=download_metadata
+        discovered_host = vpngate_manager.publicvpnlist_validate_download_url(
+            temporary_url,
+            require_allowlist=False,
         )
     except Exception:
-        print("失败：temporary_ovpn_url 请求、重定向或配置读取失败。", file=sys.stderr)
+        print("失败：temporary_ovpn_url 未通过 HTTPS/地址安全检查。", file=sys.stderr)
+        return 1
+
+    allowed_hosts = vpngate_manager.publicvpnlist_allowed_download_hosts()
+    if discovered_host not in allowed_hosts:
+        print(
+            f"发现阶段通过：download_host={discovered_host}；未请求配置。\n"
+            "请将该 hostname 加入 PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS 后重试。",
+            file=sys.stderr,
+        )
+        return 2
+
+    download_metadata = {}
+    try:
+        config_text = vpngate_manager.fetch_publicvpnlist_config(
+            temporary_url,
+            metadata=download_metadata,
+        )
+    except Exception:
+        rejected_host = str(download_metadata.get("rejected_download_host") or "").strip().lower()
+        if rejected_host:
+            print(
+                f"失败：重定向目标 hostname={rejected_host} 不在允许列表；加入后重试。",
+                file=sys.stderr,
+            )
+        else:
+            print("失败：temporary_ovpn_url 请求、重定向或配置读取失败。", file=sys.stderr)
         return 1
 
     if not vpngate_manager.looks_like_openvpn_config(config_text):
@@ -76,7 +104,7 @@ def main() -> int:
             port=node.get("remote_port", ""),
             proto=node.get("proto", ""),
             redirects=download_metadata.get("redirect_count", 0),
-            download_host=download_metadata.get("final_download_host", ""),
+            download_host=download_metadata.get("final_download_host", discovered_host),
         )
     )
     return 0
