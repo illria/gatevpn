@@ -42,6 +42,7 @@ class PublicVPNListSourceTests(unittest.TestCase):
             DATA_DIR=data_dir,
             CONFIG_DIR=data_dir / "configs",
             PUBLICVPNLIST_CACHE_FILE=self.cache_file,
+            PUBLICVPNLIST_API_URL="",
             PUBLICVPNLIST_SNAPSHOT_URL="https://fixture.invalid/export-builder-snapshot.json?signature=fixture",
             PUBLICVPNLIST_SNAPSHOT_FILE="",
             PUBLICVPNLIST_REFRESH_SECONDS=3600,
@@ -167,10 +168,10 @@ class PublicVPNListSourceTests(unittest.TestCase):
             "proto": proto,
         }
 
-    def test_default_source_order_excludes_publicvpnlist_but_alias_is_available(self):
+    def test_default_source_order_includes_publicvpnlist_and_alias_is_available(self):
         self.assertEqual(
             vpngate_manager.split_node_sources("all"),
-            ["vpngate", "vpnbook", "ipspeed", "vpngate_scraper"],
+            ["vpngate", "vpnbook", "ipspeed", "vpngate_scraper", "publicvpnlist"],
         )
         self.assertEqual(vpngate_manager.split_node_sources("public_vpn_list,pvl"), ["publicvpnlist"])
         self.assertIn("PublicVPNList", vpngate_manager.node_sources_display("publicvpnlist"))
