@@ -33,9 +33,11 @@ class PublicVPNListSourceTests(unittest.TestCase):
             DATA_DIR=data_dir,
             CONFIG_DIR=data_dir / "configs",
             PUBLICVPNLIST_CACHE_FILE=self.cache_file,
-            PUBLICVPNLIST_SNAPSHOT_URL="https://fixture.invalid/openvpn-latest.json",
+            PUBLICVPNLIST_SNAPSHOT_URL="https://fixture.invalid/export-builder-snapshot.json?signature=fixture",
+            PUBLICVPNLIST_SNAPSHOT_FILE="",
             PUBLICVPNLIST_REFRESH_SECONDS=3600,
             PUBLICVPNLIST_MAX_NODES=100,
+            PUBLICVPNLIST_MAX_SCAN_ROWS=500,
             PUBLICVPNLIST_MAX_RESPONSE_BYTES=1024 * 1024,
             PUBLICVPNLIST_MAX_RETRIES=1,
         )
@@ -57,6 +59,9 @@ class PublicVPNListSourceTests(unittest.TestCase):
         temporary=True,
         page=True,
     ):
+        # This mirrors one Export Builder server record: server metadata lives
+        # in the JSON snapshot, while the temporary profile URL is separate
+        # from the HTML server page URL.
         row = {
             "id": node_id,
             "country": country,
@@ -77,21 +82,26 @@ class PublicVPNListSourceTests(unittest.TestCase):
 
     def fetch_rows(self, rows, target=None, enrich=None, snapshot=None, http_get=None):
         configs = {}
+        pages = {}
         for row in rows:
-            url = row.get("temporary_ovpn_url") or row.get("download_page_url")
+            url = row.get("temporary_ovpn_url")
             if url:
                 configs[url] = self.config(
                     row.get("host") or row.get("ip"),
                     row["port"],
                     row.get("proto", "tcp"),
                 ).encode()
+            if row.get("download_page_url"):
+                pages[row["download_page_url"]] = b"<html><body>server page</body></html>"
 
         def fixture_http_get(url, timeout=15, max_bytes=None):
             if http_get is not None:
                 return http_get(url, timeout=timeout, max_bytes=max_bytes)
-            if url not in configs:
-                raise AssertionError(f"unexpected fixture URL: {url}")
-            return configs[url]
+            if url in configs:
+                return configs[url]
+            if url in pages:
+                return pages[url]
+            raise AssertionError(f"unexpected fixture URL: {url}")
 
         snapshot = snapshot if snapshot is not None else {"data": rows}
         with mock.patch.object(vpngate_manager, "fetch_publicvpnlist_snapshot", return_value=snapshot), mock.patch.object(
@@ -111,13 +121,36 @@ class PublicVPNListSourceTests(unittest.TestCase):
             "proto": proto,
         }
 
-    def test_default_source_order_and_aliases_include_publicvpnlist(self):
+    def test_default_source_order_excludes_publicvpnlist_but_alias_is_available(self):
         self.assertEqual(
             vpngate_manager.split_node_sources("all"),
-            ["vpngate", "vpnbook", "ipspeed", "vpngate_scraper", "publicvpnlist"],
+            ["vpngate", "vpnbook", "ipspeed", "vpngate_scraper"],
         )
         self.assertEqual(vpngate_manager.split_node_sources("public_vpn_list,pvl"), ["publicvpnlist"])
         self.assertIn("PublicVPNList", vpngate_manager.node_sources_display("publicvpnlist"))
+
+    def test_unconfigured_publicvpnlist_returns_empty_without_network(self):
+        with mock.patch.object(vpngate_manager, "PUBLICVPNLIST_SNAPSHOT_URL", ""), mock.patch.object(
+            vpngate_manager, "PUBLICVPNLIST_SNAPSHOT_FILE", ""
+        ), mock.patch.object(
+            vpngate_manager, "fetch_publicvpnlist_snapshot", side_effect=AssertionError("network request")
+        ), mock.patch.object(
+            vpngate_manager, "publicvpnlist_http_get", side_effect=AssertionError("network request")
+        ), mock.patch.object(vpngate_manager, "log_to_json") as log_mock:
+            result = vpngate_manager.fetch_publicvpnlist_candidates([], set())
+            display = vpngate_manager.node_sources_display("publicvpnlist")
+        self.assertEqual(result, [])
+        self.assertIn("未配置快照", display)
+        messages = " ".join(str(call.args[2]) for call in log_mock.call_args_list if len(call.args) >= 3)
+        self.assertIn("未配置快照", messages)
+
+    def test_local_snapshot_file_is_supported(self):
+        snapshot_file = Path(self.temp_dir.name) / "export-builder.json"
+        snapshot_file.write_text(json.dumps({"data": []}), encoding="utf-8")
+        with mock.patch.object(vpngate_manager, "PUBLICVPNLIST_SNAPSHOT_URL", ""), mock.patch.object(
+            vpngate_manager, "PUBLICVPNLIST_SNAPSHOT_FILE", str(snapshot_file)
+        ), mock.patch.object(vpngate_manager, "publicvpnlist_http_get", side_effect=AssertionError("network request")):
+            self.assertEqual(vpngate_manager.fetch_publicvpnlist_snapshot(), {"data": []})
 
     def test_documented_snapshot_field_names_are_normalized(self):
         row = {
@@ -190,7 +223,7 @@ class PublicVPNListSourceTests(unittest.TestCase):
 
         result, enrich_mock = self.fetch_rows(rows, target=["US"], enrich=enrich)
         self.assertEqual([node["ip"] for node in result], ["198.51.100.40"])
-        enrich_mock.assert_called_once()
+        self.assertEqual(enrich_mock.call_count, len(rows))
 
     def test_us_dnsbl_only_result_is_not_a_complete_classification(self):
         row = self.row("us-dnsbl", "US", "198.51.100.45")
@@ -222,17 +255,38 @@ class PublicVPNListSourceTests(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(calls, [row["temporary_ovpn_url"]])
 
-    def test_download_page_url_is_fallback_when_temporary_url_is_absent(self):
-        row = self.row("page-fallback", "PH", "198.51.100.51", temporary=False, page=True)
+    def test_download_page_url_html_is_skipped_without_config_build(self):
+        row = self.row("html-page", "PH", "198.51.100.51", temporary=False, page=True)
         calls = []
 
         def http_get(url, timeout=15, max_bytes=None):
             calls.append(url)
-            return self.config(row["host"], row["port"], row["proto"]).encode()
+            return b"<html><body>PublicVPNList server page</body></html>"
 
-        result, _ = self.fetch_rows([row], http_get=http_get)
-        self.assertEqual(len(result), 1)
-        self.assertEqual(calls, [row["download_page_url"]])
+        with mock.patch.object(vpngate_manager, "fetch_publicvpnlist_config") as config_builder, mock.patch.object(
+            vpngate_manager, "log_to_json"
+        ) as log_mock:
+            result, _ = self.fetch_rows([row], http_get=http_get)
+        self.assertEqual(result, [])
+        self.assertEqual(calls, [])
+        config_builder.assert_not_called()
+        messages = " ".join(str(call.args[2]) for call in log_mock.call_args_list if len(call.args) >= 3)
+        self.assertIn("download_page_url", messages)
+        self.assertIn("重新生成", messages)
+
+    def test_expired_temporary_snapshot_profile_is_skipped(self):
+        row = self.row("expired-profile", "PH", "198.51.100.61")
+        with mock.patch.object(vpngate_manager, "fetch_publicvpnlist_snapshot", return_value={"data": [row]}), mock.patch.object(
+            vpngate_manager,
+            "fetch_publicvpnlist_config",
+            side_effect=vpngate_manager.PublicVPNListSnapshotError("HTTP 410 temporary URL expired"),
+        ) as config_builder, mock.patch.object(vpngate_manager, "log_to_json") as log_mock:
+            result = vpngate_manager.fetch_publicvpnlist_candidates(["PH"], set())
+        self.assertEqual(result, [])
+        config_builder.assert_called_once_with(row["temporary_ovpn_url"])
+        messages = " ".join(str(call.args[2]) for call in log_mock.call_args_list if len(call.args) >= 3)
+        self.assertIn("temporary_ovpn_url", messages)
+        self.assertIn("重新生成", messages)
 
     def test_temporary_token_is_not_in_node_or_cache(self):
         row = self.row("cache-token", "PH", "198.51.100.52")
@@ -319,6 +373,38 @@ class PublicVPNListSourceTests(unittest.TestCase):
         self.assertEqual(len(result), 2)
         self.assertEqual({node["source"] for node in result}, {"vpngate", "publicvpnlist"})
 
+    def test_vpnbook_and_vpngate_same_endpoint_are_both_kept(self):
+        nodes = [
+            self.candidate("vpnbook", "198.51.100.74"),
+            self.candidate("vpngate", "198.51.100.74"),
+        ]
+        result = vpngate_manager.deduplicate_candidates(nodes)
+        self.assertEqual([node["source"] for node in result], ["vpnbook", "vpngate"])
+
+    def test_vpngate_scraper_and_ipspeed_same_endpoint_are_both_kept(self):
+        nodes = [
+            self.candidate("vpngate_scraper", "198.51.100.75"),
+            self.candidate("ipspeed", "198.51.100.75"),
+        ]
+        result = vpngate_manager.deduplicate_candidates(nodes)
+        self.assertEqual([node["source"] for node in result], ["vpngate_scraper", "ipspeed"])
+
+    def test_publicvpnlist_same_endpoint_loses_to_vpngate(self):
+        nodes = [
+            self.candidate("publicvpnlist", "198.51.100.76"),
+            self.candidate("vpngate", "198.51.100.76"),
+        ]
+        result = vpngate_manager.deduplicate_candidates(nodes)
+        self.assertEqual([node["source"] for node in result], ["vpngate"])
+
+    def test_publicvpnlist_same_endpoint_loses_to_ipspeed(self):
+        nodes = [
+            self.candidate("publicvpnlist", "198.51.100.77"),
+            self.candidate("ipspeed", "198.51.100.77"),
+        ]
+        result = vpngate_manager.deduplicate_candidates(nodes)
+        self.assertEqual([node["source"] for node in result], ["ipspeed"])
+
     def test_hostname_resolving_to_same_ip_is_deduplicated(self):
         nodes = [
             self.candidate("publicvpnlist", "198.51.100.71", host="198.51.100.71"),
@@ -345,6 +431,42 @@ class PublicVPNListSourceTests(unittest.TestCase):
             result = vpngate_manager.deduplicate_candidates([node])
         self.assertEqual(keys, {"temporary.example:443:tcp"})
         self.assertEqual(result, [node])
+
+    def test_large_hostname_dedupe_resolves_each_hostname_once_and_is_stable(self):
+        nodes = [
+            self.candidate("ipspeed", "", host=f"node-{index}.example", port=443, proto="tcp")
+            for index in range(300)
+        ]
+
+        def resolve(host):
+            index = int(host.removeprefix("node-").removesuffix(".example"))
+            return f"198.18.{index // 256}.{index % 256}"
+
+        with mock.patch.object(vpngate_manager.socket, "gethostbyname", side_effect=resolve) as resolver:
+            result = vpngate_manager.deduplicate_candidates(nodes)
+        self.assertEqual(len(result), 300)
+        self.assertEqual([node["id"] for node in result], [node["id"] for node in nodes])
+        self.assertEqual(resolver.call_count, 300)
+        self.assertEqual({call.args[0] for call in resolver.call_args_list}, {f"node-{i}.example" for i in range(300)})
+
+    def test_us_nonresidential_rows_do_not_consume_final_quota(self):
+        us_rows = [self.row(f"us-hosting-{i}", "US", f"198.19.{i // 256}.{(i % 256) + 1}") for i in range(100)]
+        other_rows = [
+            self.row("ph-after-us", "PH", "198.20.0.1"),
+            self.row("fr-after-us", "FR", "198.20.0.2"),
+            self.row("gb-after-us", "GB", "198.20.0.3"),
+        ]
+
+        def enrich(nodes):
+            for node in nodes:
+                node["ip_type"] = "hosting"
+                node["risk_sources"] = ["ip-api.com"]
+
+        with mock.patch.object(vpngate_manager, "PUBLICVPNLIST_MAX_NODES", 3), mock.patch.object(
+            vpngate_manager, "PUBLICVPNLIST_MAX_SCAN_ROWS", 500
+        ):
+            result, _ = self.fetch_rows(us_rows + other_rows, target=[], enrich=enrich)
+        self.assertEqual([node["country_short"] for node in result], ["PH", "FR", "GB"])
 
     def test_source_failure_does_not_stop_other_sources(self):
         healthy = self.candidate("vpngate", "198.51.100.73")

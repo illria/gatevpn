@@ -6,7 +6,7 @@
 
 - 名称统一改为 **Eianun免费聚合落地IP**。
 - 移除 Web UI 里的 VPS 推广广告和 README 中的推广徽章/链接。
-- 新增多节点来源：默认同时拉取 **VPNGate + VPNBook + IPSpeed + Vpngate-Scraper + PublicVPNList**；也可在面板里切换为任意单一或组合来源。
+- 新增多节点来源：默认同时拉取 **VPNGate + VPNBook + IPSpeed + Vpngate-Scraper**；PublicVPNList 作为需要用户快照的可选来源，也可在面板里切换为任意单一或组合来源。
 - VPNBook 来源默认只抓取节点、不参与启动阶段批量 OpenVPN 检测，避免部分 VPS 因 VPNBook 节点握手/路由推送导致 SSH 卡死。
 - 新增后端节点地区过滤：可只保留指定国家/地区节点，不再默认把全部地区节点都写入节点池。
 - Web 管理后台“管理员设置”新增 **节点来源** 和 **拉取地区过滤** 配置。
@@ -66,7 +66,7 @@ RHEL / CentOS / Rocky / AlmaLinux 等系统会尝试自动安装 `epel-release`�
 默认来源为：
 
 ```text
-vpngate,vpnbook,ipspeed,vpngate_scraper,publicvpnlist
+vpngate,vpnbook,ipspeed,vpngate_scraper
 ```
 
 可以在 Web 管理后台修改：
@@ -84,7 +84,7 @@ en source
 或写入 `/etc/default/eianun-vpngate`：
 
 ```bash
-NODE_SOURCES=vpngate,vpnbook,ipspeed,vpngate_scraper,publicvpnlist
+NODE_SOURCES=vpngate,vpnbook,ipspeed,vpngate_scraper
 # 可选：vpngate / vpnbook / ipspeed / vpngate_scraper / publicvpnlist / 多个来源用逗号组合
 ```
 
@@ -109,8 +109,17 @@ Vpngate-Scraper 来源会读取 `https://github.com/fdciabdul/Vpngate-Scraper-AP
 
 ### PublicVPNList 来源说明
 
-PublicVPNList 来源默认读取官方 OpenVPN JSON 快照：
-`https://publicvpnlist.com/exports/openvpn-latest.json`。每条记录只使用 `id`、国家、`host`/`ip`、`port`、`proto`、`speed`、`latency`、`checkedAt` 等元数据，以及记录提供的 `temporary_ovpn_url` 或 `download_page_url` 获取 `.ovpn` 配置。短期配置 URL 不会写入磁盘缓存；缓存只保存元数据和成功通过校验的配置文本，默认刷新周期为 21600 秒（6 小时）。
+PublicVPNList 默认不加入 `NODE_SOURCES`。启用该来源前，用户必须提供一次有效的 Export Builder 临时 JSON 快照输入：
+
+```bash
+# 二选一，也可以同时设置；本地文件优先
+PUBLICVPNLIST_SNAPSHOT_URL=
+PUBLICVPNLIST_SNAPSHOT_FILE=
+```
+
+`PUBLICVPNLIST_SNAPSHOT_URL` 只能填写用户自己生成的、短期有效的签名快照 URL；`PUBLICVPNLIST_SNAPSHOT_FILE` 填写用户已经下载到本地的 JSON 快照路径。项目不会自动操作 Export Builder，不猜测永久 API/feed，也不会绕过站点的 token、限流或反滥用设计。未配置 URL 或文件时，PublicVPNList 状态显示“未配置快照”、本轮返回空且不发起网络请求。
+
+每条记录只使用 `id`、国家、`host`/`ip`、`port`、`proto`、`speed`、`latency`、`checkedAt` 等元数据，以及有效的 `temporary_ovpn_url` 获取 `.ovpn` 配置。`download_page_url` 是 HTML 页面，不能当作 OpenVPN 配置；缺少或失效的 `temporary_ovpn_url` 会安全跳过节点并记录需要重新生成临时快照/配置下载链接。临时配置 URL 不会写入磁盘缓存；缓存只保存元数据和成功通过校验的配置文本，默认刷新周期为 21600 秒（6 小时）。
 
 PublicVPNList 是第三方聚合来源，节点数量、国家分布和配置可用性会动态变化。程序会先执行现有的 OpenVPN 配置清洗、远端地址/端口/协议校验，再加入统一节点池；快照返回 HTML challenge、HTTP 403/429、格式变化或下载失败时，该来源本轮返回空，其他来源仍继续工作。
 
@@ -125,11 +134,13 @@ PublicVPNList 的固定允许国家为 `PH, US, FR, GB, ID, FI, DE, TW, AU, NL`�
 
 ```bash
 PUBLICVPNLIST_REFRESH_SECONDS=21600
-PUBLICVPNLIST_SNAPSHOT_URL=https://publicvpnlist.com/exports/openvpn-latest.json
+PUBLICVPNLIST_SNAPSHOT_URL=
+PUBLICVPNLIST_SNAPSHOT_FILE=
 PUBLICVPNLIST_MAX_NODES=100
+PUBLICVPNLIST_MAX_SCAN_ROWS=500
 ```
 
-PublicVPNList 与其他来源会按规范化的 `host/IP + port + tcp/udp` endpoint 去重；同一 endpoint 的优先级为 VPNGate > IPSpeed > PublicVPNList。DNS 临时失败不会删除原节点，协议或端口不同的 endpoint 不会误去重。
+PublicVPNList 与 VPNGate、IPSpeed 会按规范化的 `host/IP + port + tcp/udp` endpoint 去重；同一 endpoint 的优先级为 VPNGate > IPSpeed > PublicVPNList。VPNBook 和 Vpngate-Scraper 不参与这次跨来源优先级去重。DNS 临时失败仍保留 hostname key，协议或端口不同的 endpoint 不会误去重。`PUBLICVPNLIST_MAX_NODES` 限制最终节点数，`PUBLICVPNLIST_MAX_SCAN_ROWS` 限制扫描记录数；被美国住宅规则拒绝的节点不消耗最终配额。
 
 
 ## 指定地区拉取节点
