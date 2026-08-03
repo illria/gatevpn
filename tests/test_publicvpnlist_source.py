@@ -314,6 +314,130 @@ class PublicVPNListSourceTests(unittest.TestCase):
         messages = [str(call.args[2]) for call in log_mock.call_args_list if len(call.args) >= 3]
         self.assertEqual(sum("未配置下载域名" in message for message in messages), 1)
 
+    def test_no_snapshot_with_valid_cache_returns_cached_candidates(self):
+        row = self.row("no-snapshot-cache", "PH", "198.51.100.56")
+        first, _ = self.fetch_rows([row], target=["PH"])
+        self.assertEqual(len(first), 1)
+        before = json.loads(self.cache_file.read_text(encoding="utf-8"))
+
+        with mock.patch.object(vpngate_manager, "PUBLICVPNLIST_SNAPSHOT_URL", ""), mock.patch.object(
+            vpngate_manager, "PUBLICVPNLIST_SNAPSHOT_FILE", ""
+        ), mock.patch.object(
+            vpngate_manager, "fetch_publicvpnlist_snapshot", side_effect=AssertionError("cache-only snapshot refresh")
+        ), mock.patch.object(
+            vpngate_manager, "fetch_publicvpnlist_config", side_effect=AssertionError("cache-only profile download")
+        ), mock.patch.object(
+            vpngate_manager, "publicvpnlist_http_get", side_effect=AssertionError("cache-only network request")
+        ), mock.patch.object(vpngate_manager, "log_to_json") as log_mock:
+            sources = vpngate_manager.get_node_sources()
+            result = vpngate_manager.fetch_publicvpnlist_candidates(["PH"], set())
+            status = vpngate_manager.publicvpnlist_web_status()
+
+        self.assertIn("publicvpnlist", sources)
+        self.assertEqual([node["ip"] for node in result], [row["ip"]])
+        self.assertEqual(status["status"], "cache_only")
+        self.assertTrue(status["effective_source_active"])
+        self.assertFalse(status["refresh_ready"])
+        self.assertTrue(status["cache_only"])
+        after = json.loads(self.cache_file.read_text(encoding="utf-8"))
+        for field in ("snapshot_source_hash", "snapshot_fetched_at", "last_refresh_attempt_at", "last_refresh_success_at"):
+            self.assertEqual(after[field], before[field])
+        messages = [str(call.args[2]) for call in log_mock.call_args_list if len(call.args) >= 3]
+        self.assertEqual(
+            messages,
+            ["PublicVPNList 仅使用缓存：未配置快照，不进行快照或 profile 下载"],
+        )
+
+    def test_clear_config_with_valid_cache_remains_functional(self):
+        row = self.row("clear-keeps-cache", "PH", "198.51.100.57")
+        first, _ = self.fetch_rows([row], target=["PH"])
+        self.assertEqual(len(first), 1)
+
+        with mock.patch.object(vpngate_manager, "PUBLICVPNLIST_SNAPSHOT_URL", ""), mock.patch.object(
+            vpngate_manager, "PUBLICVPNLIST_SNAPSHOT_FILE", ""
+        ), mock.patch.object(
+            vpngate_manager, "PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS", frozenset()
+        ), mock.patch.object(
+            vpngate_manager, "fetch_publicvpnlist_snapshot", side_effect=AssertionError("cache-only snapshot refresh")
+        ), mock.patch.object(
+            vpngate_manager, "fetch_publicvpnlist_config", side_effect=AssertionError("cache-only profile download")
+        ), mock.patch.object(
+            vpngate_manager, "publicvpnlist_http_get", side_effect=AssertionError("cache-only network request")
+        ), mock.patch.object(vpngate_manager, "log_to_json") as log_mock:
+            status = vpngate_manager.publicvpnlist_web_status()
+            result = vpngate_manager.fetch_publicvpnlist_candidates(["PH"], set())
+
+        self.assertEqual(status["status"], "cache_only")
+        self.assertTrue(status["effective_source_active"])
+        self.assertFalse(status["refresh_ready"])
+        self.assertTrue(status["cache_only"])
+        self.assertEqual([node["ip"] for node in result], [row["ip"]])
+        messages = [str(call.args[2]) for call in log_mock.call_args_list if len(call.args) >= 3]
+        self.assertEqual(
+            messages,
+            ["PublicVPNList 仅使用缓存：未配置快照，不进行快照或 profile 下载"],
+        )
+
+    def test_no_snapshot_without_usable_cache_disables_source(self):
+        cases = {
+            "empty": vpngate_manager.publicvpnlist_cache_default("preserved-empty"),
+            "expired": {
+                **vpngate_manager.publicvpnlist_cache_default("preserved-expired"),
+                "profiles": {
+                    "expired": {
+                        "country_short": "PH",
+                        "config_text": self.config("198.51.100.58", 443),
+                        "last_seen_at": time.time() - (8 * 24 * 3600),
+                        "config_validated_at": time.time() - (8 * 24 * 3600),
+                    }
+                },
+                "profile_order": ["expired"],
+            },
+            "damaged": {
+                **vpngate_manager.publicvpnlist_cache_default("preserved-damaged"),
+                "profiles": {
+                    "damaged": {
+                        "country_short": "PH",
+                        "config_text": "not an OpenVPN profile",
+                        "last_seen_at": time.time(),
+                        "config_validated_at": time.time(),
+                    }
+                },
+                "profile_order": ["damaged"],
+            },
+            "disallowed-country": {
+                **vpngate_manager.publicvpnlist_cache_default("preserved-country"),
+                "profiles": {
+                    "disallowed": {
+                        "country_short": "JP",
+                        "config_text": self.config("198.51.100.59", 443),
+                        "last_seen_at": time.time(),
+                        "config_validated_at": time.time(),
+                    }
+                },
+                "profile_order": ["disallowed"],
+            },
+        }
+        for name, cache in cases.items():
+            with self.subTest(name=name):
+                self.cache_file.write_text(json.dumps(cache), encoding="utf-8")
+                with mock.patch.object(vpngate_manager, "PUBLICVPNLIST_SNAPSHOT_URL", ""), mock.patch.object(
+                    vpngate_manager, "PUBLICVPNLIST_SNAPSHOT_FILE", ""
+                ), mock.patch.object(
+                    vpngate_manager, "fetch_publicvpnlist_snapshot", side_effect=AssertionError("must not refresh")
+                ), mock.patch.object(
+                    vpngate_manager, "fetch_publicvpnlist_config", side_effect=AssertionError("must not download")
+                ), mock.patch.object(
+                    vpngate_manager, "publicvpnlist_http_get", side_effect=AssertionError("must not use network")
+                ), mock.patch.object(vpngate_manager, "log_to_json") as log_mock:
+                    sources = vpngate_manager.get_node_sources()
+                    result = vpngate_manager.fetch_publicvpnlist_candidates(["PH"], set())
+                self.assertNotIn("publicvpnlist", sources)
+                self.assertEqual(result, [])
+                messages = [str(call.args[2]) for call in log_mock.call_args_list if len(call.args) >= 3]
+                self.assertEqual(len(messages), 1)
+                self.assertIn("未配置快照且没有有效缓存", messages[0])
+
     def test_local_snapshot_file_is_supported(self):
         snapshot_file = Path(self.temp_dir.name) / "export-builder.json"
         snapshot_file.write_text(json.dumps({"data": []}), encoding="utf-8")

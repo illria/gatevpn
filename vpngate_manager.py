@@ -3770,34 +3770,44 @@ def fetch_publicvpnlist_candidates(
     blocked_endpoint_keys: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     source_kind, _source_value = publicvpnlist_snapshot_source()
-    if not source_kind:
-        log_to_json(
-            "INFO",
-            "PublicVPNList",
-            "PublicVPNList 未配置快照，本轮来源返回空；请设置 PUBLICVPNLIST_SNAPSHOT_URL 或 PUBLICVPNLIST_SNAPSHOT_FILE",
-        )
-        return []
-
     cache = load_publicvpnlist_cache()
-    download_hosts = publicvpnlist_allowed_download_hosts()
-    if not download_hosts:
-        if not publicvpnlist_cache_has_usable_profiles(cache):
+    if not source_kind:
+        if isinstance(cache, dict) and publicvpnlist_prune_stale_profiles(cache):
+            save_publicvpnlist_cache(cache)
+        has_usable_cache = publicvpnlist_cache_has_usable_profiles(cache)
+        if not has_usable_cache:
             log_to_json(
                 "INFO",
                 "PublicVPNList",
-                "PublicVPNList 未配置下载域名且没有有效缓存，本轮来源返回空；请设置 PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS",
+                "PublicVPNList 未配置快照且没有有效缓存，本轮来源返回空；不进行快照或 profile 下载",
             )
             return []
         log_to_json(
             "INFO",
             "PublicVPNList",
-            "PublicVPNList 仅使用缓存：未配置 PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS，不尝试下载新的 profile",
+            "PublicVPNList 仅使用缓存：未配置快照，不进行快照或 profile 下载",
         )
-        cache = cache or publicvpnlist_cache_default(publicvpnlist_snapshot_source_hash())
     else:
-        cache = refresh_publicvpnlist_cache(cache, blocked_endpoint_keys=blocked_endpoint_keys)
-    cache = cache or publicvpnlist_cache_default(publicvpnlist_snapshot_source_hash())
-    if publicvpnlist_prune_stale_profiles(cache):
+        download_hosts = publicvpnlist_allowed_download_hosts()
+        if not download_hosts:
+            if not publicvpnlist_cache_has_usable_profiles(cache):
+                log_to_json(
+                    "INFO",
+                    "PublicVPNList",
+                    "PublicVPNList 未配置下载域名且没有有效缓存，本轮来源返回空；请设置 PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS",
+                )
+                return []
+            log_to_json(
+                "INFO",
+                "PublicVPNList 仅使用缓存：未配置 PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS，不尝试下载新的 profile",
+            )
+            cache = cache or publicvpnlist_cache_default(publicvpnlist_snapshot_source_hash())
+        else:
+            cache = refresh_publicvpnlist_cache(cache, blocked_endpoint_keys=blocked_endpoint_keys)
+
+    if cache is None:
+        cache = publicvpnlist_cache_default(publicvpnlist_snapshot_source_hash())
+    if source_kind and publicvpnlist_prune_stale_profiles(cache):
         save_publicvpnlist_cache(cache)
 
     target_display = normalize_target_countries_input(target_countries) or "全部地区"
