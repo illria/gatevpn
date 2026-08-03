@@ -167,6 +167,8 @@ GITHUB_REPO="${2:-$DEFAULT_REPO}"
 GITHUB_URL="https://github.com/${GITHUB_USER}/${GITHUB_REPO}.git"
 INSTALL_DIR="/opt/eianun-vpngate"
 SERVICE_NAME="eianun-vpngate"
+EIANUN_ENV_FILE="/etc/eianun-vpngate.env"
+LEGACY_ENV_FILE="/etc/default/eianun-vpngate"
 
 install_base_dependencies
 check_required_tools
@@ -203,6 +205,32 @@ else
     fi
 fi
 
+prepare_eianun_environment_file() {
+    mkdir -p "$(dirname "${LEGACY_ENV_FILE}")"
+    if [ ! -f "${EIANUN_ENV_FILE}" ]; then
+        if [ -f "${LEGACY_ENV_FILE}" ]; then
+            cp -p "${LEGACY_ENV_FILE}" "${EIANUN_ENV_FILE}"
+        else
+            : > "${EIANUN_ENV_FILE}"
+        fi
+    fi
+    chmod 600 "${EIANUN_ENV_FILE}"
+    chown root:root "${EIANUN_ENV_FILE}" 2>/dev/null || true
+}
+
+prepare_eianun_environment_file
+
+repair_sensitive_runtime_files() {
+    if ! "${PYTHON_BIN}" "${INSTALL_DIR}/tools/repair_gatevpn_permissions.py" \
+        --install-dir "${INSTALL_DIR}" \
+        --env-file "${EIANUN_ENV_FILE}" \
+        --legacy-env-file "${LEGACY_ENV_FILE}"; then
+        say "${YELLOW}警告: 无法完整修复敏感运行文件权限；未输出环境变量或配置内容。${PLAIN}"
+    fi
+}
+
+repair_sensitive_runtime_files
+
 configure_service() {
     SERVICE_MANAGER="$(detect_service_manager)"
     say "\n${YELLOW}[3/4] 正在配置系统服务 (${SERVICE_MANAGER})...${PLAIN}"
@@ -222,6 +250,7 @@ ExecStart=${PYTHON_BIN} vpngate_manager.py
 Restart=always
 RestartSec=5
 EnvironmentFile=-/etc/default/eianun-vpngate
+EnvironmentFile=-/etc/eianun-vpngate.env
 
 [Install]
 WantedBy=multi-user.target
@@ -249,6 +278,10 @@ depend() {
 }
 
 start_pre() {
+    set -a
+    [ ! -f /etc/default/eianun-vpngate ] || . /etc/default/eianun-vpngate
+    [ ! -f /etc/eianun-vpngate.env ] || . /etc/eianun-vpngate.env
+    set +a
     checkpath --directory --mode 0755 "${INSTALL_DIR}/vpngate_data"
 }
 EOF_SERVICE
@@ -261,6 +294,10 @@ EOF_SERVICE
             mkdir -p "$SERVICE_DIR" "${INSTALL_DIR}/vpngate_data"
             cat > "$SERVICE_DIR/run" <<EOF_SERVICE
 #!/bin/sh
+set -a
+[ ! -f /etc/default/eianun-vpngate ] || . /etc/default/eianun-vpngate
+[ ! -f /etc/eianun-vpngate.env ] || . /etc/eianun-vpngate.env
+set +a
 cd "${INSTALL_DIR}" || exit 1
 exec ${PYTHON_BIN} vpngate_manager.py >> "${INSTALL_DIR}/vpngate_data/vpngate.log" 2>&1
 EOF_SERVICE
@@ -287,12 +324,197 @@ import subprocess
 import time
 import tty
 import termios
+import json
+import shlex
+import urllib.parse
+import getpass
 
 INSTALL_DIR = "/opt/eianun-vpngate"
 LOG_FILE = "/opt/eianun-vpngate/vpngate_data/vpngate.log"
 
 SERVICE_NAME = "eianun-vpngate"
 SYSTEMD_SERVICE = SERVICE_NAME + ".service"
+ENV_FILE = "/etc/eianun-vpngate.env"
+LEGACY_ENV_FILE = "/etc/default/eianun-vpngate"
+PUBLICVPNLIST_ENV_KEYS = (
+    "PUBLICVPNLIST_SNAPSHOT_URL",
+    "PUBLICVPNLIST_SNAPSHOT_FILE",
+    "PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS",
+)
+
+PUBLICVPNLIST_STATUS_LABELS = {
+    "snapshot_missing": "PublicVPNList（未配置快照）",
+    "download_hosts_missing": "PublicVPNList（未配置下载域名）",
+    "cache_only": "PublicVPNList（仅使用缓存）",
+    "configured": "PublicVPNList（已配置）",
+    "stale_cache": "PublicVPNList（缓存过期）",
+    "refresh_failed": "PublicVPNList（刷新失败）",
+}
+
+def read_env_file(path):
+    values = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, raw_value = line.split("=", 1)
+                key = key.strip()
+                if not key or not key.replace("_", "").isalnum():
+                    continue
+                try:
+                    parts = shlex.split(raw_value, comments=True, posix=True)
+                    values[key] = parts[0] if parts else ""
+                except ValueError:
+                    values[key] = raw_value.strip().strip("'\"")
+    except OSError:
+        pass
+    return values
+
+def load_publicvpnlist_environment():
+    values = read_env_file(LEGACY_ENV_FILE)
+    values.update(read_env_file(ENV_FILE))
+    for key in PUBLICVPNLIST_ENV_KEYS:
+        if key in values:
+            os.environ[key] = values[key]
+    return values
+
+def save_publicvpnlist_environment(updates):
+    values = read_env_file(LEGACY_ENV_FILE)
+    values.update(read_env_file(ENV_FILE))
+    for key, value in updates.items():
+        values[key] = str(value or "")
+    try:
+        os.makedirs(os.path.dirname(ENV_FILE), exist_ok=True)
+        with open(ENV_FILE, "w", encoding="utf-8") as f:
+            for key in sorted(values):
+                f.write(f"{key}={shlex.quote(values[key])}\n")
+        os.chmod(ENV_FILE, 0o600)
+        try:
+            os.chown(ENV_FILE, 0, 0)
+        except (AttributeError, PermissionError, OSError):
+            pass
+        load_publicvpnlist_environment()
+        return True
+    except OSError as exc:
+        print(f"保存 PublicVPNList 环境文件失败: {exc}")
+        return False
+
+def redacted_snapshot_url(value):
+    value = str(value or "").strip()
+    if not value:
+        return "未设置"
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        if parsed.scheme and parsed.hostname:
+            return f"{parsed.scheme.lower()}://{parsed.hostname.lower()} path={'有' if parsed.path else '无'}"
+    except ValueError:
+        pass
+    return "已设置（格式未显示）"
+
+def safe_download_hosts_display(value):
+    hosts = []
+    for raw_host in str(value or "").split(","):
+        host = raw_host.strip().lower().rstrip(".")
+        if not host or any(char in host for char in (":", "/", "?", "#", " ", "\t")):
+            if host:
+                hosts.append("<invalid>")
+            continue
+        hosts.append(host)
+    return ",".join(hosts) or "未配置"
+
+def publicvpnlist_cache_summary():
+    path = os.path.join(INSTALL_DIR, "vpngate_data", "publicvpnlist_cache.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cache = json.load(f)
+    except (OSError, ValueError, TypeError):
+        return 0, False, False
+    profiles = cache.get("profiles") if isinstance(cache, dict) else {}
+    count = sum(1 for p in (profiles or {}).values() if isinstance(p, dict) and p.get("config_text"))
+    return count, bool(cache.get("cache_stale")), bool(cache.get("refresh_failed"))
+
+def publicvpnlist_status_label():
+    values = load_publicvpnlist_environment()
+    has_snapshot = bool(values.get("PUBLICVPNLIST_SNAPSHOT_URL") or values.get("PUBLICVPNLIST_SNAPSHOT_FILE"))
+    count, cache_stale, refresh_failed = publicvpnlist_cache_summary()
+    if not has_snapshot:
+        status = "snapshot_missing"
+    elif not values.get("PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS"):
+        status = "cache_only" if count else "download_hosts_missing"
+    elif refresh_failed:
+        status = "refresh_failed"
+    elif cache_stale:
+        status = "stale_cache"
+    else:
+        status = "configured"
+    return PUBLICVPNLIST_STATUS_LABELS.get(status, "PublicVPNList")
+
+def print_publicvpnlist_status():
+    values = load_publicvpnlist_environment()
+    count, cache_stale, refresh_failed = publicvpnlist_cache_summary()
+    print("PublicVPNList 状态: " + publicvpnlist_status_label())
+    print("  快照 URL: " + redacted_snapshot_url(values.get("PUBLICVPNLIST_SNAPSHOT_URL")))
+    print("  本地快照文件: " + ("已设置" if values.get("PUBLICVPNLIST_SNAPSHOT_FILE") else "未设置"))
+    print("  允许下载域名: " + safe_download_hosts_display(values.get("PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS")))
+    print(f"  已验证缓存 profile: {count}；cache_stale={str(cache_stale).lower()}；refresh_failed={str(refresh_failed).lower()}")
+
+def publicvpnlist_command(args):
+    action = (args[0].lower() if args else "status")
+    if action in ("status", "show"):
+        print_publicvpnlist_status()
+        return
+    if action in ("help", "-h", "--help"):
+        print("用法: en publicvpnlist status | set-url | set-file PATH | set-hosts HOST[,HOST] | clear | restart")
+        print("set-url 不接收命令行参数，使用交互输入以避免签名进入进程参数。")
+        return
+    if action == "set-url":
+        if len(args) > 1:
+            print("为避免签名 URL 出现在进程参数中，请运行 en publicvpnlist set-url 后在提示中输入。")
+            return
+        value = getpass.getpass("请输入临时快照 URL（不会回显或写入日志）: ").strip()
+        if not value or "\n" in value or "\r" in value:
+            print("快照 URL 为空或格式无效。")
+            return
+        if save_publicvpnlist_environment({"PUBLICVPNLIST_SNAPSHOT_URL": value, "PUBLICVPNLIST_SNAPSHOT_FILE": ""}):
+            print("临时快照 URL 已保存；显示和日志只会使用脱敏状态。")
+        return
+    if action == "set-file":
+        if len(args) != 2:
+            print("用法: en publicvpnlist set-file PATH")
+            return
+        value = args[1].strip()
+        if not value or "\n" in value or "\r" in value:
+            print("本地快照路径为空或格式无效。")
+            return
+        if save_publicvpnlist_environment({"PUBLICVPNLIST_SNAPSHOT_URL": "", "PUBLICVPNLIST_SNAPSHOT_FILE": value}):
+            print("本地快照路径已保存。")
+        return
+    if action == "set-hosts":
+        value = args[1].strip() if len(args) == 2 else input("请输入允许下载域名（逗号分隔）: ").strip()
+        hosts = [item.strip().lower().rstrip(".") for item in value.split(",") if item.strip()]
+        if any(not host or "://" in host or any(char in host for char in (":", "/", "?", "#", " ", "\t")) for host in hosts):
+            print("允许列表只接受 hostname，不接受 URL、路径或 query。")
+            return
+        if save_publicvpnlist_environment({"PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS": ",".join(hosts)}):
+            print("下载域名允许列表已保存。")
+        return
+    if action == "clear":
+        if save_publicvpnlist_environment({
+            "PUBLICVPNLIST_SNAPSHOT_URL": "",
+            "PUBLICVPNLIST_SNAPSHOT_FILE": "",
+            "PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS": "",
+        }):
+            print("PublicVPNList 快照和下载域名配置已清除；缓存文件未删除。")
+        return
+    if action == "restart":
+        run_service_action("restart")
+        return
+    print("未知 PublicVPNList 子命令；运行 en publicvpnlist help 查看用法。")
+
+def publicvpnlist_status_action():
+    publicvpnlist_command(["status"])
 
 def command_exists(name):
     from shutil import which
@@ -554,6 +776,7 @@ def print_status():
     masked_pwd = curr_pwd if len(curr_pwd) <= 4 else curr_pwd[:3] + "********" + curr_pwd[-2:]
     print_line(format_line("网页管理密码", masked_pwd))
     print_line(format_line("节点拉取来源", cfg.get("node_sources", "vpngate,vpnbook,ipspeed,vpngate_scraper") or "vpngate,vpnbook,ipspeed,vpngate_scraper"))
+    print_line(format_line("PublicVPNList 状态", publicvpnlist_status_label()))
     print_line(format_line("节点拉取地区", cfg.get("target_countries", "") or "全部地区"))
     print_line(format_line("自动IP优先级", cfg.get("target_ip_types", "residential") or "全部类型"))
     print_line()
@@ -848,35 +1071,43 @@ def configure_source():
     print("                    节点来源配置                       ")
     print("=======================================================")
     print(f"当前节点来源: {current}")
-    print("  [1] VPNGate + VPNBook + IPSpeed + Vpngate-Scraper（推荐）")
-    print("  [2] VPNGate + IPSpeed + Vpngate-Scraper")
-    print("  [3] VPNGate + Vpngate-Scraper")
-    print("  [4] VPNGate + VPNBook")
-    print("  [5] VPNGate + VPNBook + IPSpeed")
-    print("  [6] 仅 VPNGate")
-    print("  [7] 仅 VPNBook")
-    print("  [8] 仅 IPSpeed")
-    print("  [9] 仅 Vpngate-Scraper")
+    print("  [1] VPNGate + VPNBook + IPSpeed + Vpngate-Scraper（默认）")
+    print("  [2] VPNGate + VPNBook + IPSpeed + Vpngate-Scraper + PublicVPNList（需快照+下载域名）")
+    print("  [3] VPNGate + IPSpeed + Vpngate-Scraper + PublicVPNList（需快照+下载域名）")
+    print("  [4] VPNGate + Vpngate-Scraper")
+    print("  [5] VPNGate + VPNBook")
+    print("  [6] VPNGate + VPNBook + IPSpeed")
+    print("  [7] 仅 VPNGate")
+    print("  [8] 仅 VPNBook")
+    print("  [9] 仅 IPSpeed")
+    print("  [0] 仅 Vpngate-Scraper")
+    print("  [p] 仅 PublicVPNList（需快照+下载域名）")
+    print("提示：PublicVPNList 需要 PUBLICVPNLIST_SNAPSHOT_URL/FILE，以及用户确认后的 PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS；未配置时来源返回空。")
+    print("PublicVPNList 当前状态: " + publicvpnlist_status_label())
     print("  [q] 返回主菜单")
     key = getch()
     if key == '1':
         cfg['node_sources'] = 'vpngate,vpnbook,ipspeed,vpngate_scraper'
     elif key == '2':
-        cfg['node_sources'] = 'vpngate,ipspeed,vpngate_scraper'
+        cfg['node_sources'] = 'vpngate,vpnbook,ipspeed,vpngate_scraper,publicvpnlist'
     elif key == '3':
-        cfg['node_sources'] = 'vpngate,vpngate_scraper'
+        cfg['node_sources'] = 'vpngate,ipspeed,vpngate_scraper,publicvpnlist'
     elif key == '4':
-        cfg['node_sources'] = 'vpngate,vpnbook'
+        cfg['node_sources'] = 'vpngate,vpngate_scraper'
     elif key == '5':
-        cfg['node_sources'] = 'vpngate,vpnbook,ipspeed'
+        cfg['node_sources'] = 'vpngate,vpnbook'
     elif key == '6':
-        cfg['node_sources'] = 'vpngate'
+        cfg['node_sources'] = 'vpngate,vpnbook,ipspeed'
     elif key == '7':
-        cfg['node_sources'] = 'vpnbook'
+        cfg['node_sources'] = 'vpngate'
     elif key == '8':
-        cfg['node_sources'] = 'ipspeed'
+        cfg['node_sources'] = 'vpnbook'
     elif key == '9':
+        cfg['node_sources'] = 'ipspeed'
+    elif key in ('0',):
         cfg['node_sources'] = 'vpngate_scraper'
+    elif key in ('p', 'P'):
+        cfg['node_sources'] = 'publicvpnlist'
     else:
         return
     save_ui_cfg(cfg)
@@ -992,6 +1223,7 @@ def get_status_state():
     )
 
 def main():
+    load_publicvpnlist_environment()
     if os.geteuid() != 0:
         print("错误: 必须以 root 权限运行此命令。")
         sys.exit(1)
@@ -1037,12 +1269,14 @@ def main():
             configure_credentials()
         elif cmd == "source":
             configure_source()
+        elif cmd == "publicvpnlist":
+            publicvpnlist_command(sys.argv[2:])
         elif cmd == "country":
             configure_country()
         elif cmd in ("iptype", "ip-type", "type"):
             configure_iptype()
         else:
-            print("未知命令。可用命令: start, stop, restart, status, logs, update, uninstall, web, port, password, source, country, iptype")
+            print("未知命令。可用命令: start, stop, restart, status, logs, update, uninstall, web, port, password, source, publicvpnlist, country, iptype")
         sys.exit(0)
         
     options = {
@@ -1054,6 +1288,7 @@ def main():
         '6': ("端口配置 (en port)", configure_port),
         '7': ("账号密码 (en password)", configure_credentials),
         '8': ("节点来源 (en source)", configure_source),
+        'b': ("PublicVPNList (en publicvpnlist)", publicvpnlist_status_action),
         '9': ("地区过滤 (en country)", configure_country),
         'a': ("自动IP类型 (en iptype)", configure_iptype),
         'u': ("一键更新 (en update)", update_service),
@@ -1120,7 +1355,7 @@ def main():
                     print(f"执行出错: {e}")
                     
                 if func not in (start_service, stop_service, restart_service,
-                                configure_web, configure_port, configure_credentials, configure_source, configure_country, configure_iptype, show_logs, update_service):
+                                configure_web, configure_port, configure_credentials, configure_source, configure_country, configure_iptype, publicvpnlist_status_action, show_logs, update_service):
                     input("\n操作已完成，按回车键返回主菜单...")
                     
                 # Re-enter alternate buffer and hide cursor
@@ -1171,6 +1406,10 @@ TARGET_COUNTRIES_INPUT="$(${PYTHON_BIN} -c "import json; p='$AUTH_FILE'
 try:
  d=json.load(open(p,encoding='utf-8')); print(d.get('target_countries',''))
 except Exception: print('')" 2>/dev/null || echo '')"
+NODE_SOURCES_INPUT="$(${PYTHON_BIN} -c "import json; p='$AUTH_FILE'
+try:
+ d=json.load(open(p,encoding='utf-8')); print(d.get('node_sources',''))
+except Exception: print('')" 2>/dev/null || echo '')"
 TARGET_IP_TYPES_INPUT="$(${PYTHON_BIN} -c "import json; p='$AUTH_FILE'
 try:
  d=json.load(open(p,encoding='utf-8')); print(d.get('target_ip_types','residential'))
@@ -1184,6 +1423,7 @@ say "  -> 当前端口: ${GREEN}${UI_PORT}${PLAIN}"
 say "  -> 当前账号: ${GREEN}${UI_USERNAME}${PLAIN}"
 say "  -> 当前安全后缀: ${GREEN}${SECRET_PATH}${PLAIN}"
 say "  -> 当前节点来源: ${GREEN}${NODE_SOURCES_INPUT:-vpngate,vpnbook,ipspeed,vpngate_scraper}${PLAIN}"
+say "  -> PublicVPNList 需要用户提供临时快照 URL/本地 JSON 文件，并配置确认后的下载域名允许列表；状态和 URL 显示会脱敏。"
 say "  -> 当前拉取地区: ${GREEN}${TARGET_COUNTRIES_INPUT:-全部地区}${PLAIN}"
 say "  -> 当前自动IP类型: ${GREEN}${TARGET_IP_TYPES_INPUT:-residential}${PLAIN}"
 ask "是否现在配置端口/安全后缀/登录账号密码/拉取地区/IP类型？[y/N]: "
@@ -1228,7 +1468,7 @@ case "$is_custom" in
 esac
 
 if [ "$NEED_WRITE" = "1" ]; then
-    AUTH_FILE="$AUTH_FILE" UI_PORT="$UI_PORT" SECRET_PATH="$SECRET_PATH" UI_USERNAME="$UI_USERNAME" UI_PASSWORD="$UI_PASSWORD" TARGET_COUNTRIES_INPUT="$TARGET_COUNTRIES_INPUT" TARGET_IP_TYPES_INPUT="$TARGET_IP_TYPES_INPUT" ${PYTHON_BIN} - <<'PY_SAVE_AUTH'
+    AUTH_FILE="$AUTH_FILE" UI_PORT="$UI_PORT" SECRET_PATH="$SECRET_PATH" UI_USERNAME="$UI_USERNAME" UI_PASSWORD="$UI_PASSWORD" TARGET_COUNTRIES_INPUT="$TARGET_COUNTRIES_INPUT" NODE_SOURCES_INPUT="$NODE_SOURCES_INPUT" TARGET_IP_TYPES_INPUT="$TARGET_IP_TYPES_INPUT" ${PYTHON_BIN} - <<'PY_SAVE_AUTH'
 import json
 import os
 cfg = {
@@ -1244,6 +1484,7 @@ cfg = {
 with open(os.environ['AUTH_FILE'], 'w', encoding='utf-8') as f:
     json.dump(cfg, f, ensure_ascii=False, indent=2)
 PY_SAVE_AUTH
+    chmod 600 "${AUTH_FILE}" 2>/dev/null || say "${YELLOW}警告: 无法将面板认证文件权限设为 0600。${PLAIN}"
     say "${GREEN}面板配置已保存。${PLAIN}"
 else
     say "${GREEN}已保留现有面板配置。${PLAIN}"
@@ -1323,6 +1564,7 @@ say "  * 查看实时日志:   ${YELLOW}en logs${PLAIN}"
 say "  * 停止服务:       ${YELLOW}en stop${PLAIN}"
 say "  * 重启服务:       ${YELLOW}en restart${PLAIN}"
 say "  * 设置节点来源:   ${YELLOW}en source${PLAIN}"
+say "  * PublicVPNList:  ${YELLOW}en publicvpnlist status|set-url|set-file PATH|set-hosts HOST[,HOST]|clear|restart${PLAIN}"
 say "  * 设置拉取地区:   ${YELLOW}en country${PLAIN}"
 say "  * 设置自动IP类型: ${YELLOW}en iptype${PLAIN}"
 say "=========================================================="

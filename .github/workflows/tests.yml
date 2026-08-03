@@ -1,0 +1,48 @@
+name: tests
+
+on:
+  push:
+    branches:
+      - main
+      - "feat/**"
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Compile Python modules
+        run: |
+          python3 -m py_compile \
+            vpngate_manager.py \
+            vpn_utils.py \
+            proxy_server.py \
+            tools/publicvpnlist-smoke.py \
+            tools/repair_gatevpn_permissions.py
+
+      - name: Run unit tests
+        run: python3 -m unittest discover -s tests -p "test_*.py" -v
+
+      - name: Compile and exercise generated en command
+        run: python3 -m unittest discover -s tests -p "test_service_environment.py" -v
+
+      - name: Check shell syntax
+        run: sh -n install.sh
+
+      - name: Check diff whitespace
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git diff --check "${{ github.event.pull_request.base.sha }}...HEAD"
+          else
+            git show --check --oneline HEAD
+          fi
