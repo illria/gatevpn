@@ -109,17 +109,17 @@ Vpngate-Scraper 来源会读取 `https://github.com/fdciabdul/Vpngate-Scraper-AP
 
 ### PublicVPNList 来源说明
 
-PublicVPNList 默认不加入 `NODE_SOURCES`。启用该来源前，用户必须提供一次有效的 Export Builder 临时 JSON 快照输入：
+PublicVPNList 默认不加入 `NODE_SOURCES`。用户提供一次有效的 Export Builder 临时 JSON 快照后，来源会自动加入有效节点来源，无需再次执行 `en source`：
 
 ```bash
-# 二选一，也可以同时设置；本地文件优先
+# URL 和本地文件二选一，不得同时配置
 PUBLICVPNLIST_SNAPSHOT_URL=
 PUBLICVPNLIST_SNAPSHOT_FILE=
 ```
 
 `PUBLICVPNLIST_SNAPSHOT_URL` 只能填写用户自己生成的、短期有效的签名快照 URL；`PUBLICVPNLIST_SNAPSHOT_FILE` 填写用户已经下载到本地的 JSON 快照路径。项目不会自动操作 Export Builder，不猜测永久 API/feed，也不会绕过站点的 token、限流或反滥用设计。未配置 URL 或文件时，PublicVPNList 状态显示“未配置快照”、本轮返回空且不发起网络请求。
 
-要下载新的 `temporary_ovpn_url`，还必须设置用户在真实冒烟发现阶段确认过的 `PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS`。因此状态可能显示“未配置下载域名”；允许列表为空且已有保留期内的有效 profile 时，来源显示“仅使用缓存”，继续提供旧配置但不发起新的 profile 下载。快照和下载域名都可以通过安装后的 `en publicvpnlist` 管理，统一配置文件为 `/etc/eianun-vpngate.env`（权限 0600、root 所有），旧的 `/etc/default/eianun-vpngate` 会被兼容读取。
+要下载新的 `temporary_ovpn_url`，还必须设置用户在真实冒烟发现阶段确认过的 `PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS`。有快照但缺少下载域名时，状态显示“未配置下载域名”，来源仍会自动加入；如果存在保留期内的有效缓存，运行时可以继续复用缓存，但 `cache_only=false`。只有清除快照配置后仍保留有效缓存时，状态才显示“仅使用缓存”且 `cache_only=true`。没有快照、没有有效缓存时，来源自动停用且不发起网络请求。快照和下载域名都可以通过安装后的 `en publicvpnlist` 管理，统一配置文件为 `/etc/eianun-vpngate.env`（权限 0600、root 所有），旧的 `/etc/default/eianun-vpngate` 会被兼容读取。
 
 每条记录只使用 `id`、国家、`host`/`ip`、`port`、`proto`、`speed`、`latency`、`checkedAt` 等元数据，以及有效的 `temporary_ovpn_url` 获取 `.ovpn` 配置。`download_page_url` 是 HTML 页面，不能当作 OpenVPN 配置；缺少或失效的 `temporary_ovpn_url` 会安全跳过节点并记录需要重新生成临时快照/配置下载链接。临时配置 URL 不会写入磁盘缓存；缓存只保存元数据和成功通过校验的配置文本，默认刷新周期为 21600 秒（6 小时）。
 

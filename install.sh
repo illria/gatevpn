@@ -327,7 +327,9 @@ import termios
 import json
 import shlex
 import urllib.parse
+import re
 import getpass
+import tempfile
 
 INSTALL_DIR = "/opt/eianun-vpngate"
 LOG_FILE = "/opt/eianun-vpngate/vpngate_data/vpngate.log"
@@ -340,6 +342,15 @@ PUBLICVPNLIST_ENV_KEYS = (
     "PUBLICVPNLIST_SNAPSHOT_URL",
     "PUBLICVPNLIST_SNAPSHOT_FILE",
     "PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS",
+)
+PUBLICVPNLIST_STALE_PROFILE_SECONDS = 7 * 24 * 3600
+
+if INSTALL_DIR not in sys.path:
+    sys.path.insert(0, INSTALL_DIR)
+from tools.publicvpnlist_cache import (
+    cache_profile_summary as shared_cache_profile_summary,
+    resolve_vpngate_data_dir as shared_resolve_data_dir,
+    stale_profile_seconds as shared_stale_profile_seconds,
 )
 
 PUBLICVPNLIST_STATUS_LABELS = {
@@ -375,8 +386,10 @@ def read_env_file(path):
 def load_publicvpnlist_environment():
     values = read_env_file(LEGACY_ENV_FILE)
     values.update(read_env_file(ENV_FILE))
-    for key in PUBLICVPNLIST_ENV_KEYS:
-        if key in values:
+    for key in PUBLICVPNLIST_ENV_KEYS + ("VPNGATE_DATA_DIR", "PUBLICVPNLIST_STALE_PROFILE_SECONDS"):
+        if key not in values:
+            values[key] = os.environ.get(key, "")
+        if key in PUBLICVPNLIST_ENV_KEYS and key in values:
             os.environ[key] = values[key]
     return values
 
@@ -385,21 +398,59 @@ def save_publicvpnlist_environment(updates):
     values.update(read_env_file(ENV_FILE))
     for key, value in updates.items():
         values[key] = str(value or "")
+    directory = os.path.dirname(ENV_FILE) or "."
+    temporary_path = None
+    temporary_fd = None
     try:
-        os.makedirs(os.path.dirname(ENV_FILE), exist_ok=True)
-        with open(ENV_FILE, "w", encoding="utf-8") as f:
+        os.makedirs(directory, exist_ok=True)
+        temporary_fd, temporary_path = tempfile.mkstemp(
+            prefix=".eianun-vpngate.env.",
+            dir=directory,
+            text=True,
+        )
+        os.fchmod(temporary_fd, 0o600)
+        with os.fdopen(temporary_fd, "w", encoding="utf-8") as f:
+            temporary_fd = None
             for key in sorted(values):
                 f.write(f"{key}={shlex.quote(values[key])}\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary_path, ENV_FILE)
+        temporary_path = None
         os.chmod(ENV_FILE, 0o600)
         try:
             os.chown(ENV_FILE, 0, 0)
         except (AttributeError, PermissionError, OSError):
             pass
+        try:
+            directory_fd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            pass
         load_publicvpnlist_environment()
         return True
     except OSError as exc:
-        print(f"保存 PublicVPNList 环境文件失败: {exc}")
+        if temporary_fd is not None:
+            try:
+                os.close(temporary_fd)
+            except OSError:
+                pass
+        if temporary_path:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
+        print(f"保存 PublicVPNList 环境文件失败: {type(exc).__name__}")
         return False
+    finally:
+        if temporary_path:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
 
 def redacted_snapshot_url(value):
     value = str(value or "").strip()
@@ -424,41 +475,130 @@ def safe_download_hosts_display(value):
         hosts.append(host)
     return ",".join(hosts) or "未配置"
 
-def publicvpnlist_cache_summary():
-    path = os.path.join(INSTALL_DIR, "vpngate_data", "publicvpnlist_cache.json")
+def normalize_publicvpnlist_hosts(value):
+    result = []
+    seen = set()
+    for raw in str(value or "").split(","):
+        text = raw.strip()
+        if not text:
+            continue
+        if "://" in text:
+            try:
+                parsed = urllib.parse.urlsplit(text)
+                if parsed.username or parsed.password or parsed.port:
+                    return None, "允许列表不得包含用户名、密码或端口"
+                host = parsed.hostname or ""
+            except ValueError:
+                return None, "允许列表中的域名格式无效"
+        else:
+            host = re.split(r"[/\\?#]", text, maxsplit=1)[0]
+            if ":" in host:
+                return None, "允许列表不得包含端口"
+        host = host.strip().lower().rstrip(".")
+        labels = host.split(".")
+        if not host or len(host) > 253 or any(
+            not label or len(label) > 63 or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label)
+            for label in labels
+        ):
+            return None, "允许列表中的域名格式无效"
+        if host not in seen:
+            result.append(host)
+            seen.add(host)
+    return ",".join(result), None
+
+def publicvpnlist_data_dir(values=None):
+    values = values if isinstance(values, dict) else load_publicvpnlist_environment()
+    return str(shared_resolve_data_dir(values.get("VPNGATE_DATA_DIR"), INSTALL_DIR))
+
+def publicvpnlist_stale_profile_seconds(values=None):
+    values = values if isinstance(values, dict) else load_publicvpnlist_environment()
+    return shared_stale_profile_seconds(values.get("PUBLICVPNLIST_STALE_PROFILE_SECONDS"))
+
+def publicvpnlist_cache_summary(values=None):
+    values = values if isinstance(values, dict) else load_publicvpnlist_environment()
+    path = os.path.join(publicvpnlist_data_dir(values), "publicvpnlist_cache.json")
+    stale_seconds = publicvpnlist_stale_profile_seconds(values)
     try:
         with open(path, "r", encoding="utf-8") as f:
             cache = json.load(f)
     except (OSError, ValueError, TypeError):
-        return 0, False, False
-    profiles = cache.get("profiles") if isinstance(cache, dict) else {}
-    count = sum(1 for p in (profiles or {}).values() if isinstance(p, dict) and p.get("config_text"))
-    return count, bool(cache.get("cache_stale")), bool(cache.get("refresh_failed"))
+        return 0, 0, False, False
+    if not isinstance(cache, dict):
+        return 0, 0, False, False
+    count, usable = shared_cache_profile_summary(
+        cache,
+        stale_seconds=stale_seconds,
+    )
+    return count, usable, bool(cache.get("cache_stale")), bool(cache.get("refresh_failed"))
 
-def publicvpnlist_status_label():
-    values = load_publicvpnlist_environment()
+def publicvpnlist_state(values=None):
+    values = values if isinstance(values, dict) else load_publicvpnlist_environment()
     has_snapshot = bool(values.get("PUBLICVPNLIST_SNAPSHOT_URL") or values.get("PUBLICVPNLIST_SNAPSHOT_FILE"))
-    count, cache_stale, refresh_failed = publicvpnlist_cache_summary()
+    count, usable, cache_stale, refresh_failed = publicvpnlist_cache_summary(values)
     if not has_snapshot:
-        status = "snapshot_missing"
+        status = "cache_only" if usable else "snapshot_missing"
     elif not values.get("PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS"):
-        status = "cache_only" if count else "download_hosts_missing"
+        status = "download_hosts_missing"
     elif refresh_failed:
         status = "refresh_failed"
     elif cache_stale:
         status = "stale_cache"
     else:
         status = "configured"
-    return PUBLICVPNLIST_STATUS_LABELS.get(status, "PublicVPNList")
+    return {
+        "status": status,
+        "count": count,
+        "usable": usable,
+        "cache_stale": cache_stale,
+        "refresh_failed": refresh_failed,
+        "effective_source_active": bool(has_snapshot or usable),
+        "refresh_ready": bool(has_snapshot and values.get("PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS")),
+        "cache_only": bool(not has_snapshot and usable),
+    }
+
+def publicvpnlist_status_label(values=None):
+    state = publicvpnlist_state(values)
+    return PUBLICVPNLIST_STATUS_LABELS.get(state["status"], "PublicVPNList")
 
 def print_publicvpnlist_status():
     values = load_publicvpnlist_environment()
-    count, cache_stale, refresh_failed = publicvpnlist_cache_summary()
-    print("PublicVPNList 状态: " + publicvpnlist_status_label())
+    state = publicvpnlist_state(values)
+    print("PublicVPNList 状态: " + PUBLICVPNLIST_STATUS_LABELS.get(state["status"], "PublicVPNList"))
     print("  快照 URL: " + redacted_snapshot_url(values.get("PUBLICVPNLIST_SNAPSHOT_URL")))
     print("  本地快照文件: " + ("已设置" if values.get("PUBLICVPNLIST_SNAPSHOT_FILE") else "未设置"))
     print("  允许下载域名: " + safe_download_hosts_display(values.get("PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS")))
-    print(f"  已验证缓存 profile: {count}；cache_stale={str(cache_stale).lower()}；refresh_failed={str(refresh_failed).lower()}")
+    print(f"  已验证缓存 profile: {state['count']}（可复用 {state['usable']}）；cache_stale={str(state['cache_stale']).lower()}；refresh_failed={str(state['refresh_failed']).lower()}")
+    print("  effective source active: " + ("yes" if state["effective_source_active"] else "no"))
+    print("  refresh_ready: " + ("yes" if state["refresh_ready"] else "no"))
+    print("  cache_only: " + ("yes" if state["cache_only"] else "no"))
+
+def publicvpnlist_auto_activation_message():
+    values = load_publicvpnlist_environment()
+    state = publicvpnlist_state(values)
+    has_snapshot = bool(values.get("PUBLICVPNLIST_SNAPSHOT_URL") or values.get("PUBLICVPNLIST_SNAPSHOT_FILE"))
+    has_hosts = bool(values.get("PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS"))
+    active = state["effective_source_active"]
+    if active and has_snapshot and not has_hosts:
+        print("PublicVPNList 已自动加入来源，但尚未配置下载域名。")
+    elif active:
+        print("PublicVPNList 已自动加入有效节点来源。无需另外执行 en source。")
+        if state["cache_only"]:
+            print("当前为 cache-only；清除配置不会删除保留期内的有效缓存。")
+    else:
+        print("配置已保存；PublicVPNList 尚未配置快照或有效缓存，来源保持停用。")
+    run_service_action("restart")
+
+def effective_node_sources(value):
+    sources = []
+    for item in str(value or "").replace(";", ",").split(","):
+        token = item.strip().lower()
+        if token in {"vpngate", "vpnbook", "ipspeed", "vpngate_scraper"} and token not in sources:
+            sources.append(token)
+    values = load_publicvpnlist_environment()
+    active = publicvpnlist_state(values)["effective_source_active"]
+    if active:
+        sources.append("publicvpnlist")
+    return ",".join(sources)
 
 def publicvpnlist_command(args):
     action = (args[0].lower() if args else "status")
@@ -477,8 +617,16 @@ def publicvpnlist_command(args):
         if not value or "\n" in value or "\r" in value:
             print("快照 URL 为空或格式无效。")
             return
+        try:
+            parsed = urllib.parse.urlsplit(value)
+            if parsed.scheme.lower() != "https" or not parsed.hostname or parsed.username or parsed.password:
+                raise ValueError()
+        except (TypeError, ValueError):
+            print("快照 URL 必须是无账号密码的 HTTPS 地址。")
+            return
         if save_publicvpnlist_environment({"PUBLICVPNLIST_SNAPSHOT_URL": value, "PUBLICVPNLIST_SNAPSHOT_FILE": ""}):
             print("临时快照 URL 已保存；显示和日志只会使用脱敏状态。")
+            publicvpnlist_auto_activation_message()
         return
     if action == "set-file":
         if len(args) != 2:
@@ -490,15 +638,17 @@ def publicvpnlist_command(args):
             return
         if save_publicvpnlist_environment({"PUBLICVPNLIST_SNAPSHOT_URL": "", "PUBLICVPNLIST_SNAPSHOT_FILE": value}):
             print("本地快照路径已保存。")
+            publicvpnlist_auto_activation_message()
         return
     if action == "set-hosts":
         value = args[1].strip() if len(args) == 2 else input("请输入允许下载域名（逗号分隔）: ").strip()
-        hosts = [item.strip().lower().rstrip(".") for item in value.split(",") if item.strip()]
-        if any(not host or "://" in host or any(char in host for char in (":", "/", "?", "#", " ", "\t")) for host in hosts):
-            print("允许列表只接受 hostname，不接受 URL、路径或 query。")
+        hosts, host_error = normalize_publicvpnlist_hosts(value)
+        if host_error:
+            print(host_error)
             return
-        if save_publicvpnlist_environment({"PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS": ",".join(hosts)}):
+        if save_publicvpnlist_environment({"PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS": hosts or ""}):
             print("下载域名允许列表已保存。")
+            publicvpnlist_auto_activation_message()
         return
     if action == "clear":
         if save_publicvpnlist_environment({
@@ -507,6 +657,7 @@ def publicvpnlist_command(args):
             "PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS": "",
         }):
             print("PublicVPNList 快照和下载域名配置已清除；缓存文件未删除。")
+            publicvpnlist_auto_activation_message()
         return
     if action == "restart":
         run_service_action("restart")
@@ -775,7 +926,7 @@ def print_status():
     curr_pwd = cfg.get("password", "")
     masked_pwd = curr_pwd if len(curr_pwd) <= 4 else curr_pwd[:3] + "********" + curr_pwd[-2:]
     print_line(format_line("网页管理密码", masked_pwd))
-    print_line(format_line("节点拉取来源", cfg.get("node_sources", "vpngate,vpnbook,ipspeed,vpngate_scraper") or "vpngate,vpnbook,ipspeed,vpngate_scraper"))
+    print_line(format_line("节点拉取来源", effective_node_sources(cfg.get("node_sources", "vpngate,vpnbook,ipspeed,vpngate_scraper") or "vpngate,vpnbook,ipspeed,vpngate_scraper")))
     print_line(format_line("PublicVPNList 状态", publicvpnlist_status_label()))
     print_line(format_line("节点拉取地区", cfg.get("target_countries", "") or "全部地区"))
     print_line(format_line("自动IP优先级", cfg.get("target_ip_types", "residential") or "全部类型"))
@@ -1565,6 +1716,7 @@ say "  * 停止服务:       ${YELLOW}en stop${PLAIN}"
 say "  * 重启服务:       ${YELLOW}en restart${PLAIN}"
 say "  * 设置节点来源:   ${YELLOW}en source${PLAIN}"
 say "  * PublicVPNList:  ${YELLOW}en publicvpnlist status|set-url|set-file PATH|set-hosts HOST[,HOST]|clear|restart${PLAIN}"
+say "  * 配置 PublicVPNList 后会自动加入节点来源，无需再次执行 en source。"
 say "  * 设置拉取地区:   ${YELLOW}en country${PLAIN}"
 say "  * 设置自动IP类型: ${YELLOW}en iptype${PLAIN}"
 say "=========================================================="
