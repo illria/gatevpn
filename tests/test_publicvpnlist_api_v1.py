@@ -115,7 +115,9 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
             self.assertIn(query["country"][0], {"PH", "FR"})
             metadata.update({"status": 200, "content_type": "application/json", "etag": '"fixture"'})
             country = query["country"][0]
-            return self.api_response([self.record(node_id=f"{country.lower()}-1", country=country)])
+            row = self.record(node_id=f"{country.lower()}-1", country=country)
+            row["ip"] = "198.51.100.11" if country == "PH" else "198.51.100.12"
+            return self.api_response([row])
 
         with mock.patch.object(vpngate_manager, "publicvpnlist_download_host_addresses", return_value=("93.184.216.34",)), mock.patch.object(
             vpngate_manager, "publicvpnlist_http_get", side_effect=http_get
@@ -350,7 +352,12 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
         now = time.time()
         row = self.record("retry-backoff", country="PH", with_config=False)
         cache = vpngate_manager.publicvpnlist_api_cache_default()
-        cache.update({"last_success_at": now, "next_update_at": now + 3600, "backoff_until": now + 300})
+        cache.update({
+            "last_success_at": now,
+            "next_update_at": now + 3600,
+            "backoff_until": now + 300,
+            "rate_limited": True,
+        })
         vpngate_manager.publicvpnlist_api_record_profile_retry(
             cache,
             vpngate_manager.normalize_publicvpnlist_row(row),
@@ -476,14 +483,18 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
                 vpngate_manager,
                 "publicvpnlist_http_get",
                 side_effect=AssertionError("bounded cache must not request the API"),
+            ), mock.patch.object(
+                vpngate_manager,
+                "publicvpnlist_download_host_addresses",
+                return_value=("93.184.216.34",),
             ):
                 payload = vpngate_manager.fetch_publicvpnlist_api_snapshot(target_countries=["PH"])
-            self.assertLessEqual(len(payload["data"]), limit)
-            self.assertEqual(payload["_api_meta"]["records_fetched"], 0)
-            self.assertLessEqual(
-                vpngate_manager.load_publicvpnlist_api_cache()["metadata_record_count"],
-                limit,
-            )
+                self.assertLessEqual(len(payload["data"]), limit)
+                self.assertEqual(payload["_api_meta"]["records_fetched"], 0)
+                self.assertLessEqual(
+                    vpngate_manager.load_publicvpnlist_api_cache()["metadata_record_count"],
+                    limit,
+                )
 
         now = time.time()
         limited_cache = vpngate_manager.load_publicvpnlist_api_cache()
@@ -495,6 +506,10 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
             vpngate_manager,
             "publicvpnlist_http_get",
             side_effect=AssertionError("backoff cache must not request the API"),
+        ), mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_download_host_addresses",
+            return_value=("93.184.216.34",),
         ):
             backoff = vpngate_manager.fetch_publicvpnlist_api_snapshot(target_countries=["PH"])
         self.assertLessEqual(len(backoff["data"]), 5)
@@ -566,7 +581,11 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
             metadata.update({"status": 200, "content_type": "application/json"})
             return self.api_response([self.record("fresh-us", country="US", with_config=False)])
 
-        with mock.patch.object(vpngate_manager, "publicvpnlist_http_get", side_effect=retry_http_get):
+        with mock.patch.object(vpngate_manager, "publicvpnlist_http_get", side_effect=retry_http_get), mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_download_host_addresses",
+            return_value=("93.184.216.34",),
+        ):
             payload = vpngate_manager.fetch_publicvpnlist_api_snapshot(target_countries=["PH", "US"])
         self.assertEqual(calls, ["US"])
         self.assertLessEqual(len(payload["data"]), vpngate_manager.PUBLICVPNLIST_API_MAX_RECORDS)
@@ -590,7 +609,11 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
             metadata.update({"status": 200, "content_type": "application/json"})
             return self.api_response([self.record(f"new-{country}", country=country, with_config=False)])
 
-        with mock.patch.object(vpngate_manager, "publicvpnlist_http_get", side_effect=retry_http_get):
+        with mock.patch.object(vpngate_manager, "publicvpnlist_http_get", side_effect=retry_http_get), mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_download_host_addresses",
+            return_value=("93.184.216.34",),
+        ):
             payload = vpngate_manager.fetch_publicvpnlist_api_snapshot(target_countries=["PH", "US"])
         self.assertEqual(calls, ["PH", "US"])
         self.assertLessEqual(len(payload["data"]), vpngate_manager.PUBLICVPNLIST_API_MAX_RECORDS)
