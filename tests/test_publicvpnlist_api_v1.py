@@ -791,10 +791,11 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
         self.assertGreater(refreshed["page_meta_by_query"][ph_key]["last_validated_at"], old_time)
         self.assertEqual(refreshed["page_meta_by_query"][us_key]["last_success_at"], old_time)
         self.assertEqual(refreshed["page_meta_by_query"][us_key]["last_validated_at"], old_time)
-        self.assertEqual(
-            [row["id"] for row in vpngate_manager.publicvpnlist_api_cached_records(refreshed)],
-            ["new-ph"],
-        )
+        with mock.patch.object(vpngate_manager, "PUBLICVPNLIST_API_MAX_STALE_SECONDS", 10):
+            self.assertEqual(
+                [row["id"] for row in vpngate_manager.publicvpnlist_api_cached_records(refreshed)],
+                ["new-ph"],
+            )
 
     def test_304_updates_only_page_validation_time_and_preserves_page_success_time(self):
         now = time.time()

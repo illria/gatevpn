@@ -2994,6 +2994,7 @@ def publicvpnlist_api_cached_records(
     }
     page_records_by_country: dict[str, list[dict[str, Any]]] = {}
     page_keys_by_country: dict[str, set[str]] = {}
+    page_entries: list[tuple[str, int, str, list[dict[str, Any]]]] = []
     for query_key, values in (cache.get("records_by_query") or {}).items():
         country = _publicvpnlist_api_query_country(query_key)
         if country not in selected_countries or country not in PUBLICVPNLIST_ALLOWED_COUNTRIES:
@@ -3001,8 +3002,24 @@ def publicvpnlist_api_cached_records(
         if not _publicvpnlist_api_page_cache_is_fresh(cache, str(query_key), now):
             continue
         page_records = _publicvpnlist_api_cached_page(cache, str(query_key)) or []
+        page_entries.append(
+            (
+                country,
+                _publicvpnlist_api_query_page(query_key),
+                str(query_key),
+                page_records,
+            )
+        )
+    for country, _page, query_key, page_records in sorted(
+        page_entries,
+        key=lambda item: (
+            PUBLICVPNLIST_ALLOWED_COUNTRY_ORDER.index(item[0]),
+            item[1],
+            item[2],
+        ),
+    ):
         page_records_by_country.setdefault(country, []).extend(page_records)
-        page_keys_by_country.setdefault(country, set()).add(str(query_key))
+        page_keys_by_country.setdefault(country, set()).add(query_key)
 
     records_by_country = {
         str(country).upper(): values
