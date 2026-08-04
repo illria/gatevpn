@@ -366,6 +366,235 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
         self.assertTrue(payload["_api_meta"]["rate_limited"])
         self.assertEqual(payload["_api_meta"]["backoff_until"], cache["backoff_until"])
 
+    def _save_fresh_metadata_cache(
+        self,
+        records,
+        *,
+        status=200,
+        next_update_offset=3600,
+        backoff_until=0.0,
+        rate_limited=False,
+        api_stale=False,
+        refresh_failed=False,
+    ):
+        now = time.time()
+        cache = vpngate_manager.publicvpnlist_api_cache_default()
+        by_country = {}
+        for record in records:
+            by_country.setdefault(str(record.get("country_code") or "PH").upper(), []).append(record)
+        cache.update(
+            {
+                "last_success_at": now,
+                "next_update_at": now + next_update_offset,
+                "last_http_status": status,
+                "backoff_until": backoff_until,
+                "rate_limited": rate_limited,
+                "api_stale": api_stale,
+                "refresh_failed": refresh_failed,
+                "records_by_country": by_country,
+            }
+        )
+        vpngate_manager.save_publicvpnlist_api_cache(cache)
+        return cache
+
+    def test_healthy_fresh_cache_reports_real_status_without_network(self):
+        self._save_fresh_metadata_cache([self.record("fresh-cache", with_config=False)])
+        with mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_http_get",
+            side_effect=AssertionError("fresh cache must not request the API"),
+        ):
+            payload = vpngate_manager.fetch_publicvpnlist_api_snapshot(target_countries=["PH"])
+        meta = payload["_api_meta"]
+        self.assertEqual(meta["status"], 200)
+        self.assertTrue(meta["from_cache"])
+        self.assertEqual(meta["records_fetched"], 0)
+        self.assertFalse(meta["api_stale"])
+        self.assertFalse(meta["refresh_failed"])
+        self.assertFalse(meta["rate_limited"])
+        self.assertEqual(meta["backoff_until"], 0.0)
+
+    def test_fresh_cache_preserves_304_status_without_calling_it_rate_limited(self):
+        self._save_fresh_metadata_cache(
+            [self.record("fresh-304", with_config=False)],
+            status=304,
+        )
+        with mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_http_get",
+            side_effect=AssertionError("fresh 304 cache must not request the API"),
+        ):
+            payload = vpngate_manager.fetch_publicvpnlist_api_snapshot(target_countries=["PH"])
+        self.assertEqual(payload["_api_meta"]["status"], 304)
+        self.assertFalse(payload["_api_meta"]["rate_limited"])
+
+    def test_active_and_expired_429_backoff_have_distinct_cache_state(self):
+        now = time.time()
+        self._save_fresh_metadata_cache(
+            [self.record("active-429", with_config=False)],
+            status=429,
+            next_update_offset=3600,
+            backoff_until=now + 300,
+            rate_limited=True,
+            api_stale=True,
+            refresh_failed=True,
+        )
+        with mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_http_get",
+            side_effect=AssertionError("active backoff must suppress requests"),
+        ):
+            active = vpngate_manager.fetch_publicvpnlist_api_snapshot(target_countries=["PH"])
+        self.assertEqual(active["_api_meta"]["status"], 429)
+        self.assertTrue(active["_api_meta"]["rate_limited"])
+        self.assertGreater(active["_api_meta"]["backoff_until"], now)
+
+        expired = vpngate_manager.load_publicvpnlist_api_cache()
+        expired["backoff_until"] = now - 1
+        expired["next_update_at"] = now + 3600
+        expired["rate_limited"] = True
+        vpngate_manager.save_publicvpnlist_api_cache(expired)
+        with mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_http_get",
+            side_effect=AssertionError("expired backoff with fresh cache must not request"),
+        ):
+            recovered = vpngate_manager.fetch_publicvpnlist_api_snapshot(target_countries=["PH"])
+        self.assertFalse(recovered["_api_meta"]["rate_limited"])
+        self.assertEqual(recovered["_api_meta"]["backoff_until"], 0.0)
+
+    def test_all_cache_return_paths_apply_runtime_metadata_limit(self):
+        records = []
+        for index in range(30):
+            row = self.record(f"bounded-{index}", with_config=False)
+            row["ip"] = f"198.51.100.{index + 1}"
+            row["hostname"] = f"bounded-{index}.fixture.invalid"
+            records.append(row)
+        self._save_fresh_metadata_cache(records)
+        for limit in (20, 5):
+            with mock.patch.object(vpngate_manager, "PUBLICVPNLIST_API_MAX_RECORDS", limit), mock.patch.object(
+                vpngate_manager,
+                "publicvpnlist_http_get",
+                side_effect=AssertionError("bounded cache must not request the API"),
+            ):
+                payload = vpngate_manager.fetch_publicvpnlist_api_snapshot(target_countries=["PH"])
+            self.assertLessEqual(len(payload["data"]), limit)
+            self.assertEqual(payload["_api_meta"]["records_fetched"], 0)
+            self.assertLessEqual(
+                vpngate_manager.load_publicvpnlist_api_cache()["metadata_record_count"],
+                limit,
+            )
+
+        now = time.time()
+        limited_cache = vpngate_manager.load_publicvpnlist_api_cache()
+        limited_cache["backoff_until"] = now + 300
+        limited_cache["rate_limited"] = True
+        limited_cache["last_http_status"] = 429
+        vpngate_manager.save_publicvpnlist_api_cache(limited_cache)
+        with mock.patch.object(vpngate_manager, "PUBLICVPNLIST_API_MAX_RECORDS", 5), mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_http_get",
+            side_effect=AssertionError("backoff cache must not request the API"),
+        ):
+            backoff = vpngate_manager.fetch_publicvpnlist_api_snapshot(target_countries=["PH"])
+        self.assertLessEqual(len(backoff["data"]), 5)
+
+    def test_failed_refresh_fallback_also_applies_runtime_metadata_limit(self):
+        records = []
+        for index in range(12):
+            row = self.record(f"failed-fallback-{index}", with_config=False)
+            row["ip"] = f"198.51.100.{index + 1}"
+            records.append(row)
+        cache = self._save_fresh_metadata_cache(records, next_update_offset=-1)
+        cache["next_update_at"] = time.time() - 1
+        vpngate_manager.save_publicvpnlist_api_cache(cache)
+        with mock.patch.object(vpngate_manager, "PUBLICVPNLIST_API_MAX_RECORDS", 5), mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_http_get",
+            side_effect=urllib.error.URLError("fixture unavailable"),
+        ), mock.patch.object(vpngate_manager, "publicvpnlist_download_host_addresses", return_value=("93.184.216.34",)):
+            payload = vpngate_manager.fetch_publicvpnlist_api_snapshot(target_countries=["PH"])
+        self.assertLessEqual(len(payload["data"]), 5)
+
+    def test_bounded_metadata_deduplicates_public_ids_and_endpoints(self):
+        first = self.record("duplicate-id", with_config=False)
+        same_endpoint = dict(first)
+        same_endpoint["id"] = "duplicate-endpoint"
+        same_id_other_endpoint = dict(first)
+        same_id_other_endpoint["hostname"] = "duplicate-id-other.fixture.invalid"
+        same_id_other_endpoint["ip"] = "198.51.100.201"
+        bounded = vpngate_manager.publicvpnlist_api_normalize_bounded_records(
+            [first, same_endpoint, same_id_other_endpoint],
+            limit=20,
+        )
+        self.assertEqual(len(bounded), 2)
+        self.assertEqual(
+            {row["hostname"] for row in bounded},
+            {first["hostname"], same_id_other_endpoint["hostname"]},
+        )
+
+    def test_due_retry_country_is_requested_before_full_fresh_cache(self):
+        now = time.time()
+        ph_records = []
+        for index in range(20):
+            row = self.record(f"cached-ph-{index}", country="PH", with_config=False)
+            row["ip"] = f"198.51.100.{index + 1}"
+            ph_records.append(row)
+        us = self.record("retry-us", country="US", with_config=False)
+        us["ip"] = "198.51.100.200"
+        cache = vpngate_manager.publicvpnlist_api_cache_default()
+        cache.update(
+            {
+                "last_success_at": now,
+                "next_update_at": now + 3600,
+                "records_by_country": {"PH": ph_records, "US": [us]},
+            }
+        )
+        vpngate_manager.publicvpnlist_api_record_profile_retry(
+            cache,
+            vpngate_manager.normalize_publicvpnlist_row(us),
+            now=now - 100,
+        )
+        cache["profile_retry_entries"][0]["retry_after"] = now - 1
+        vpngate_manager._publicvpnlist_api_sync_retry_fields(cache)
+        vpngate_manager.save_publicvpnlist_api_cache(cache)
+        calls = []
+
+        def retry_http_get(url, metadata=None, **_kwargs):
+            country = parse_qs(urlsplit(url).query)["country"][0]
+            calls.append(country)
+            metadata.update({"status": 200, "content_type": "application/json"})
+            return self.api_response([self.record("fresh-us", country="US", with_config=False)])
+
+        with mock.patch.object(vpngate_manager, "publicvpnlist_http_get", side_effect=retry_http_get):
+            payload = vpngate_manager.fetch_publicvpnlist_api_snapshot(target_countries=["PH", "US"])
+        self.assertEqual(calls, ["US"])
+        self.assertLessEqual(len(payload["data"]), vpngate_manager.PUBLICVPNLIST_API_MAX_RECORDS)
+
+    def test_multiple_due_retry_countries_each_get_one_bounded_request(self):
+        now = time.time()
+        rows = [self.record("retry-ph", country="PH", with_config=False), self.record("retry-us", country="US", with_config=False)]
+        cache = vpngate_manager.publicvpnlist_api_cache_default()
+        cache.update({"last_success_at": now, "next_update_at": now + 3600, "records_by_country": {"PH": [rows[0]], "US": [rows[1]]}})
+        for row in rows:
+            vpngate_manager.publicvpnlist_api_record_profile_retry(cache, vpngate_manager.normalize_publicvpnlist_row(row), now=now - 100)
+        for entry in cache["profile_retry_entries"]:
+            entry["retry_after"] = now - 1
+        vpngate_manager._publicvpnlist_api_sync_retry_fields(cache)
+        vpngate_manager.save_publicvpnlist_api_cache(cache)
+        calls = []
+
+        def retry_http_get(url, metadata=None, **_kwargs):
+            country = parse_qs(urlsplit(url).query)["country"][0]
+            calls.append(country)
+            metadata.update({"status": 200, "content_type": "application/json"})
+            return self.api_response([self.record(f"new-{country}", country=country, with_config=False)])
+
+        with mock.patch.object(vpngate_manager, "publicvpnlist_http_get", side_effect=retry_http_get):
+            payload = vpngate_manager.fetch_publicvpnlist_api_snapshot(target_countries=["PH", "US"])
+        self.assertEqual(calls, ["PH", "US"])
+        self.assertLessEqual(len(payload["data"]), vpngate_manager.PUBLICVPNLIST_API_MAX_RECORDS)
+
     def _seed_page_cache(self, pages, *, country="PH"):
         cache = vpngate_manager.publicvpnlist_api_cache_default()
         records_by_query = {}
@@ -740,6 +969,123 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
         self.assertNotIn("publicvpnlist", node["verification_sources"])
         self.assertIn("publicvpnlist", node["endpoint_match_sources"])
         self.assertEqual(node["pvl_public_id"], "ph-1")
+
+    def _run_existing_node_enrichment_with_api_cache(self, last_success_at):
+        row = self.record("enrich-me", with_config=False)
+        row.update(
+            {
+                "ip": "198.51.100.77",
+                "hostname": "enrich-me.fixture.invalid",
+                "checked_at": time.time(),
+                "measurement_quality": "verified",
+                "measurement_status": "success",
+            }
+        )
+        api_cache = vpngate_manager.publicvpnlist_api_cache_default()
+        api_cache.update(
+            {
+                "last_success_at": last_success_at,
+                "records_by_country": {"PH": [row]},
+            }
+        )
+        vpngate_manager.save_publicvpnlist_api_cache(api_cache)
+        node = {
+            "source": "vpngate",
+            "ip": "198.51.100.77",
+            "remote_host": "enrich-me.fixture.invalid",
+            "remote_port": 443,
+            "proto": "tcp",
+            "speed": 7_000_000,
+            "score": 7_000_000,
+            "ping": 31,
+            "latency_ms": 31,
+            "verification_sources": ["vpngate"],
+        }
+        empty_profile_cache = vpngate_manager.publicvpnlist_cache_default(
+            vpngate_manager.publicvpnlist_source_hash()
+        )
+        with mock.patch.object(
+            vpngate_manager,
+            "refresh_publicvpnlist_cache",
+            return_value=empty_profile_cache,
+        ), mock.patch.object(vpngate_manager, "log_to_json"):
+            vpngate_manager.fetch_publicvpnlist_candidates(
+                ["PH"],
+                set(),
+                existing_nodes=[node],
+            )
+        stats = vpngate_manager.load_publicvpnlist_cache().get("last_refresh_stats", {})
+        return node, stats
+
+    def test_fresh_api_metadata_enriches_existing_node(self):
+        node, stats = self._run_existing_node_enrichment_with_api_cache(time.time())
+        self.assertTrue(node.get("pvl_endpoint_matched"))
+        self.assertIn("publicvpnlist", node.get("endpoint_match_sources", []))
+        self.assertIn("publicvpnlist", node.get("verification_sources", []))
+        self.assertEqual(stats.get("matched_existing_nodes"), 1)
+
+    def test_expired_api_metadata_does_not_enrich_existing_node(self):
+        node, stats = self._run_existing_node_enrichment_with_api_cache(
+            time.time() - vpngate_manager.PUBLICVPNLIST_API_MAX_STALE_SECONDS - 1
+        )
+        self.assertNotIn("pvl_endpoint_matched", node)
+        self.assertNotIn("endpoint_match_sources", node)
+        self.assertNotIn("publicvpnlist", node.get("verification_sources", []))
+        self.assertEqual(node["speed"], 7_000_000)
+        self.assertEqual(node["latency_ms"], 31)
+        self.assertEqual(stats.get("matched_existing_nodes"), 0)
+
+    def test_api_metadata_without_last_success_does_not_enrich_existing_node(self):
+        node, stats = self._run_existing_node_enrichment_with_api_cache(0)
+        self.assertNotIn("pvl_endpoint_matched", node)
+        self.assertEqual(stats.get("matched_existing_nodes"), 0)
+
+    def test_endpoint_enrichment_selects_one_best_record_independent_of_input_order(self):
+        verified = self.record("verified-endpoint", with_config=False)
+        verified.update(
+            {
+                "ip": "198.51.100.88",
+                "hostname": "shared-endpoint.fixture.invalid",
+                "checked_at": time.time(),
+                "measurement_quality": "verified",
+                "measurement_status": "success",
+            }
+        )
+        stale = dict(verified)
+        stale.update(
+            {
+                "id": "stale-endpoint",
+                "freshness_status": "stale",
+                "measurement_status": "failed",
+                "checker_measured_throughput_mbps": 999,
+            }
+        )
+        first = vpngate_manager.publicvpnlist_select_best_endpoint_records([stale, verified])
+        second = vpngate_manager.publicvpnlist_select_best_endpoint_records([verified, stale])
+        self.assertEqual([row["id"] for row in first], ["verified-endpoint"])
+        self.assertEqual([row["id"] for row in second], ["verified-endpoint"])
+
+    def test_same_public_id_on_different_endpoints_is_not_merged(self):
+        first = self.record("same-public-id", with_config=False)
+        second = dict(first)
+        second["hostname"] = "different-endpoint.fixture.invalid"
+        second["ip"] = "198.51.100.199"
+        selected = vpngate_manager.publicvpnlist_select_best_endpoint_records([first, second])
+        self.assertEqual({row["host"] for row in selected}, {first["hostname"], second["hostname"]})
+
+    def test_endpoint_dedup_keeps_port_and_protocol_distinctions(self):
+        base = self.record("endpoint-base", with_config=False)
+        same_host_other_port = dict(base)
+        same_host_other_port["id"] = "endpoint-other-port"
+        same_host_other_port["port"] = 1194
+        same_host_other_proto = dict(base)
+        same_host_other_proto["id"] = "endpoint-other-proto"
+        same_host_other_proto["transport"] = "udp"
+        same_host_other_proto["protocol"] = "udp"
+        selected = vpngate_manager.publicvpnlist_select_best_endpoint_records(
+            [base, same_host_other_port, same_host_other_proto]
+        )
+        self.assertEqual(len(selected), 3)
 
     def test_failed_measurement_does_not_apply_publicvpnlist_metrics(self):
         node = {
