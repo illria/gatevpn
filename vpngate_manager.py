@@ -20,6 +20,7 @@ import urllib.parse
 import urllib.error
 import urllib.request
 import email.utils
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -450,6 +451,23 @@ def load_ui_config() -> dict[str, Any]:
                 pass
                 
         return config
+
+
+def save_ui_config(config: dict[str, Any]) -> bool:
+    """Persist the UI configuration with the existing sensitive-file policy."""
+
+    try:
+        with lock:
+            DATA_DIR.mkdir(exist_ok=True, parents=True)
+            atomic_write_text(
+                DATA_DIR / "ui_auth.json",
+                json.dumps(config, ensure_ascii=False, indent=2),
+                mode=0o600,
+            )
+        return True
+    except (OSError, TypeError, ValueError) as exc:
+        log_to_json("WARNING", "Settings", f"保存 UI 配置失败，错误类型={type(exc).__name__}")
+        return False
 
 
 def split_target_countries(value: Any) -> list[str]:
@@ -2420,7 +2438,7 @@ PUBLICVPNLIST_API_STORED_FIELDS = frozenset(
     {
         "id", "public_id", "country_code", "country_name", "country_short", "country_long",
         "city", "hostname", "host", "ip", "protocol", "transport", "proto", "port",
-        "speed_mbps", "latency_ms", "technical_quality_score", "last_checked_at",
+        "speed_mbps", "latency_ms", "technical_quality_score", "last_checked_at", "expires_at",
         "freshness_status", "availability_status", "source_name", "source_license",
         "redistribution_allowed", "risk_flags", "config_sha256", "source_reported_speed_mbps",
         "source_reported_ping_ms", "checker_measured_tunnel_rtt_ms",
@@ -2776,6 +2794,19 @@ def load_publicvpnlist_api_cache() -> dict[str, Any]:
             if _publicvpnlist_api_query_country(query_key) in PUBLICVPNLIST_ALLOWED_COUNTRIES:
                 records_by_query[str(query_key)] = [record for record in safe_records if record is not None]
     normalized["records_by_query"] = records_by_query
+    # A legacy country-level cache is not a precise page cache.  Do not carry
+    # its validators forward, otherwise a 304 can permanently prevent the
+    # first unconditional page migration.
+    normalized["etag_by_query"] = {
+        str(key): str(value)
+        for key, value in normalized["etag_by_query"].items()
+        if str(key) in records_by_query and str(value)
+    }
+    normalized["last_modified_by_query"] = {
+        str(key): str(value)
+        for key, value in normalized["last_modified_by_query"].items()
+        if str(key) in records_by_query and str(value)
+    }
     page_meta_by_query: dict[str, dict[str, Any]] = {}
     raw_page_meta = raw.get("page_meta_by_query")
     if isinstance(raw_page_meta, dict):
@@ -2848,6 +2879,16 @@ def save_publicvpnlist_api_cache(cache: dict[str, Any]) -> None:
             continue
         safe_records = [publicvpnlist_api_cache_record(record) for record in records]
         state["records_by_query"][str(query_key)] = [record for record in safe_records if record is not None]
+    state["etag_by_query"] = {
+        str(key): str(value)
+        for key, value in state["etag_by_query"].items()
+        if str(key) in state["records_by_query"] and str(value)
+    }
+    state["last_modified_by_query"] = {
+        str(key): str(value)
+        for key, value in state["last_modified_by_query"].items()
+        if str(key) in state["records_by_query"] and str(value)
+    }
     state["page_meta_by_query"] = {}
     for query_key, page_meta in (cache.get("page_meta_by_query") or {}).items():
         safe_meta = _publicvpnlist_api_safe_page_meta(page_meta)
@@ -2892,15 +2933,18 @@ def publicvpnlist_api_cached_records(cache: dict[str, Any]) -> list[dict[str, An
 
 def publicvpnlist_api_cache_is_fresh(cache: dict[str, Any], now: float | None = None) -> bool:
     now = time.time() if now is None else now
-    next_update_at = float(cache.get("next_update_at") or 0)
-    backoff_until = float(cache.get("backoff_until") or 0)
+    next_update_at = _publicvpnlist_api_time(cache.get("next_update_at"))
+    backoff_until = _publicvpnlist_api_time(cache.get("backoff_until"))
+    expires_at = _publicvpnlist_api_time(cache.get("expires_at"))
+    if expires_at and now >= expires_at:
+        return False
     next_allowed_at = max(next_update_at, backoff_until)
     return bool(next_allowed_at and now < next_allowed_at)
 
 
 def publicvpnlist_api_cache_is_usable(cache: dict[str, Any], now: float | None = None) -> bool:
     now = time.time() if now is None else now
-    last_success = float(cache.get("last_success_at") or 0)
+    last_success = _publicvpnlist_api_time(cache.get("last_success_at"))
     if not last_success or now - last_success > PUBLICVPNLIST_API_MAX_STALE_SECONDS:
         return False
     return bool(publicvpnlist_api_cached_records(cache))
@@ -3050,17 +3094,39 @@ def _publicvpnlist_api_target_countries(target_countries: Any = None) -> list[st
 
 
 def _publicvpnlist_api_time(value: Any) -> float:
-    if value in (None, ""):
+    if value in (None, "") or isinstance(value, bool):
+        return 0.0
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+        return numeric if math.isfinite(numeric) else 0.0
+    text = str(value).strip()
+    if not text:
         return 0.0
     try:
-        numeric = float(value)
+        numeric = float(text)
         return numeric if math.isfinite(numeric) else 0.0
     except (TypeError, ValueError):
         pass
+    iso_text = text
+    if iso_text.endswith(("Z", "z")):
+        iso_text = iso_text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(iso_text)
+        # Naive API timestamps have no server-local-time semantics.  Treat
+        # them as explicitly UTC so the result is deterministic everywhere.
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        timestamp = parsed.astimezone(timezone.utc).timestamp()
+        return timestamp if math.isfinite(timestamp) else 0.0
+    except (TypeError, ValueError, OverflowError, OSError):
+        pass
     try:
         parsed = email.utils.parsedate_to_datetime(str(value))
-        return parsed.timestamp()
-    except (TypeError, ValueError, OverflowError):
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        timestamp = parsed.astimezone(timezone.utc).timestamp()
+        return timestamp if math.isfinite(timestamp) else 0.0
+    except (TypeError, ValueError, OverflowError, OSError):
         return 0.0
 
 
@@ -3099,29 +3165,38 @@ def fetch_publicvpnlist_api_snapshot(
     servers_url = publicvpnlist_api_servers_url()
     countries = _publicvpnlist_api_target_countries(target_countries)
 
-    if publicvpnlist_api_cache_is_fresh(api_cache, now):
+    backoff_until = float(api_cache.get("backoff_until") or 0)
+    # A due profile retry is the only reason to revisit a fresh metadata
+    # cache.  It must still respect a previously recorded 429 backoff.
+    if backoff_until and now < backoff_until:
+        cached_records = publicvpnlist_api_cached_records(api_cache)
         return {
             "data": [
                 {**record, "_pvl_api_not_modified": True}
-                for record in publicvpnlist_api_cached_records(api_cache)
+                for record in cached_records
                 if str(record.get("country_code") or record.get("country_short") or "").upper() in countries
             ],
             "_api_meta": {
-                "status": int(api_cache.get("last_http_status") or 200),
+                "status": int(api_cache.get("last_http_status") or 429),
                 "records_fetched": 0,
                 "from_cache": True,
-                "api_stale": bool(api_cache.get("api_stale")),
-                "refresh_failed": bool(api_cache.get("refresh_failed")),
-                "rate_limited": bool(api_cache.get("rate_limited")),
-                "backoff_until": float(api_cache.get("backoff_until") or 0),
+                "api_stale": True,
+                "refresh_failed": True,
+                "rate_limited": True,
+                "backoff_until": backoff_until,
                 "etag_cache_hits": 0,
                 "profile_retry_count": len(api_cache.get("profile_retry_entries") or []),
                 "dataset_version": str(api_cache.get("dataset_version") or ""),
             },
         }
 
-    backoff_until = float(api_cache.get("backoff_until") or 0)
-    if backoff_until and now < backoff_until:
+    fresh_cache = publicvpnlist_api_cache_is_fresh(api_cache, now)
+    retry_countries = {
+        country
+        for country in countries
+        if publicvpnlist_api_retry_due(api_cache, country, now)
+    }
+    if fresh_cache and not retry_countries:
         cached_records = publicvpnlist_api_cached_records(api_cache)
         return {
             "data": [
@@ -3181,6 +3256,15 @@ def fetch_publicvpnlist_api_snapshot(
         if stop_all:
             break
         processed_countries.add(country)
+        if fresh_cache and country not in retry_countries:
+            # Preserve the fresh country cache without issuing an unrelated
+            # request while another country is being retried.
+            cached_country = _publicvpnlist_api_mark_cached_records(
+                _publicvpnlist_api_cache_records_for_country(working, country)
+            )
+            records_by_country[country] = cached_country
+            current_records.extend(cached_country)
+            continue
         if len(current_records) >= PUBLICVPNLIST_API_MAX_RECORDS:
             total_limit_hit = True
             working["total_limit_hit"] = True
@@ -3212,7 +3296,7 @@ def fetch_publicvpnlist_api_snapshot(
             retry_due = publicvpnlist_api_retry_due(working, country, now)
             page_meta = _publicvpnlist_api_cached_page_meta(working, query_key)
             cached_page = _publicvpnlist_api_cached_page(working, query_key)
-            if not retry_due:
+            if not retry_due and cached_page is not None:
                 etag = str(
                     page_meta.get("etag")
                     or (working.get("etag_by_query") or {}).get(query_key)
@@ -3973,6 +4057,7 @@ def normalize_publicvpnlist_row(row: dict[str, Any]) -> dict[str, Any] | None:
         "config_updated_at": row.get("config_updated_at"),
         "source_updated_at": row.get("source_updated_at"),
         "checked_at": row.get("checkedAt") or row.get("checked_at") or row.get("last_checked_at") or "",
+        "expires_at": row.get("expiresAt") or row.get("expires_at") or "",
         "temporary_ovpn_url": config_download_url,
         "download_page_url": str(row.get("download_page_url") or row.get("server_page_url") or "").strip(),
         "config_text": str(row.get("config_text") or ""),
@@ -4075,6 +4160,7 @@ def publicvpnlist_cache_profile(
         "config_updated_at": row.get("config_updated_at"),
         "source_updated_at": row.get("source_updated_at"),
         "checked_at": row.get("checked_at") or row.get("checkedAt") or row.get("last_checked_at") or "",
+        "expires_at": row.get("expires_at") or row.get("expiresAt") or "",
         "download_page_url": publicvpnlist_cache_page_url(row),
         "technical_quality_score": row.get("technical_quality_score"),
         "freshness_status": str(row.get("freshness_status") or "").strip(),
@@ -4611,6 +4697,41 @@ def publicvpnlist_write_environment(updates: dict[str, Any]) -> dict[str, str]:
     return values
 
 
+def save_node_sources_transaction(ui_cfg: dict[str, Any]) -> bool:
+    """Update UI sources and the PublicVPNList switch as one logical operation."""
+
+    if not isinstance(ui_cfg, dict):
+        return False
+    previous_values = publicvpnlist_environment_values()
+    previous_enabled = str(
+        previous_values.get(
+            "PUBLICVPNLIST_ENABLED",
+            "1" if publicvpnlist_is_enabled() else "0",
+        )
+    )
+    enabled = "1" if "publicvpnlist" in split_node_sources(ui_cfg.get("node_sources")) else "0"
+    try:
+        publicvpnlist_write_environment({"PUBLICVPNLIST_ENABLED": enabled})
+    except Exception as exc:
+        log_to_json("WARNING", "Settings", f"节点来源事务未写入环境文件，错误类型={type(exc).__name__}")
+        return False
+    try:
+        if save_ui_config(ui_cfg) is not True:
+            raise OSError("UI 配置写入失败")
+    except Exception as exc:
+        try:
+            publicvpnlist_write_environment({"PUBLICVPNLIST_ENABLED": previous_enabled})
+        except Exception as rollback_exc:
+            log_to_json(
+                "WARNING",
+                "Settings",
+                f"节点来源事务回滚环境文件失败，错误类型={type(rollback_exc).__name__}",
+            )
+        log_to_json("WARNING", "Settings", f"节点来源事务未写入 UI 配置，错误类型={type(exc).__name__}")
+        return False
+    return True
+
+
 def schedule_manager_restart() -> None:
     def restart_server() -> None:
         time.sleep(2)
@@ -4648,11 +4769,15 @@ def publicvpnlist_refresh_needed(
         return True
     if source_kind == "api":
         api_cache = load_publicvpnlist_api_cache()
-        if publicvpnlist_api_cache_is_fresh(api_cache, now):
-            return False
-        backoff_until = float(api_cache.get("backoff_until") or 0)
+        backoff_until = _publicvpnlist_api_time(api_cache.get("backoff_until"))
         if backoff_until and now < backoff_until:
             return False
+        if publicvpnlist_api_cache_is_fresh(api_cache, now):
+            retry_due = any(
+                publicvpnlist_api_retry_due(api_cache, country, now)
+                for country in PUBLICVPNLIST_ALLOWED_COUNTRY_ORDER
+            )
+            return retry_due
         return True
     # A local snapshot is immutable from the application's perspective until
     # its identity changes. Never reuse its expired temporary URL merely
@@ -5461,6 +5586,13 @@ def publicvpnlist_metadata_is_verified(
     )
     if not checked_at or checked_at > now + 300:
         return False
+    expires_value = row.get("expires_at")
+    if expires_value in (None, ""):
+        expires_value = row.get("expiresAt")
+    if expires_value not in (None, ""):
+        expires_at = _publicvpnlist_api_time(expires_value)
+        if not expires_at or now >= expires_at:
+            return False
     return now - checked_at <= PUBLICVPNLIST_API_MAX_STALE_SECONDS
 
 
@@ -5480,6 +5612,9 @@ def publicvpnlist_row_to_node(row: dict[str, Any], config_text: str) -> dict[str
         return None
     ip = str(row.get("ip") or "") or resolve_publicvpnlist_ipv4(remote_host)
     country_short, country_zh = canonicalize_country_fields(row.get("country_short"), row.get("country_long"))
+    pvl_verified = publicvpnlist_metadata_is_verified(row)
+    node_speed = publicvpnlist_speed_bps(row.get("speed_mbps")) if pvl_verified else 0
+    node_latency = publicvpnlist_metric_int(row.get("latency_ms", row.get("ping"))) if pvl_verified else 0
     node_id = safe_name(
         "_".join(["PUBLICVPNLIST", country_short, str(row.get("id") or ip or remote_host), str(remote_port), parsed_proto])
     )
@@ -5493,12 +5628,12 @@ def publicvpnlist_row_to_node(row: dict[str, Any], config_text: str) -> dict[str
         "auth_user": OPENVPN_AUTH_USER,
         "auth_pass": OPENVPN_AUTH_PASS,
         "ip": ip,
-        "score": publicvpnlist_speed_bps(row.get("speed_mbps")),
-        "ping": publicvpnlist_metric_int(row.get("ping")),
-        "speed": publicvpnlist_speed_bps(row.get("speed_mbps")),
+        "score": node_speed,
+        "ping": node_latency,
+        "speed": node_speed,
         "sessions": 0,
         **publicvpnlist_classification_defaults(),
-        "latency_ms": publicvpnlist_metric_int(row.get("latency_ms", row.get("ping"))),
+        "latency_ms": node_latency,
         "source_reported_speed_mbps": row.get("source_reported_speed_mbps"),
         "source_reported_ping_ms": row.get("source_reported_ping_ms"),
         "checker_measured_tunnel_rtt_ms": row.get("checker_measured_tunnel_rtt_ms"),
@@ -5512,17 +5647,19 @@ def publicvpnlist_row_to_node(row: dict[str, Any], config_text: str) -> dict[str
         "uptime_percent_7d": row.get("uptime_percent_7d"),
         "uptime_hours": row.get("uptime_hours"),
         "sessions": row.get("sessions"),
-        "technical_quality_score": row.get("technical_quality_score"),
+        "technical_quality_score": row.get("technical_quality_score") if pvl_verified else 0,
         "score_label": row.get("score_label"),
         "last_checked_at": row.get("checked_at"),
         "pvl_endpoint_matched": True,
-        "pvl_verified": publicvpnlist_metadata_is_verified(row),
+        "pvl_verified": pvl_verified,
         "pvl_public_id": str(row.get("id") or ""),
         "pvl_last_checked_at": row.get("checked_at"),
         "pvl_checker_speed_mbps": row.get("checker_measured_throughput_mbps"),
         "pvl_checker_latency_ms": row.get("checker_measured_tunnel_rtt_ms"),
         "pvl_technical_quality_score": row.get("technical_quality_score"),
         "pvl_measurement_quality": row.get("measurement_quality"),
+        "verification_sources": ["publicvpnlist"] if pvl_verified else [],
+        "endpoint_match_sources": ["publicvpnlist"],
         "config_file": str(config_path),
         "config_text": sanitized,
         "proto": parsed_proto,
@@ -5540,8 +5677,9 @@ def publicvpnlist_row_to_node(row: dict[str, Any], config_text: str) -> dict[str
 def publicvpnlist_enrich_existing_node(node: dict[str, Any], row: dict[str, Any]) -> None:
     """Attach API measurements to an existing source without replacing it."""
 
+    verified = publicvpnlist_metadata_is_verified(row)
     node["pvl_endpoint_matched"] = True
-    node["pvl_verified"] = publicvpnlist_metadata_is_verified(row)
+    node["pvl_verified"] = verified
     node["pvl_public_id"] = str(row.get("id") or row.get("public_id") or "")
     node["pvl_last_checked_at"] = row.get("checked_at") or row.get("last_checked_at") or ""
     node["pvl_checker_speed_mbps"] = row.get("checker_measured_throughput_mbps")
@@ -5553,11 +5691,22 @@ def publicvpnlist_enrich_existing_node(node: dict[str, Any], row: dict[str, Any]
         verification_sources = [verification_sources]
     if not isinstance(verification_sources, list):
         verification_sources = []
-    if "publicvpnlist" not in verification_sources:
+    verification_sources = [
+        source for source in verification_sources
+        if str(source).strip().lower() != "publicvpnlist"
+    ]
+    if verified:
         verification_sources.append("publicvpnlist")
     node["verification_sources"] = verification_sources
-    quality = str(row.get("measurement_quality") or "").strip().lower()
-    if quality == "verified":
+    endpoint_match_sources = node.get("endpoint_match_sources")
+    if isinstance(endpoint_match_sources, str):
+        endpoint_match_sources = [endpoint_match_sources]
+    if not isinstance(endpoint_match_sources, list):
+        endpoint_match_sources = []
+    if "publicvpnlist" not in endpoint_match_sources:
+        endpoint_match_sources.append("publicvpnlist")
+    node["endpoint_match_sources"] = endpoint_match_sources
+    if verified:
         if parse_int(node.get("latency_ms")) <= 0 and parse_int(row.get("checker_measured_tunnel_rtt_ms")) > 0:
             node["latency_ms"] = parse_int(row.get("checker_measured_tunnel_rtt_ms"))
             node["ping"] = node["latency_ms"]
@@ -10152,22 +10301,6 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"ok": False, "error": "安全后缀仅能由英文字母和数字组成"}, HTTPStatus.BAD_REQUEST)
                     return
 
-                if "node_sources" in payload:
-                    try:
-                        publicvpnlist_write_environment(
-                            {
-                                "PUBLICVPNLIST_ENABLED": (
-                                    "1" if "publicvpnlist" in split_node_sources(new_node_sources) else "0"
-                                )
-                            }
-                        )
-                    except Exception:
-                        self.send_json(
-                            {"ok": False, "error": "节点来源更新失败：PublicVPNList 开关环境文件写入失败"},
-                            HTTPStatus.INTERNAL_SERVER_ERROR,
-                        )
-                        return
-                
                 ui_cfg["port"] = new_port_int
                 ui_cfg["secret_path"] = new_suffix
                 ui_cfg["target_countries"] = new_target_countries
@@ -10180,10 +10313,19 @@ class Handler(BaseHTTPRequestHandler):
                 if new_password:
                     ui_cfg["password"] = new_password
                 
-                auth_file = DATA_DIR / "ui_auth.json"
-                with lock:
-                    DATA_DIR.mkdir(exist_ok=True, parents=True)
-                    atomic_write_text(auth_file, json.dumps(ui_cfg, ensure_ascii=False, indent=2), mode=0o600)
+                if "node_sources" in payload:
+                    if not save_node_sources_transaction(ui_cfg):
+                        self.send_json(
+                            {"ok": False, "error": "节点来源更新失败，UI 配置与 PublicVPNList 开关均未提交"},
+                            HTTPStatus.INTERNAL_SERVER_ERROR,
+                        )
+                        return
+                elif not save_ui_config(ui_cfg):
+                    self.send_json(
+                        {"ok": False, "error": "配置更新失败，UI 配置未提交"},
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+                    return
                 
                 self.send_json({"ok": True, "message": "配置更新成功，系统将在 2 秒内重启..."})
                 schedule_manager_restart()

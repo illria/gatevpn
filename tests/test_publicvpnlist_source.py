@@ -187,6 +187,54 @@ class PublicVPNListSourceTests(unittest.TestCase):
             ["vpnbook", "vpngate"],
         )
 
+    def test_source_transaction_keeps_ui_unchanged_when_environment_write_fails(self):
+        ui_cfg = {"node_sources": "vpngate,publicvpnlist"}
+        with mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_environment_values",
+            return_value={"PUBLICVPNLIST_ENABLED": "0"},
+        ), mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_write_environment",
+            side_effect=OSError("environment unavailable"),
+        ) as env_writer, mock.patch.object(vpngate_manager, "save_ui_config") as save_ui:
+            self.assertFalse(vpngate_manager.save_node_sources_transaction(ui_cfg))
+        env_writer.assert_called_once_with({"PUBLICVPNLIST_ENABLED": "1"})
+        save_ui.assert_not_called()
+
+    def test_source_transaction_rolls_back_environment_when_ui_write_fails(self):
+        ui_cfg = {"node_sources": "vpngate,publicvpnlist"}
+        writes = []
+
+        def write_environment(updates):
+            writes.append(dict(updates))
+            return {}
+
+        with mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_environment_values",
+            return_value={"PUBLICVPNLIST_ENABLED": "0"},
+        ), mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_write_environment",
+            side_effect=write_environment,
+        ), mock.patch.object(vpngate_manager, "save_ui_config", return_value=False):
+            self.assertFalse(vpngate_manager.save_node_sources_transaction(ui_cfg))
+        self.assertEqual(writes, [{"PUBLICVPNLIST_ENABLED": "1"}, {"PUBLICVPNLIST_ENABLED": "0"}])
+
+    def test_source_transaction_commits_switch_only_after_both_writes_succeed(self):
+        ui_cfg = {"node_sources": "vpngate,publicvpnlist"}
+        with mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_environment_values",
+            return_value={"PUBLICVPNLIST_ENABLED": "0"},
+        ), mock.patch.object(
+            vpngate_manager, "publicvpnlist_write_environment", return_value={}
+        ) as env_writer, mock.patch.object(vpngate_manager, "save_ui_config", return_value=True) as save_ui:
+            self.assertTrue(vpngate_manager.save_node_sources_transaction(ui_cfg))
+        env_writer.assert_called_once_with({"PUBLICVPNLIST_ENABLED": "1"})
+        save_ui.assert_called_once_with(ui_cfg)
+
     def test_configured_and_effective_sources_are_separate(self):
         with mock.patch.object(vpngate_manager, "NODE_SOURCES_ENV", ""), mock.patch.object(
             vpngate_manager, "load_ui_config", return_value={"node_sources": "vpngate,publicvpnlist"}
@@ -1513,6 +1561,13 @@ class PublicVPNListSourceTests(unittest.TestCase):
         self.assertEqual(vpngate_manager.publicvpnlist_speed_bps("not-a-number"), 0)
         self.assertEqual(vpngate_manager.publicvpnlist_speed_bps("nan"), 0)
         row = self.row("speed-bps", "PH", "198.51.100.68")
+        row.update(
+            {
+                "checkedAt": time.time(),
+                "measurement_quality": "verified",
+                "measurement_status": "success",
+            }
+        )
         result, _ = self.fetch_rows([row])
         self.assertEqual(result[0]["speed"], 12_500_000)
         self.assertEqual(result[0]["score"], 12_500_000)

@@ -267,7 +267,8 @@ class ServiceEnvironmentTests(unittest.TestCase):
             namespace["publicvpnlist_status_label"] = lambda: "PublicVPNList（API）"
             namespace["ask_restart"] = lambda: None
             saved_configs = []
-            namespace["save_ui_cfg"] = lambda cfg: saved_configs.append(dict(cfg))
+            namespace["save_ui_cfg"] = lambda cfg: saved_configs.append(dict(cfg)) or True
+            original_env_writer = namespace["save_publicvpnlist_environment"]
 
             for key, expected_enabled, expected_sources in (
                 ("1", "1", "vpngate,vpnbook,ipspeed,vpngate_scraper,publicvpnlist"),
@@ -286,6 +287,14 @@ class ServiceEnvironmentTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 namespace["configure_source"]()
             self.assertEqual(len(saved_configs), before)
+
+            namespace["save_publicvpnlist_environment"] = original_env_writer
+            namespace["save_ui_cfg"] = lambda _cfg: False
+            namespace["getch"] = lambda: "1"
+            with contextlib.redirect_stdout(io.StringIO()):
+                namespace["configure_source"]()
+            rolled_back = namespace["read_env_file"](namespace["ENV_FILE"])
+            self.assertEqual(rolled_back.get("PUBLICVPNLIST_ENABLED"), "0")
 
 
 if __name__ == "__main__":

@@ -877,12 +877,69 @@ def save_ui_cfg(cfg):
     import json
     path = "/opt/eianun-vpngate/vpngate_data/ui_auth.json"
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    temporary_path = None
+    temporary_fd = None
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        temporary_fd, temporary_path = tempfile.mkstemp(
+            prefix=".ui_auth.json.",
+            dir=os.path.dirname(path),
+            text=True,
+        )
+        os.fchmod(temporary_fd, 0o600)
+        with os.fdopen(temporary_fd, "w", encoding="utf-8") as f:
+            temporary_fd = None
             json.dump(cfg, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary_path, path)
+        temporary_path = None
+        os.chmod(path, 0o600)
+        try:
+            directory_fd = os.open(os.path.dirname(path), os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            pass
         return True
-    except Exception:
+    except (OSError, TypeError, ValueError):
+        if temporary_fd is not None:
+            try:
+                os.close(temporary_fd)
+            except OSError:
+                pass
+        if temporary_path:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
         return False
+    finally:
+        if temporary_path:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
+
+def save_node_sources_transaction(cfg):
+    """Commit UI node_sources and PUBLICVPNLIST_ENABLED together."""
+    if not isinstance(cfg, dict):
+        return False
+    previous = load_publicvpnlist_environment()
+    previous_enabled = str(previous.get("PUBLICVPNLIST_ENABLED", "1"))
+    sources = str(cfg.get("node_sources") or "")
+    enabled = "1" if any(
+        token.strip().lower() in {"publicvpnlist", "public_vpn_list", "pvl"}
+        for token in re.split(r"[,，;；|/\s]+", sources)
+    ) else "0"
+    if not save_publicvpnlist_environment({"PUBLICVPNLIST_ENABLED": enabled}):
+        return False
+    if save_ui_cfg(cfg) is True:
+        return True
+    save_publicvpnlist_environment({"PUBLICVPNLIST_ENABLED": previous_enabled})
+    return False
 
 def load_state():
     import json
@@ -1409,11 +1466,9 @@ def configure_source():
         cfg['node_sources'] = 'publicvpnlist'
     else:
         return
-    publicvpnlist_enabled = "1" if "publicvpnlist" in cfg['node_sources'].split(",") else "0"
-    if not save_publicvpnlist_environment({"PUBLICVPNLIST_ENABLED": publicvpnlist_enabled}):
-        print("节点来源未更新：PublicVPNList 开关环境文件写入失败。")
+    if not save_node_sources_transaction(cfg):
+        print("节点来源未更新：UI 配置与 PublicVPNList 开关均未提交。")
         return
-    save_ui_cfg(cfg)
     print(f"节点来源已更新为: {cfg['node_sources']}")
     ask_restart()
 
