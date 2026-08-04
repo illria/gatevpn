@@ -1564,6 +1564,8 @@ class PublicVPNListSourceTests(unittest.TestCase):
         row.update(
             {
                 "checkedAt": time.time(),
+                "freshness_status": "fresh",
+                "availability_status": "online",
                 "measurement_quality": "verified",
                 "measurement_status": "success",
             }
