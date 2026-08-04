@@ -304,6 +304,10 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
             10,
         ), mock.patch.object(
             vpngate_manager,
+            "publicvpnlist_download_host_addresses",
+            return_value=("93.184.216.34",),
+        ), mock.patch.object(
+            vpngate_manager,
             "publicvpnlist_http_get",
             side_effect=refresh_http_get,
         ):
@@ -327,6 +331,10 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
             )
 
         with mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_download_host_addresses",
+            return_value=("93.184.216.34",),
+        ), mock.patch.object(
             vpngate_manager,
             "publicvpnlist_http_get",
             side_effect=second_http_get,
@@ -468,6 +476,10 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
 
             before = time.time()
             with mock.patch.object(
+                vpngate_manager,
+                "publicvpnlist_download_host_addresses",
+                return_value=("93.184.216.34",),
+            ), mock.patch.object(
                 vpngate_manager,
                 "publicvpnlist_http_get",
                 side_effect=http_get,
@@ -767,6 +779,10 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
 
         with mock.patch.object(
             vpngate_manager,
+            "publicvpnlist_download_host_addresses",
+            return_value=("93.184.216.34",),
+        ), mock.patch.object(
+            vpngate_manager,
             "publicvpnlist_http_get",
             side_effect=AssertionError("fresh cache must not request the API"),
         ):
@@ -783,6 +799,10 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
         expired_page["page_meta_by_query"][key]["last_validated_at"] = old_time
         vpngate_manager.save_publicvpnlist_api_cache(expired_page)
         with mock.patch.object(vpngate_manager, "PUBLICVPNLIST_API_MAX_STALE_SECONDS", 10), mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_download_host_addresses",
+            return_value=("93.184.216.34",),
+        ), mock.patch.object(
             vpngate_manager,
             "publicvpnlist_http_get",
             side_effect=urllib.error.URLError("expired page"),
@@ -1417,6 +1437,10 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
 
         with mock.patch.object(
             vpngate_manager,
+            "publicvpnlist_download_host_addresses",
+            return_value=("93.184.216.34",),
+        ), mock.patch.object(
+            vpngate_manager,
             "publicvpnlist_http_get",
             side_effect=first_http_get,
         ):
@@ -1452,6 +1476,10 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
             raise urllib.error.URLError("unconditional retry failed")
 
         with mock.patch.object(vpngate_manager, "PUBLICVPNLIST_API_MAX_RETRIES", 1), mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_download_host_addresses",
+            return_value=("93.184.216.34",),
+        ), mock.patch.object(
             vpngate_manager,
             "publicvpnlist_http_get",
             side_effect=retry_http_get,
