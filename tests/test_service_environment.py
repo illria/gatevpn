@@ -223,6 +223,7 @@ class ServiceEnvironmentTests(unittest.TestCase):
             exec(compile(source, "install.sh:generated-en", "exec"), namespace)
             values = {
                 "VPNGATE_DATA_DIR": str(data_dir),
+                "PUBLICVPNLIST_ENABLED": "1",
                 "PUBLICVPNLIST_STALE_PROFILE_SECONDS": "604800",
                 "PUBLICVPNLIST_API_URL": "",
                 "PUBLICVPNLIST_SNAPSHOT_URL": "",
@@ -235,7 +236,9 @@ class ServiceEnvironmentTests(unittest.TestCase):
 
             with mock.patch.object(vpngate_manager, "DATA_DIR", data_dir), mock.patch.object(
                 vpngate_manager, "PUBLICVPNLIST_CACHE_FILE", cache_path
-            ), mock.patch.object(vpngate_manager, "PUBLICVPNLIST_API_URL", ""), mock.patch.object(
+            ), mock.patch.object(vpngate_manager, "PUBLICVPNLIST_ENABLED", True), mock.patch.object(
+                vpngate_manager, "PUBLICVPNLIST_API_URL", ""
+            ), mock.patch.object(
                 vpngate_manager, "PUBLICVPNLIST_SNAPSHOT_URL", ""
             ), mock.patch.object(
                 vpngate_manager, "PUBLICVPNLIST_SNAPSHOT_FILE", ""

@@ -6,7 +6,7 @@
 
 - 名称统一改为 **Eianun免费聚合落地IP**。
 - 移除 Web UI 里的 VPS 推广广告和 README 中的推广徽章/链接。
-- 新增多节点来源：默认同时拉取 **VPNGate + VPNBook + IPSpeed + Vpngate-Scraper**；PublicVPNList 作为需要用户快照的可选来源，也可在面板里切换为任意单一或组合来源。
+- 新增多节点来源：默认同时拉取 **VPNGate + VPNBook + IPSpeed + Vpngate-Scraper + PublicVPNList**。PublicVPNList 默认使用官方 API v1；人工快照只作为可选覆盖，也可在面板里切换为任意单一或组合来源。
 - VPNBook 来源默认只抓取节点、不参与启动阶段批量 OpenVPN 检测，避免部分 VPS 因 VPNBook 节点握手/路由推送导致 SSH 卡死。
 - 新增后端节点地区过滤：可只保留指定国家/地区节点，不再默认把全部地区节点都写入节点池。
 - Web 管理后台“管理员设置”新增 **节点来源** 和 **拉取地区过滤** 配置。
@@ -66,7 +66,7 @@ RHEL / CentOS / Rocky / AlmaLinux 等系统会尝试自动安装 `epel-release`�
 默认来源为：
 
 ```text
-vpngate,vpnbook,ipspeed,vpngate_scraper
+vpngate,vpnbook,ipspeed,vpngate_scraper,publicvpnlist
 ```
 
 可以在 Web 管理后台修改：
@@ -109,7 +109,7 @@ Vpngate-Scraper 来源会读取 `https://github.com/fdciabdul/Vpngate-Scraper-AP
 
 ### PublicVPNList 来源说明
 
-PublicVPNList 默认已经加入 `NODE_SOURCES`，使用官方 API v1 元数据入口：
+PublicVPNList 默认已经加入 `NODE_SOURCES`，不需要先配置人工快照。程序使用官方 API v1 元数据入口：
 
 ```text
 API base: https://publicvpnlist.com/api/v1
@@ -121,9 +121,11 @@ GET /health
 
 默认请求 `https://publicvpnlist.com/api/v1/servers`，参数包括 `protocol=openvpn`、`status=online`、`per_page=200`、`sort=last_checked`、`order=desc` 以及固定允许国家。API 的 metadata 数量和最终可连接节点数量分开统计。只有存在官方 `config_download_url`、`redistribution_allowed=true` 且 `source_url` 是直接 `.ovpn` 文件并通过实际响应校验，或已有有效配置缓存的记录，才会成为可连接节点。metadata 不能被拼接成伪造的 OpenVPN 配置。
 
-人工快照仍可作为高级覆盖方式，URL 和本地文件二选一，不得同时配置：
+人工快照仍可作为高级覆盖方式，URL 和本地文件二选一，不得同时配置；清除覆盖后恢复 API 模式：
 
 ```bash
+PUBLICVPNLIST_ENABLED=1
+PUBLICVPNLIST_API_BASE_URL=https://publicvpnlist.com/api/v1
 PUBLICVPNLIST_API_URL=https://publicvpnlist.com/api/v1/servers
 PUBLICVPNLIST_SNAPSHOT_URL=
 PUBLICVPNLIST_SNAPSHOT_FILE=
@@ -131,7 +133,7 @@ PUBLICVPNLIST_SNAPSHOT_FILE=
 
 配置人工 snapshot 后优先使用 snapshot；清除后恢复 API 模式，而不是停用来源。项目不会抓取 HTML 下载按钮、猜测一次性 token、自动操作 Export Builder 或绕过下载保护。`server_page_url` 只作为页面元数据，绝不当作 `.ovpn` 配置。
 
-API 支持分页、总量上限、`Content-Type` 和响应大小校验、429 `Retry-After` 退避，以及 ETag/`If-None-Match`/304 缓存复用。配置下载仍经过 HTTPS、域名/SSRF、重定向、OpenVPN endpoint 一致性和严格 sanitizer 校验；未知下载域名必须加入 `PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS`，官方 API hostname 可直接作为默认允许域名。下载失败或 API 返回的记录没有配置 URL 时，会分别计入配置失败或 `metadata_only_skipped`，不会把 metadata 计为可连接节点。
+API 支持每个固定国家的分页、请求/页面/记录/响应大小上限、`Content-Type` 校验、429 `Retry-After` 退避，以及 ETag/`If-None-Match`/`Last-Modified`/304 缓存复用。429 不会长时间阻塞抓取，而是保存有界 backoff 状态。API metadata 单独保存到 `publicvpnlist_api_cache.json`（0600），不保存 cookie、凭据、签名 URL、配置 URL 或配置正文。配置下载仍经过 HTTPS、域名/SSRF、重定向、OpenVPN endpoint 一致性和严格 sanitizer 校验；第三方 CDN 或配置域名必须加入 `PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS`，官方 API hostname 可直接作为默认允许域名。下载失败或 API 返回的记录没有配置 URL 时，会分别计入配置失败或 `metadata_only_skipped`，不会把 metadata 计为可连接节点。
 
 PublicVPNList 的状态会显示 `mode`、`Metadata records`、`Connectable candidates`、`Metadata-only skipped`、最后 API 更新时间、API 状态和限流退避状态。若当前 API 所有记录都没有合法配置下载方式，日志会明确表示 API 已接入但本轮产生 0 个可连接节点；其他来源仍继续工作。快照 URL、query、签名和 token 不写入缓存、节点文件或日志。
 
@@ -145,6 +147,8 @@ PublicVPNList 的固定允许国家为 `PH, US, FR, GB, ID, FI, DE, TW, AU, NL`�
 可选环境变量：
 
 ```bash
+PUBLICVPNLIST_ENABLED=1
+PUBLICVPNLIST_API_BASE_URL=https://publicvpnlist.com/api/v1
 PUBLICVPNLIST_REFRESH_SECONDS=21600
 PUBLICVPNLIST_API_URL=https://publicvpnlist.com/api/v1/servers
 PUBLICVPNLIST_SNAPSHOT_URL=
@@ -156,12 +160,18 @@ PUBLICVPNLIST_STALE_PROFILE_SECONDS=604800
 PUBLICVPNLIST_CONFIG_TIMEOUT_SECONDS=45
 PUBLICVPNLIST_MAX_REDIRECTS=5
 PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS=
-PUBLICVPNLIST_API_MAX_PAGES=50
-PUBLICVPNLIST_API_MAX_RECORDS=5000
-PUBLICVPNLIST_API_MAX_BACKOFF_SECONDS=60
+PUBLICVPNLIST_API_REFRESH_SECONDS=900
+PUBLICVPNLIST_API_MAX_STALE_SECONDS=21600
+PUBLICVPNLIST_API_TIMEOUT_SECONDS=20
+PUBLICVPNLIST_API_MAX_RETRIES=2
+PUBLICVPNLIST_API_MAX_PAGES=20
+PUBLICVPNLIST_API_MAX_RECORDS=4000
+PUBLICVPNLIST_API_PER_PAGE=200
+PUBLICVPNLIST_API_MAX_RETRY_AFTER_SECONDS=300
+PUBLICVPNLIST_API_MAX_REQUESTS_PER_REFRESH=60
 ```
 
-`PUBLICVPNLIST_REFRESH_SECONDS` 是 API 或人工快照的刷新尝试间隔，不是已验证配置的硬过期时间。缓存按稳定的 `public id + normalized host + port + proto` 保存已清洗配置，并记录 `snapshot_source_hash`、`snapshot_fetched_at`、`last_refresh_attempt_at`、`last_refresh_success_at`、`config_validated_at`、`last_seen_at` 和 `snapshot_checked_at`。API 失败、304、配置链接失效或部分节点失败时，缓存会保留仍在保留期内的旧验证配置；只有超过 `PUBLICVPNLIST_STALE_PROFILE_SECONDS` 的 profile 才会移除。地区过滤只在读取缓存后执行，切换 PH/FR 不会重新下载已经验证的配置。
+`PUBLICVPNLIST_API_REFRESH_SECONDS` 是 API metadata 的刷新尝试间隔，`PUBLICVPNLIST_REFRESH_SECONDS` 仍用于人工快照；它们都不是已验证配置的硬过期时间。缓存按稳定的 `public id + normalized host + port + proto` 保存已清洗配置，并记录 `snapshot_source_hash`、`snapshot_fetched_at`、`last_refresh_attempt_at`、`last_refresh_success_at`、`config_validated_at`、`last_seen_at` 和 `snapshot_checked_at`。API 失败、304、配置链接失效或部分节点失败时，缓存会保留仍在保留期内的旧验证配置；只有超过 `PUBLICVPNLIST_STALE_PROFILE_SECONDS` 的 profile 才会移除。地区过滤只在读取缓存后执行，切换 PH/FR 不会重新下载已经验证的配置。
 
 配置下载 URL 只允许 HTTPS，并且必须通过 `PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS` 或官方 API hostname 的精确域名限制；程序会拒绝用户名密码、localhost、回环/私网/链路本地/云元数据地址，并在每次重定向时重新执行相同检查，超过 `PUBLICVPNLIST_MAX_REDIRECTS` 也会 fail closed。临时 URL、query、签名和 token 不写日志或缓存。`PUBLICVPNLIST_MAX_RAW_ROWS` 是原始记录安全上限，`PUBLICVPNLIST_MAX_SCAN_ROWS` 只计算规范化后属于固定允许国家的记录；美国节点会先按最多 100 条批量风控，非住宅或无法分类的节点不会消耗配置下载和最终配额。
 
@@ -171,7 +181,7 @@ PublicVPNList 与 VPNGate、IPSpeed 会按规范化的 `host/IP + port + tcp/udp
 
 ### PublicVPNList 手动真实快照冒烟测试
 
-该检查不会进入默认 CI，也不会启动 OpenVPN。脚本分两阶段运行：第一次只需要快照 URL，读取并解析快照、选择一个 PH/FR 节点、验证 `temporary_ovpn_url` 的 HTTPS 和地址安全性，然后只输出需要加入允许列表的 hostname 并以退出码 2 结束，不会请求配置；加入 hostname 后再次运行，才会下载配置、逐次验证重定向，并检查 OpenVPN 内容、remote/端口/proto 一致性和配置清理。脚本不会打印完整 URL、query、签名或 token：
+该检查不会进入默认 CI，也不会启动 OpenVPN。脚本分两阶段运行：第一次只需要人工快照 URL，读取并解析快照、选择一个 PH/FR 节点、验证 `temporary_ovpn_url` 的 HTTPS 和地址安全性，然后只输出需要加入允许列表的 hostname 并以退出码 2 结束，不会请求配置；加入 hostname 后再次运行，才会下载配置、逐次验证重定向，并检查 OpenVPN 内容、remote/端口/proto 一致性和配置清理。默认 API 抓取不依赖该人工快照脚本。脚本不会打印完整 URL、query、签名或 token：
 
 ```bash
 export PUBLICVPNLIST_SNAPSHOT_URL='用户自己生成的临时签名快照 URL'
@@ -254,7 +264,9 @@ en web         # 修改网页绑定地址/安全后缀
 en port        # 修改网页端口
 en password    # 修改管理账号密码
 en source      # 设置节点来源：VPNGate / VPNBook / IPSpeed / Vpngate-Scraper / PublicVPNList（默认 API）
-en publicvpnlist status                         # 查看脱敏状态
+en publicvpnlist status                         # 查看 API/metadata/可连接节点脱敏状态
+en publicvpnlist enable                         # 启用默认 API 来源
+en publicvpnlist disable                        # 停用 PublicVPNList（不删除缓存）
 en publicvpnlist set-url                        # 设置人工临时快照覆盖 API
 en publicvpnlist set-file /path/to/snapshot.json # 设置本地快照文件覆盖 API
 en publicvpnlist set-hosts download.example     # 设置额外配置下载域名允许列表

@@ -339,11 +339,14 @@ SYSTEMD_SERVICE = SERVICE_NAME + ".service"
 ENV_FILE = "/etc/eianun-vpngate.env"
 LEGACY_ENV_FILE = "/etc/default/eianun-vpngate"
 PUBLICVPNLIST_ENV_KEYS = (
+    "PUBLICVPNLIST_ENABLED",
+    "PUBLICVPNLIST_API_BASE_URL",
     "PUBLICVPNLIST_API_URL",
     "PUBLICVPNLIST_SNAPSHOT_URL",
     "PUBLICVPNLIST_SNAPSHOT_FILE",
     "PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS",
 )
+PUBLICVPNLIST_API_BASE_URL_DEFAULT = "https://publicvpnlist.com/api/v1"
 PUBLICVPNLIST_API_URL_DEFAULT = "https://publicvpnlist.com/api/v1/servers"
 PUBLICVPNLIST_STALE_PROFILE_SECONDS = 7 * 24 * 3600
 
@@ -356,6 +359,7 @@ from tools.publicvpnlist_cache import (
 )
 
 PUBLICVPNLIST_STATUS_LABELS = {
+    "disabled": "PublicVPNList（已停用）",
     "snapshot_missing": "PublicVPNList（未配置快照）",
     "download_hosts_missing": "PublicVPNList（未配置下载域名）",
     "cache_only": "PublicVPNList（仅使用缓存）",
@@ -392,7 +396,14 @@ def load_publicvpnlist_environment():
     values.update(read_env_file(ENV_FILE))
     for key in PUBLICVPNLIST_ENV_KEYS + ("VPNGATE_DATA_DIR", "PUBLICVPNLIST_STALE_PROFILE_SECONDS"):
         if key not in values:
-            values[key] = os.environ.get(key, PUBLICVPNLIST_API_URL_DEFAULT if key == "PUBLICVPNLIST_API_URL" else "")
+            default = ""
+            if key == "PUBLICVPNLIST_ENABLED":
+                default = "1"
+            elif key == "PUBLICVPNLIST_API_BASE_URL":
+                default = PUBLICVPNLIST_API_BASE_URL_DEFAULT
+            elif key == "PUBLICVPNLIST_API_URL":
+                default = PUBLICVPNLIST_API_URL_DEFAULT
+            values[key] = os.environ.get(key, default)
         if key in PUBLICVPNLIST_ENV_KEYS and key in values:
             os.environ[key] = values[key]
     return values
@@ -535,28 +546,90 @@ def publicvpnlist_cache_summary(values=None):
     )
     return count, usable, bool(cache.get("cache_stale")), bool(cache.get("refresh_failed"))
 
+def publicvpnlist_profile_refresh_stats(values=None):
+    values = values if isinstance(values, dict) else load_publicvpnlist_environment()
+    path = os.path.join(publicvpnlist_data_dir(values), "publicvpnlist_cache.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cache = json.load(f)
+    except (OSError, ValueError, TypeError):
+        return {}
+    if not isinstance(cache, dict) or not isinstance(cache.get("last_refresh_stats"), dict):
+        return {}
+    return dict(cache["last_refresh_stats"])
+
+def publicvpnlist_api_cache_summary(values=None):
+    values = values if isinstance(values, dict) else load_publicvpnlist_environment()
+    path = os.path.join(publicvpnlist_data_dir(values), "publicvpnlist_api_cache.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cache = json.load(f)
+    except (OSError, ValueError, TypeError):
+        cache = {}
+    if not isinstance(cache, dict):
+        cache = {}
+    def safe_float(value):
+        try:
+            result = float(value or 0)
+            return result if result == result and result not in (float("inf"), float("-inf")) else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+    def safe_int(value):
+        try:
+            return int(float(value or 0))
+        except (TypeError, ValueError):
+            return 0
+    rate_limited = str(cache.get("rate_limited") or "").strip().lower() not in {"", "0", "false", "no", "off"}
+    backoff_value = safe_float(cache.get("backoff_until"))
+    return {
+        "metadata_records": safe_int(cache.get("metadata_record_count")),
+        "dataset_version": str(cache.get("dataset_version") or ""),
+        "last_success_at": safe_float(cache.get("last_success_at")),
+        "api_status": safe_int(cache.get("last_http_status")),
+        "rate_limited": rate_limited,
+        "backoff_until": backoff_value,
+        "backoff_seconds": max(0, int(backoff_value - time.time())) if backoff_value else 0,
+        "request_count": safe_int(cache.get("request_count")),
+        "refresh_failed": str(cache.get("refresh_failed") or "").strip().lower() not in {"", "0", "false", "no", "off"},
+    }
+
 def publicvpnlist_source_mode(values=None, usable=0):
     values = values if isinstance(values, dict) else load_publicvpnlist_environment()
+    if str(values.get("PUBLICVPNLIST_ENABLED", "1")).strip().lower() in {"0", "false", "no", "off", "disabled"}:
+        return "disabled"
     if values.get("PUBLICVPNLIST_SNAPSHOT_FILE"):
         return "snapshot_file"
     if values.get("PUBLICVPNLIST_SNAPSHOT_URL"):
         return "snapshot_url"
-    if values.get("PUBLICVPNLIST_API_URL", PUBLICVPNLIST_API_URL_DEFAULT):
+    api_url = values.get("PUBLICVPNLIST_API_URL")
+    if api_url is None:
+        api_url = PUBLICVPNLIST_API_URL_DEFAULT
+    if api_url:
         return "api"
-    return "cache_only" if usable else "disabled"
+    return "cache_only" if usable else "api"
 
 def publicvpnlist_state(values=None):
     values = values if isinstance(values, dict) else load_publicvpnlist_environment()
     count, usable, cache_stale, refresh_failed = publicvpnlist_cache_summary(values)
+    refresh_stats = publicvpnlist_profile_refresh_stats(values)
+    api_summary = publicvpnlist_api_cache_summary(values)
+    def stat_int(value, default=0):
+        try:
+            return int(float(value or default))
+        except (TypeError, ValueError):
+            return default
     mode = publicvpnlist_source_mode(values, usable)
-    if mode == "api":
+    if mode == "api" and refresh_failed and usable:
+        mode = "cache_fallback"
+    enabled = mode != "disabled"
+    if mode in ("api", "cache_fallback"):
         status = "api_error" if refresh_failed else "api"
     elif mode in ("snapshot_url", "snapshot_file") and not values.get("PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS"):
         status = "download_hosts_missing"
     elif mode == "cache_only":
         status = "cache_only"
     elif mode == "disabled":
-        status = "snapshot_missing"
+        status = "disabled"
     elif refresh_failed:
         status = "refresh_failed"
     elif cache_stale:
@@ -567,12 +640,20 @@ def publicvpnlist_state(values=None):
         "status": status,
         "count": count,
         "usable": usable,
+        "metadata_records": max(
+            api_summary.get("metadata_records", 0),
+            stat_int(refresh_stats.get("metadata_records")),
+        ),
+        "connectable_candidates": stat_int(refresh_stats.get("connectable_candidates"), usable),
+        "metadata_only_skipped": stat_int(refresh_stats.get("metadata_only_skipped")),
         "cache_stale": cache_stale,
         "refresh_failed": refresh_failed,
         "mode": mode,
-        "effective_source_active": mode != "disabled",
-        "refresh_ready": bool(mode == "api" or (mode in ("snapshot_url", "snapshot_file") and values.get("PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS"))),
+        "enabled": enabled,
+        "effective_source_active": enabled,
+        "refresh_ready": bool(enabled and (mode == "api" or (mode in ("snapshot_url", "snapshot_file") and values.get("PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS")))),
         "cache_only": bool(mode == "cache_only"),
+        **api_summary,
     }
 
 def publicvpnlist_status_label(values=None):
@@ -583,9 +664,12 @@ def print_publicvpnlist_status():
     values = load_publicvpnlist_environment()
     state = publicvpnlist_state(values)
     print("PublicVPNList 状态: " + PUBLICVPNLIST_STATUS_LABELS.get(state["status"], "PublicVPNList"))
+    print("  enabled: " + ("yes" if state.get("enabled") else "no"))
     print("  mode: " + state["mode"])
-    if state["mode"] == "api":
-        print("  API: " + redacted_snapshot_url(values.get("PUBLICVPNLIST_API_URL") or PUBLICVPNLIST_API_URL_DEFAULT))
+    if state["mode"] in ("api", "cache_fallback"):
+        print("  API: " + redacted_snapshot_url(values.get("PUBLICVPNLIST_API_BASE_URL") or PUBLICVPNLIST_API_BASE_URL_DEFAULT))
+        print(f"  metadata records: {state['metadata_records']}；connectable candidates: {state['connectable_candidates']}；metadata-only skipped: {state['metadata_only_skipped']}；dataset: {state['dataset_version'] or 'unknown'}；last API update: {state['last_success_at'] or 'never'}")
+        print(f"  API status: {state['api_status'] or 'not requested'}；rate_limited={str(state['rate_limited']).lower()}；backoff={state['backoff_seconds']}s")
     print("  快照 URL: " + redacted_snapshot_url(values.get("PUBLICVPNLIST_SNAPSHOT_URL")))
     print("  本地快照文件: " + ("已设置" if values.get("PUBLICVPNLIST_SNAPSHOT_FILE") else "未设置"))
     print("  允许下载域名: " + safe_download_hosts_display(values.get("PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS")))
@@ -598,7 +682,9 @@ def publicvpnlist_auto_activation_message():
     values = load_publicvpnlist_environment()
     state = publicvpnlist_state(values)
     active = state["effective_source_active"]
-    if active and state["mode"] == "api":
+    if not state["enabled"]:
+        print("PublicVPNList 当前已停用；缓存文件未删除。")
+    elif active and state["mode"] == "api":
         print("PublicVPNList API 已启用；只有官方配置下载 URL 或有效缓存的记录会成为可连接节点。")
     elif active and state["mode"] in ("snapshot_url", "snapshot_file") and not state["refresh_ready"]:
         print("PublicVPNList 已使用人工快照覆盖，但尚未配置下载域名。")
@@ -628,8 +714,14 @@ def publicvpnlist_command(args):
         print_publicvpnlist_status()
         return
     if action in ("help", "-h", "--help"):
-        print("用法: en publicvpnlist status | set-url | set-file PATH | set-hosts HOST[,HOST] | clear | restart")
+        print("用法: en publicvpnlist status | enable | disable | set-url | set-file PATH | set-hosts HOST[,HOST] | clear | restart")
         print("默认使用 PublicVPNList 官方 API v1；set-url/set-file 仅用于人工快照覆盖。")
+        return
+    if action in ("enable", "disable"):
+        enabled = "1" if action == "enable" else "0"
+        if save_publicvpnlist_environment({"PUBLICVPNLIST_ENABLED": enabled}):
+            print("PublicVPNList 已启用。" if enabled == "1" else "PublicVPNList 已停用；缓存文件未删除。")
+            publicvpnlist_auto_activation_message()
         return
     if action == "set-url":
         if len(args) > 1:
@@ -646,7 +738,7 @@ def publicvpnlist_command(args):
         except (TypeError, ValueError):
             print("快照 URL 必须是无账号密码的 HTTPS 地址。")
             return
-        if save_publicvpnlist_environment({"PUBLICVPNLIST_SNAPSHOT_URL": value, "PUBLICVPNLIST_SNAPSHOT_FILE": ""}):
+        if save_publicvpnlist_environment({"PUBLICVPNLIST_ENABLED": "1", "PUBLICVPNLIST_SNAPSHOT_URL": value, "PUBLICVPNLIST_SNAPSHOT_FILE": ""}):
             print("人工快照 URL 已保存，将覆盖默认 API；显示和日志只会使用脱敏状态。")
             publicvpnlist_auto_activation_message()
         return
@@ -658,7 +750,7 @@ def publicvpnlist_command(args):
         if not value or "\n" in value or "\r" in value:
             print("本地快照路径为空或格式无效。")
             return
-        if save_publicvpnlist_environment({"PUBLICVPNLIST_SNAPSHOT_URL": "", "PUBLICVPNLIST_SNAPSHOT_FILE": value}):
+        if save_publicvpnlist_environment({"PUBLICVPNLIST_ENABLED": "1", "PUBLICVPNLIST_SNAPSHOT_URL": "", "PUBLICVPNLIST_SNAPSHOT_FILE": value}):
             print("本地快照路径已保存，将覆盖默认 API。")
             publicvpnlist_auto_activation_message()
         return
@@ -668,7 +760,7 @@ def publicvpnlist_command(args):
         if host_error:
             print(host_error)
             return
-        if save_publicvpnlist_environment({"PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS": hosts or ""}):
+        if save_publicvpnlist_environment({"PUBLICVPNLIST_ENABLED": "1", "PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS": hosts or ""}):
             print("下载域名允许列表已保存。")
             publicvpnlist_auto_activation_message()
         return

@@ -11,6 +11,7 @@ from pathlib import Path
 SENSITIVE_DATA_FILES = (
     "nodes.json",
     "publicvpnlist_cache.json",
+    "publicvpnlist_api_cache.json",
     "vpngate_auth.txt",
     "ui_auth.json",
 )
