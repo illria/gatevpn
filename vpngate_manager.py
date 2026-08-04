@@ -2471,9 +2471,11 @@ def publicvpnlist_api_cache_default() -> dict[str, Any]:
         "records_by_query": {},
         "page_meta_by_query": {},
         "records_by_country": {},
+        "legacy_last_success_at_by_country": {},
         "record_count_by_country": {},
         "metadata_record_count": 0,
         "network_records_fetched": 0,
+        "cached_records_considered": 0,
         "cached_records_reused": 0,
         "metadata_records_returned": 0,
         "last_etag_cache_hits": 0,
@@ -2548,6 +2550,7 @@ def _publicvpnlist_api_safe_page_meta(value: Any) -> dict[str, Any]:
         "last_modified": str(value.get("last_modified") or ""),
         "last_success_at": _publicvpnlist_api_time(value.get("last_success_at")),
         "last_validated_at": _publicvpnlist_api_time(value.get("last_validated_at")),
+        "legacy_last_success_at": _publicvpnlist_api_time(value.get("legacy_last_success_at")),
     }
 
 
@@ -2636,7 +2639,9 @@ def _publicvpnlist_api_cached_page_meta(cache: dict[str, Any], query_key: str) -
 
 def _publicvpnlist_api_cache_timestamp_is_fresh(value: Any, now: float) -> bool:
     timestamp = _publicvpnlist_api_time(value)
-    return bool(timestamp and now - timestamp <= PUBLICVPNLIST_API_MAX_STALE_SECONDS)
+    if not timestamp or timestamp > now + 300:
+        return False
+    return now - timestamp <= PUBLICVPNLIST_API_MAX_STALE_SECONDS
 
 
 def _publicvpnlist_api_page_cache_is_fresh(
@@ -2648,15 +2653,12 @@ def _publicvpnlist_api_page_cache_is_fresh(
 
     now = time.time() if now is None else now
     page_meta = _publicvpnlist_api_cached_page_meta(cache, query_key)
-    page_timestamp = page_meta.get("last_validated_at") or page_meta.get("last_success_at")
-    if _publicvpnlist_api_cache_timestamp_is_fresh(page_timestamp, now):
-        return True
-    # Pre-v3/page-less caches can be read once using the old global timestamp.
-    # A successful 200/304 writes the page fields above, so new state no longer
-    # extends a different page's lifetime.
-    if not page_timestamp:
-        return _publicvpnlist_api_cache_timestamp_is_fresh(cache.get("last_success_at"), now)
-    return False
+    page_timestamp = (
+        page_meta.get("last_validated_at")
+        or page_meta.get("last_success_at")
+        or page_meta.get("legacy_last_success_at")
+    )
+    return _publicvpnlist_api_cache_timestamp_is_fresh(page_timestamp, now)
 
 
 def _publicvpnlist_api_legacy_country_cache_is_fresh(
@@ -2677,7 +2679,9 @@ def _publicvpnlist_api_legacy_country_cache_is_fresh(
     }
     if country in page_countries:
         return False
-    return _publicvpnlist_api_cache_timestamp_is_fresh(cache.get("last_success_at"), now)
+    legacy_times = cache.get("legacy_last_success_at_by_country")
+    timestamp = legacy_times.get(country) if isinstance(legacy_times, dict) else 0.0
+    return _publicvpnlist_api_cache_timestamp_is_fresh(timestamp, now)
 
 
 def _publicvpnlist_api_drop_pages_after(
@@ -2822,6 +2826,10 @@ def load_publicvpnlist_api_cache() -> dict[str, Any]:
     normalized = publicvpnlist_api_cache_default()
     if not isinstance(raw, dict):
         return normalized
+    raw_schema_version = parse_int(raw.get("schema_version"))
+    legacy_schema = raw_schema_version < PUBLICVPNLIST_API_CACHE_SCHEMA_VERSION
+    legacy_global_last_success_at = _publicvpnlist_api_time(raw.get("last_success_at"))
+    migration_changed = False
     for key in normalized:
         if key in {
             "etag_by_query",
@@ -2829,6 +2837,7 @@ def load_publicvpnlist_api_cache() -> dict[str, Any]:
             "records_by_query",
             "page_meta_by_query",
             "records_by_country",
+            "legacy_last_success_at_by_country",
             "record_count_by_country",
             "profile_retry_entries",
         }:
@@ -2867,6 +2876,31 @@ def load_publicvpnlist_api_cache() -> dict[str, Any]:
             safe_meta = _publicvpnlist_api_safe_page_meta(page_meta)
             if safe_meta.get("country") in PUBLICVPNLIST_ALLOWED_COUNTRIES:
                 page_meta_by_query[str(query_key)] = safe_meta
+    if legacy_schema:
+        # Old page caches relied on the global success time.  Materialize that
+        # value once so a later country success cannot extend an unrelated
+        # page forever.  New schema pages without a page timestamp stay
+        # unusable instead of receiving a global fallback.
+        for query_key, records in records_by_query.items():
+            if not records:
+                continue
+            country = _publicvpnlist_api_query_country(query_key)
+            if country not in PUBLICVPNLIST_ALLOWED_COUNTRIES:
+                continue
+            page_meta = dict(page_meta_by_query.get(query_key) or {})
+            if not page_meta.get("country"):
+                page_meta["country"] = country
+            if not page_meta.get("page"):
+                page_meta["page"] = _publicvpnlist_api_query_page(query_key)
+            if not page_meta.get("record_count"):
+                page_meta["record_count"] = len(records)
+            if not any(
+                page_meta.get(field)
+                for field in ("last_success_at", "last_validated_at", "legacy_last_success_at")
+            ):
+                page_meta["legacy_last_success_at"] = legacy_global_last_success_at
+                migration_changed = True
+            page_meta_by_query[query_key] = _publicvpnlist_api_safe_page_meta(page_meta)
     normalized["page_meta_by_query"] = page_meta_by_query
     records_by_country: dict[str, list[dict[str, Any]]] = {}
     raw_records = raw.get("records_by_country")
@@ -2880,6 +2914,26 @@ def load_publicvpnlist_api_cache() -> dict[str, Any]:
     for country, records in page_records_by_country.items():
         records_by_country[country] = records
     normalized["records_by_country"] = records_by_country
+    legacy_country_times: dict[str, float] = {}
+    raw_legacy_country_times = raw.get("legacy_last_success_at_by_country")
+    if isinstance(raw_legacy_country_times, dict):
+        for country, value in raw_legacy_country_times.items():
+            country_code = str(country or "").upper()
+            if country_code in PUBLICVPNLIST_ALLOWED_COUNTRIES:
+                legacy_country_times[country_code] = _publicvpnlist_api_time(value)
+    if legacy_schema:
+        legacy_country_records = (raw_records or {}).items() if isinstance(raw_records, dict) else ()
+        for country, records in legacy_country_records:
+            country_code = str(country or "").upper()
+            if (
+                country_code in PUBLICVPNLIST_ALLOWED_COUNTRIES
+                and isinstance(records, list)
+                and records
+                and country_code not in legacy_country_times
+            ):
+                legacy_country_times[country_code] = legacy_global_last_success_at
+                migration_changed = True
+    normalized["legacy_last_success_at_by_country"] = legacy_country_times
     normalized["record_count_by_country"] = {
         country: len(records) for country, records in records_by_country.items()
     }
@@ -2900,7 +2954,12 @@ def load_publicvpnlist_api_cache() -> dict[str, Any]:
             normalized[key] = 0.0
     for key in ("last_http_status", "request_count", "last_etag_cache_hits"):
         normalized[key] = parse_int(normalized.get(key))
-    for key in ("network_records_fetched", "cached_records_reused", "metadata_records_returned"):
+    for key in (
+        "network_records_fetched",
+        "cached_records_considered",
+        "cached_records_reused",
+        "metadata_records_returned",
+    ):
         normalized[key] = max(0, parse_int(normalized.get(key)))
     normalized["schema_version"] = PUBLICVPNLIST_API_CACHE_SCHEMA_VERSION
     for key in ("api_stale", "refresh_failed", "rate_limited", "request_limit_hit", "total_limit_hit"):
@@ -2912,6 +2971,15 @@ def load_publicvpnlist_api_cache() -> dict[str, Any]:
         if entry
     ]
     _publicvpnlist_api_sync_retry_fields(normalized)
+    if migration_changed:
+        try:
+            save_publicvpnlist_api_cache(normalized)
+        except OSError as exc:
+            log_to_json(
+                "WARNING",
+                "PublicVPNList",
+                f"PublicVPNList API 旧缓存迁移写入失败: {type(exc).__name__}",
+            )
     return normalized
 
 
@@ -2959,12 +3027,22 @@ def save_publicvpnlist_api_cache(cache: dict[str, Any]) -> None:
     for country, records in page_records_by_country.items():
         records_by_country[country] = records
     state["records_by_country"] = records_by_country
+    state["legacy_last_success_at_by_country"] = {}
+    for country, value in (cache.get("legacy_last_success_at_by_country") or {}).items():
+        country_code = str(country or "").upper()
+        if country_code in PUBLICVPNLIST_ALLOWED_COUNTRIES:
+            state["legacy_last_success_at_by_country"][country_code] = _publicvpnlist_api_time(value)
     state["record_count_by_country"] = {
         country: len(records) for country, records in records_by_country.items()
     }
     state["metadata_record_count"] = len(publicvpnlist_api_cached_records(state))
     state["last_etag_cache_hits"] = parse_int(cache.get("last_etag_cache_hits"))
-    for key in ("network_records_fetched", "cached_records_reused", "metadata_records_returned"):
+    for key in (
+        "network_records_fetched",
+        "cached_records_considered",
+        "cached_records_reused",
+        "metadata_records_returned",
+    ):
         state[key] = max(0, parse_int(cache.get(key)))
     state["profile_retry_entries"] = [
         entry
@@ -2973,15 +3051,16 @@ def save_publicvpnlist_api_cache(cache: dict[str, Any]) -> None:
         if entry
     ]
     _publicvpnlist_api_sync_retry_fields(state)
+    state["schema_version"] = PUBLICVPNLIST_API_CACHE_SCHEMA_VERSION
     write_json(PUBLICVPNLIST_API_CACHE_FILE, state)
 
 
-def publicvpnlist_api_cached_records(
+def _publicvpnlist_api_cached_records_raw(
     cache: dict[str, Any],
     countries: list[str] | tuple[str, ...] | set[str] | None = None,
     now: float | None = None,
 ) -> list[dict[str, Any]]:
-    """Return only bounded metadata from fresh country/page cache entries."""
+    """Return fresh cached rows before endpoint de-duplication and limits."""
 
     now = time.time() if now is None else now
     expires_at = _publicvpnlist_api_time(cache.get("expires_at"))
@@ -3037,7 +3116,19 @@ def publicvpnlist_api_cached_records(
             values = records_by_country.get(country, [])
         if isinstance(values, list):
             records.extend(dict(value) for value in values if isinstance(value, dict))
-    return publicvpnlist_api_normalize_bounded_records(records)
+    return records
+
+
+def publicvpnlist_api_cached_records(
+    cache: dict[str, Any],
+    countries: list[str] | tuple[str, ...] | set[str] | None = None,
+    now: float | None = None,
+) -> list[dict[str, Any]]:
+    """Return fresh cached metadata after endpoint de-duplication and limits."""
+
+    return publicvpnlist_api_normalize_bounded_records(
+        _publicvpnlist_api_cached_records_raw(cache, countries=countries, now=now)
+    )
 
 
 def _publicvpnlist_api_cached_payload(
@@ -3049,14 +3140,16 @@ def _publicvpnlist_api_cached_payload(
 
     now = time.time() if now is None else now
     status, rate_limited, backoff_until = _publicvpnlist_api_cache_status(cache, now)
-    cache_usable = publicvpnlist_api_cache_is_usable(cache, now)
-    records = publicvpnlist_api_cached_records(cache, countries, now=now) if cache_usable else []
+    raw_records = _publicvpnlist_api_cached_records_raw(cache, countries, now=now)
+    records = publicvpnlist_api_normalize_bounded_records(raw_records)
+    cache_usable = bool(records)
     return {
         "data": [{**record, "_pvl_api_not_modified": True} for record in records],
         "_api_meta": {
             "status": status,
             "records_fetched": len(records),
             "network_records_fetched": 0,
+            "cached_records_considered": len(raw_records),
             "cached_records_reused": len(records),
             "metadata_records_returned": len(records),
             "from_cache": True,
@@ -3081,6 +3174,8 @@ def publicvpnlist_api_cache_is_fresh(cache: dict[str, Any], now: float | None = 
     backoff_until = _publicvpnlist_api_time(cache.get("backoff_until"))
     expires_at = _publicvpnlist_api_time(cache.get("expires_at"))
     if expires_at and now >= expires_at:
+        return False
+    if next_update_at > now + PUBLICVPNLIST_API_MAX_STALE_SECONDS:
         return False
     next_allowed_at = max(next_update_at, backoff_until)
     return bool(next_allowed_at and now < next_allowed_at)
@@ -3316,9 +3411,7 @@ def _publicvpnlist_api_record_preference_key(record: dict[str, Any]) -> tuple[An
         and availability in {"online", "available", "up", "healthy"}
         and measurement_quality == "verified"
         and measurement_status in {"success", "succeeded", "ok", "passed", "verified", "complete"}
-        and checked_at > 0
-        and checked_at <= now + 300
-        and now - checked_at <= PUBLICVPNLIST_API_MAX_STALE_SECONDS
+        and _publicvpnlist_api_cache_timestamp_is_fresh(checked_at, now)
         and (not expires_at or now < expires_at)
     )
     public_id = str(record.get("id") or record.get("public_id") or "").strip()
@@ -3457,6 +3550,25 @@ def _publicvpnlist_api_error_code(status: Any) -> str:
     return "api_request_failed"
 
 
+def _publicvpnlist_api_normal_refresh_at(now: float) -> float:
+    return now + max(
+        1,
+        min(PUBLICVPNLIST_API_REFRESH_SECONDS, PUBLICVPNLIST_API_MAX_STALE_SECONDS),
+    )
+
+
+def _publicvpnlist_api_normalize_next_update_at(value: Any, now: float) -> tuple[float, str]:
+    """Keep API refresh hints bounded without logging response contents."""
+
+    parsed = _publicvpnlist_api_time(value)
+    if not parsed or parsed <= now:
+        return 0.0, ""
+    hard_limit = now + max(1, PUBLICVPNLIST_API_MAX_STALE_SECONDS)
+    if parsed > hard_limit:
+        return _publicvpnlist_api_normal_refresh_at(now), "next_update_at_capped"
+    return parsed, ""
+
+
 def _publicvpnlist_api_cache_records_for_country(cache: dict[str, Any], country: str) -> list[dict[str, Any]]:
     return publicvpnlist_api_cached_records(cache, countries=[str(country or "").upper()])
 
@@ -3518,6 +3630,7 @@ def fetch_publicvpnlist_api_snapshot(
     successful_requests = 0
     successful_countries = 0
     network_records_fetched = 0
+    cached_records_considered = 0
     cached_records_reused = 0
     errors: list[str] = []
     rate_limited = False
@@ -3548,12 +3661,25 @@ def fetch_publicvpnlist_api_snapshot(
         if fresh_cache and country not in retry_countries:
             # Preserve the fresh country cache without issuing an unrelated
             # request while another country is being retried.
-            cached_country = _publicvpnlist_api_mark_cached_records(
-                _publicvpnlist_api_cache_records_for_country(working, country)
+            cached_country_raw = _publicvpnlist_api_cached_records_raw(
+                working,
+                countries=[country],
+                now=now,
             )
+            cached_country = _publicvpnlist_api_mark_cached_records(
+                publicvpnlist_api_normalize_bounded_records(cached_country_raw)
+            )
+            for cached_query_key in list(records_by_query):
+                if _publicvpnlist_api_query_country(cached_query_key) != country:
+                    continue
+                cached_query_page = _publicvpnlist_api_cached_page(working, cached_query_key)
+                if cached_query_page is not None:
+                    records_by_query[cached_query_key] = _publicvpnlist_api_mark_cached_records(
+                        cached_query_page
+                    )
             records_by_country[country] = cached_country
             current_records.extend(cached_country)
-            cached_records_reused += len(cached_country)
+            cached_records_considered += len(cached_country_raw)
             if bounded_count(current_records) >= PUBLICVPNLIST_API_MAX_RECORDS:
                 total_limit_hit = True
                 working["total_limit_hit"] = True
@@ -3592,7 +3718,7 @@ def fetch_publicvpnlist_api_snapshot(
                 due_request_started.add(country)
             page_meta = _publicvpnlist_api_cached_page_meta(working, query_key)
             cached_page = _publicvpnlist_api_cached_page(working, query_key)
-            if not retry_due and cached_page is not None:
+            if cached_page is not None:
                 etag = str(
                     page_meta.get("etag")
                     or (working.get("etag_by_query") or {}).get(query_key)
@@ -3607,14 +3733,28 @@ def fetch_publicvpnlist_api_snapshot(
                     request_headers["If-None-Match"] = etag
                 if last_modified:
                     request_headers["If-Modified-Since"] = last_modified
-            request_attempt = 0
+            normal_network_attempts = 0
             page_completed = False
             page_network_success = False
             unconditional_retry_used = False
+            unconditional_retry_pending = False
             page_records: list[dict[str, Any]] | None = None
             next_page_number = 0
-            while request_attempt < PUBLICVPNLIST_API_MAX_RETRIES:
-                request_attempt += 1
+            while True:
+                if unconditional_retry_pending:
+                    if unconditional_retry_used:
+                        break
+                    unconditional_retry_used = True
+                    attempt_headers: dict[str, str] = {}
+                    attempt_is_conditional = False
+                    attempt_is_unconditional = True
+                else:
+                    if normal_network_attempts >= PUBLICVPNLIST_API_MAX_RETRIES:
+                        break
+                    normal_network_attempts += 1
+                    attempt_headers = dict(request_headers)
+                    attempt_is_conditional = bool(attempt_headers)
+                    attempt_is_unconditional = False
                 if working["request_count"] >= PUBLICVPNLIST_API_MAX_REQUESTS_PER_REFRESH:
                     request_limit_hit = True
                     working["request_limit_hit"] = True
@@ -3630,7 +3770,7 @@ def fetch_publicvpnlist_api_snapshot(
                         accept="application/json",
                         opener=opener,
                         metadata=metadata,
-                        extra_headers=request_headers or None,
+                        extra_headers=attempt_headers or None,
                     )
                     status = int(metadata.get("status") or 200)
                     working["last_http_status"] = status
@@ -3643,14 +3783,15 @@ def fetch_publicvpnlist_api_snapshot(
                         if response_modified:
                             working.setdefault("last_modified_by_query", {})[query_key] = response_modified
                         working["last_http_status"] = 304
-                        if retry_due and not unconditional_retry_used:
-                            request_headers = {}
-                            unconditional_retry_used = True
+                        if retry_due and attempt_is_conditional and not unconditional_retry_used:
+                            unconditional_retry_pending = True
                             continue
                         if cached_page is None:
                             errors.append("missing_page_cache")
                             break
                         page_records = _publicvpnlist_api_mark_cached_records(cached_page)
+                        records_by_query[query_key] = page_records
+                        cached_records_considered += len(cached_page)
                         page_meta = _publicvpnlist_api_cached_page_meta(working, query_key)
                         if response_etag:
                             page_meta["etag"] = response_etag
@@ -3680,7 +3821,6 @@ def fetch_publicvpnlist_api_snapshot(
                             )
                         page_completed = True
                         page_network_success = True
-                        cached_records_reused += len(cached_page)
                         successful_requests += 1
                         break
                     content_type = str(metadata.get("content_type") or "").split(";", 1)[0].strip().lower()
@@ -3715,9 +3855,18 @@ def fetch_publicvpnlist_api_snapshot(
                     expires_at = _publicvpnlist_api_time(
                         meta.get("expires_at") or meta.get("expiresAt") or payload.get("expires_at")
                     ) or expires_at
-                    next_update_at = _publicvpnlist_api_time(
-                        meta.get("next_update_at") or meta.get("nextUpdateAt") or payload.get("next_update_at")
-                    ) or next_update_at
+                    raw_next_update_at = (
+                        meta.get("next_update_at")
+                        or meta.get("nextUpdateAt")
+                        or payload.get("next_update_at")
+                    )
+                    if raw_next_update_at not in (None, ""):
+                        next_update_at, next_update_error = _publicvpnlist_api_normalize_next_update_at(
+                            raw_next_update_at,
+                            now,
+                        )
+                        if next_update_error:
+                            working["last_error_code"] = next_update_error
                     next_url = _publicvpnlist_api_page_info(payload, page, len(page_records))
                     next_page_number = _publicvpnlist_api_next_page_from_link(
                         servers_url,
@@ -3763,14 +3912,15 @@ def fetch_publicvpnlist_api_snapshot(
                             working.setdefault("etag_by_query", {})[query_key] = response_etag
                         if response_modified:
                             working.setdefault("last_modified_by_query", {})[query_key] = response_modified
-                        if retry_due and not unconditional_retry_used:
-                            request_headers = {}
-                            unconditional_retry_used = True
+                        if retry_due and attempt_is_conditional and not unconditional_retry_used:
+                            unconditional_retry_pending = True
                             continue
                         if cached_page is None:
                             errors.append("missing_page_cache")
                             break
                         page_records = _publicvpnlist_api_mark_cached_records(cached_page)
+                        records_by_query[query_key] = page_records
+                        cached_records_considered += len(cached_page)
                         page_meta = _publicvpnlist_api_cached_page_meta(working, query_key)
                         if response_etag:
                             page_meta["etag"] = response_etag
@@ -3800,7 +3950,6 @@ def fetch_publicvpnlist_api_snapshot(
                             )
                         page_completed = True
                         page_network_success = True
-                        cached_records_reused += len(cached_page)
                         successful_requests += 1
                         break
                     if status == HTTPStatus.TOO_MANY_REQUESTS:
@@ -3819,16 +3968,24 @@ def fetch_publicvpnlist_api_snapshot(
                         rate_limited = True
                         stop_all = True
                         break
-                    if status in {500, 502, 503, 504} and request_attempt < PUBLICVPNLIST_API_MAX_RETRIES:
-                        time.sleep(min(0.25 * (2 ** (request_attempt - 1)), 1.0))
+                    if (
+                        status in {500, 502, 503, 504}
+                        and not attempt_is_unconditional
+                        and normal_network_attempts < PUBLICVPNLIST_API_MAX_RETRIES
+                    ):
+                        time.sleep(min(0.25 * (2 ** (normal_network_attempts - 1)), 1.0))
                         continue
                     errors.append(_publicvpnlist_api_error_code(status))
                     working["last_http_status"] = status
                     working["last_error_code"] = _publicvpnlist_api_error_code(status)
                     break
                 except (OSError, urllib.error.URLError, PublicVPNListSnapshotError, UnicodeError, ValueError) as exc:
-                    if request_attempt < PUBLICVPNLIST_API_MAX_RETRIES and isinstance(exc, (OSError, urllib.error.URLError)):
-                        time.sleep(min(0.25 * (2 ** (request_attempt - 1)), 1.0))
+                    if (
+                        not attempt_is_unconditional
+                        and normal_network_attempts < PUBLICVPNLIST_API_MAX_RETRIES
+                        and isinstance(exc, (OSError, urllib.error.URLError))
+                    ):
+                        time.sleep(min(0.25 * (2 ** (normal_network_attempts - 1)), 1.0))
                         continue
                     errors.append(type(exc).__name__)
                     working["last_error_code"] = type(exc).__name__
@@ -3838,7 +3995,8 @@ def fetch_publicvpnlist_api_snapshot(
                     fallback_page = _publicvpnlist_api_cached_page(working, query_key)
                     if fallback_page is not None:
                         page_records = _publicvpnlist_api_mark_cached_records(fallback_page)
-                        cached_records_reused += len(fallback_page)
+                        records_by_query[query_key] = page_records
+                        cached_records_considered += len(fallback_page)
                         page_meta = _publicvpnlist_api_cached_page_meta(working, query_key)
                         next_page_number = parse_int(page_meta.get("next_page"))
                         if not next_page_number and page_meta.get("has_next"):
@@ -3871,12 +4029,25 @@ def fetch_publicvpnlist_api_snapshot(
             records_by_country[country] = list(country_records)
             current_records.extend(country_records)
         elif not country_records:
-            fallback_country = _publicvpnlist_api_mark_cached_records(
-                _publicvpnlist_api_cache_records_for_country(working, country)
+            fallback_country_raw = _publicvpnlist_api_cached_records_raw(
+                working,
+                countries=[country],
+                now=now,
             )
+            fallback_country = _publicvpnlist_api_mark_cached_records(
+                publicvpnlist_api_normalize_bounded_records(fallback_country_raw)
+            )
+            for cached_query_key in list(records_by_query):
+                if _publicvpnlist_api_query_country(cached_query_key) != country:
+                    continue
+                cached_query_page = _publicvpnlist_api_cached_page(working, cached_query_key)
+                if cached_query_page is not None:
+                    records_by_query[cached_query_key] = _publicvpnlist_api_mark_cached_records(
+                        cached_query_page
+                    )
             records_by_country[country] = fallback_country
             current_records.extend(fallback_country)
-            cached_records_reused += len(fallback_country)
+            cached_records_considered += len(fallback_country_raw)
         if page_network_success:
             country_success = True
             successful_countries += 1
@@ -3889,18 +4060,37 @@ def fetch_publicvpnlist_api_snapshot(
         for country in countries:
             if country in processed_countries:
                 continue
-            fallback_country = _publicvpnlist_api_cache_records_for_country(working, country)
-            current_records.extend(_publicvpnlist_api_mark_cached_records(fallback_country))
-            cached_records_reused += len(fallback_country)
+            fallback_country_raw = _publicvpnlist_api_cached_records_raw(
+                working,
+                countries=[country],
+                now=now,
+            )
+            fallback_country = _publicvpnlist_api_mark_cached_records(
+                publicvpnlist_api_normalize_bounded_records(fallback_country_raw)
+            )
+            for cached_query_key in list(records_by_query):
+                if _publicvpnlist_api_query_country(cached_query_key) != country:
+                    continue
+                cached_query_page = _publicvpnlist_api_cached_page(working, cached_query_key)
+                if cached_query_page is not None:
+                    records_by_query[cached_query_key] = _publicvpnlist_api_mark_cached_records(
+                        cached_query_page
+                    )
+            records_by_country[country] = fallback_country
+            current_records.extend(fallback_country)
+            cached_records_considered += len(fallback_country_raw)
 
     if successful_requests or successful_countries:
         working["last_success_at"] = now
         working["generated_at"] = generated_at or now
         working["expires_at"] = expires_at
-        working["next_update_at"] = next_update_at or now + PUBLICVPNLIST_API_REFRESH_SECONDS
+        working["next_update_at"] = next_update_at or _publicvpnlist_api_normal_refresh_at(now)
         working["dataset_version"] = dataset_version
     elif not working.get("last_success_at"):
-        working["next_update_at"] = now + min(PUBLICVPNLIST_API_REFRESH_SECONDS, 60)
+        working["next_update_at"] = min(
+            now + min(PUBLICVPNLIST_API_REFRESH_SECONDS, 60),
+            _publicvpnlist_api_normal_refresh_at(now),
+        )
     if rate_limited or errors:
         working["refresh_failed"] = True
         working["api_stale"] = True
@@ -3917,8 +4107,13 @@ def fetch_publicvpnlist_api_snapshot(
     working["page_meta_by_query"] = page_meta_by_query
     working["records_by_country"] = records_by_country
     working["network_records_fetched"] = network_records_fetched
-    working["cached_records_reused"] = cached_records_reused
-    working["metadata_records_returned"] = len(publicvpnlist_api_cached_records(working))
+    all_cached_records = publicvpnlist_api_cached_records(working)
+    all_unique_records = publicvpnlist_api_normalize_bounded_records(all_cached_records)
+    working["cached_records_considered"] = cached_records_considered
+    working["cached_records_reused"] = sum(
+        1 for record in all_unique_records if record.get("_pvl_api_not_modified")
+    )
+    working["metadata_records_returned"] = len(all_unique_records)
     working["metadata_record_count"] = working["metadata_records_returned"]
     working["record_count_by_country"] = {
         country: len(values) for country, values in records_by_country.items()
@@ -3931,12 +4126,16 @@ def fetch_publicvpnlist_api_snapshot(
     ordered_records = publicvpnlist_api_cached_records(working, countries=countries)
     unique_records = publicvpnlist_api_normalize_bounded_records(ordered_records)
     metadata_records_returned = len(unique_records)
+    cached_records_reused = sum(
+        1 for record in unique_records if record.get("_pvl_api_not_modified")
+    )
     return {
         "data": unique_records,
         "_api_meta": {
             "status": 429 if rate_limited else int(working.get("last_http_status") or 200),
             "records_fetched": metadata_records_returned,
             "network_records_fetched": network_records_fetched,
+            "cached_records_considered": cached_records_considered,
             "cached_records_reused": cached_records_reused,
             "metadata_records_returned": metadata_records_returned,
             "dataset_version": dataset_version,
@@ -4860,6 +5059,11 @@ def publicvpnlist_web_status() -> dict[str, Any]:
         if source_kind == "api" and "network_records_fetched" in api_cache
         else stat_int("network_records_fetched")
     )
+    cached_records_considered = (
+        parse_int(api_cache.get("cached_records_considered"))
+        if source_kind == "api" and "cached_records_considered" in api_cache
+        else stat_int("cached_records_considered")
+    )
     cached_records_reused = (
         parse_int(api_cache.get("cached_records_reused"))
         if source_kind == "api" and "cached_records_reused" in api_cache
@@ -4936,6 +5140,7 @@ def publicvpnlist_web_status() -> dict[str, Any]:
         "last_success_at": float(api_cache.get("last_success_at") or 0),
         "metadata_records": metadata_records,
         "network_records_fetched": network_records_fetched,
+        "cached_records_considered": cached_records_considered,
         "cached_records_reused": cached_records_reused,
         "metadata_records_returned": metadata_records_returned,
         "connectable_candidates": connectable_candidates,
@@ -5287,6 +5492,7 @@ def refresh_publicvpnlist_cache(
                         **dict(cache.get("last_refresh_stats") or {}),
                         "api_records_fetched": int(api_meta.get("metadata_records_returned") or 0),
                         "network_records_fetched": int(api_meta.get("network_records_fetched") or 0),
+                        "cached_records_considered": int(api_meta.get("cached_records_considered") or 0),
                         "cached_records_reused": int(api_meta.get("cached_records_reused") or 0),
                         "metadata_records_returned": int(api_meta.get("metadata_records_returned") or 0),
                         "api_status": 304,
@@ -5317,6 +5523,7 @@ def refresh_publicvpnlist_cache(
             "eligible_scanned": 0,
             "metadata_records": 0,
             "network_records_fetched": 0,
+            "cached_records_considered": 0,
             "cached_records_reused": 0,
             "metadata_records_returned": 0,
             "fixed_country_accepted": 0,
@@ -5616,6 +5823,7 @@ def refresh_publicvpnlist_cache(
                 "actual_duplicate_skipped": actual_duplicate_skipped,
                 "api_records_fetched": int(api_meta.get("records_fetched") or len(records)) if source_kind == "api" else 0,
                 "network_records_fetched": int(api_meta.get("network_records_fetched") or 0) if source_kind == "api" else 0,
+                "cached_records_considered": int(api_meta.get("cached_records_considered") or 0) if source_kind == "api" else 0,
                 "cached_records_reused": int(api_meta.get("cached_records_reused") or 0) if source_kind == "api" else 0,
                 "metadata_records_returned": int(
                     api_meta.get("metadata_records_returned")
@@ -5925,7 +6133,7 @@ def publicvpnlist_metadata_is_verified(
         or row.get("checkedAt")
         or row.get("last_checked_at")
     )
-    if not checked_at or checked_at > now + 300:
+    if not _publicvpnlist_api_cache_timestamp_is_fresh(checked_at, now):
         return False
     expires_value = row.get("expires_at")
     if expires_value in (None, ""):
@@ -5934,7 +6142,7 @@ def publicvpnlist_metadata_is_verified(
         expires_at = _publicvpnlist_api_time(expires_value)
         if not expires_at or now >= expires_at:
             return False
-    return now - checked_at <= PUBLICVPNLIST_API_MAX_STALE_SECONDS
+    return True
 
 
 def publicvpnlist_row_to_node(row: dict[str, Any], config_text: str) -> dict[str, Any] | None:
@@ -6384,6 +6592,7 @@ def fetch_publicvpnlist_candidates(
             "PublicVPNList API 汇总："
             f"metadata_records={api_cache.get('metadata_record_count', 0)}，"
             f"network_records_fetched={api_cache.get('network_records_fetched', 0)}，"
+            f"cached_records_considered={api_cache.get('cached_records_considered', 0)}，"
             f"cached_records_reused={api_cache.get('cached_records_reused', 0)}，"
             f"metadata_records_returned={api_cache.get('metadata_records_returned', 0)}，"
             f"fixed-country accepted={stats.get('fixed_country_accepted', 0)}，"
@@ -9978,7 +10187,7 @@ function renderPublicVPNListSettings(data) {
   const lastApiUpdate = status.last_api_update ? new Date(status.last_api_update * 1000).toLocaleString() : "未更新";
   const mode = status.mode || (status.source_kind === "api" ? "api" : "cache_only");
   const rateLimit = status.api_rate_limit || {};
-  statusEl.textContent = `PublicVPNList mode: ${mode}；Network records fetched: ${status.network_records_fetched || 0}；Cached records reused: ${status.cached_records_reused || 0}；Metadata records returned: ${status.metadata_records_returned || 0}；Connectable candidates: ${status.connectable_candidates || 0}；Metadata-only skipped: ${status.metadata_only_skipped || 0}；Last API update: ${lastApiUpdate}；API status: ${apiStatus}；Rate-limit/backoff: ${rateLimit.backoff_seconds || 0}s；${status.status_label || "PublicVPNList"}；${snapshotState}；下载域名：${hostState}；缓存 profile：${cache.profile_count || 0}；effective source active: ${active}；refresh_ready: ${refreshReady}；cache_only: ${cacheOnly}${readiness}`;
+  statusEl.textContent = `PublicVPNList mode: ${mode}；Network records fetched: ${status.network_records_fetched || 0}；Cached records considered: ${status.cached_records_considered || 0}；Cached records reused: ${status.cached_records_reused || 0}；Metadata records returned: ${status.metadata_records_returned || 0}；Connectable candidates: ${status.connectable_candidates || 0}；Metadata-only skipped: ${status.metadata_only_skipped || 0}；Last API update: ${lastApiUpdate}；API status: ${apiStatus}；Rate-limit/backoff: ${rateLimit.backoff_seconds || 0}s；${status.status_label || "PublicVPNList"}；${snapshotState}；下载域名：${hostState}；缓存 profile：${cache.profile_count || 0}；effective source active: ${active}；refresh_ready: ${refreshReady}；cache_only: ${cacheOnly}${readiness}`;
   const fileEl = $("settings_publicvpnlist_file");
   const hostsEl = $("settings_publicvpnlist_hosts");
   const urlEl = $("settings_publicvpnlist_url");
