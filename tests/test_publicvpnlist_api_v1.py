@@ -352,7 +352,11 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
             metadata.update({"status": 200, "content_type": "application/json"})
             return self.api_response([self.record("ph-recovered")])
 
-        with mock.patch.object(vpngate_manager, "publicvpnlist_http_get", side_effect=recovered_http_get):
+        with mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_download_host_addresses",
+            return_value=("93.184.216.34",),
+        ), mock.patch.object(vpngate_manager, "publicvpnlist_http_get", side_effect=recovered_http_get):
             recovered = vpngate_manager.fetch_publicvpnlist_api_snapshot(target_countries=["PH"])
         refreshed_cache = vpngate_manager.load_publicvpnlist_api_cache()
         self.assertEqual(recovered["_api_meta"]["rate_limited"], False)
