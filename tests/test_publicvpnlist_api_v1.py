@@ -269,6 +269,10 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
     def test_api_page_1_304_page_2_200_keeps_new_page_2(self):
         old_page_one = self.record("old-p1", page=1, with_config=False)
         self._seed_page_cache({1: [old_page_one]})
+        page_one_key = vpngate_manager._publicvpnlist_api_query_key("PH", 1)
+        cache = vpngate_manager.load_publicvpnlist_api_cache()
+        cache["page_meta_by_query"][page_one_key].update({"next_page": 2, "has_next": True})
+        vpngate_manager.save_publicvpnlist_api_cache(cache)
         new_page_two = self.record("new-p2", page=2, with_config=False)
         calls = []
 

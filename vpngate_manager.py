@@ -3097,7 +3097,6 @@ def fetch_publicvpnlist_api_snapshot(
     now = time.time()
     base_url = publicvpnlist_api_base_url()
     servers_url = publicvpnlist_api_servers_url()
-    publicvpnlist_validate_api_url(servers_url, base_url)
     countries = _publicvpnlist_api_target_countries(target_countries)
 
     if publicvpnlist_api_cache_is_fresh(api_cache, now):
@@ -3144,6 +3143,7 @@ def fetch_publicvpnlist_api_snapshot(
             },
         }
 
+    publicvpnlist_validate_api_url(servers_url, base_url)
     working = dict(api_cache)
     working["last_attempt_at"] = now
     working["api_base_host"] = (urllib.parse.urlsplit(base_url).hostname or "").lower().rstrip(".")
