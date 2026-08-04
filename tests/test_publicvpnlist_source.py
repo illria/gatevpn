@@ -345,8 +345,8 @@ class PublicVPNListSourceTests(unittest.TestCase):
             self.assertEqual(after[field], before[field])
         messages = [str(call.args[2]) for call in log_mock.call_args_list if len(call.args) >= 3]
         self.assertEqual(
-            [message for message in messages if message == "PublicVPNList 仅使用缓存：未配置 API/快照，不进行快照或 profile 下载"],
-            ["PublicVPNList 仅使用缓存：未配置 API/快照，不进行快照或 profile 下载"],
+            [message for message in messages if message == "PublicVPNList 仅使用缓存：未配置 API/快照，不进行元数据或 profile 下载"],
+            ["PublicVPNList 仅使用缓存：未配置 API/快照，不进行元数据或 profile 下载"],
         )
 
     def test_clear_config_with_valid_cache_remains_functional(self):
@@ -375,8 +375,8 @@ class PublicVPNListSourceTests(unittest.TestCase):
         self.assertEqual([node["ip"] for node in result], [row["ip"]])
         messages = [str(call.args[2]) for call in log_mock.call_args_list if len(call.args) >= 3]
         self.assertEqual(
-            [message for message in messages if message == "PublicVPNList 仅使用缓存：未配置 API/快照，不进行快照或 profile 下载"],
-            ["PublicVPNList 仅使用缓存：未配置 API/快照，不进行快照或 profile 下载"],
+            [message for message in messages if message == "PublicVPNList 仅使用缓存：未配置 API/快照，不进行元数据或 profile 下载"],
+            ["PublicVPNList 仅使用缓存：未配置 API/快照，不进行元数据或 profile 下载"],
         )
 
     def test_no_snapshot_without_usable_cache_disables_source(self):
@@ -866,7 +866,7 @@ class PublicVPNListSourceTests(unittest.TestCase):
         config_builder.assert_not_called()
         messages = " ".join(str(call.args[2]) for call in log_mock.call_args_list if len(call.args) >= 3)
         self.assertIn("download_page_url", messages)
-        self.assertIn("重新生成", messages)
+        self.assertIn("仅作页面元数据，不作为配置下载地址", messages)
 
     def test_expired_temporary_snapshot_profile_is_skipped(self):
         row = self.row("expired-profile", "PH", "198.51.100.61")
