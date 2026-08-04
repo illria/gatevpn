@@ -583,6 +583,9 @@ def publicvpnlist_api_cache_summary(values=None):
     backoff_value = safe_float(cache.get("backoff_until"))
     return {
         "metadata_records": safe_int(cache.get("metadata_record_count")),
+        "network_records_fetched": safe_int(cache.get("network_records_fetched")),
+        "cached_records_reused": safe_int(cache.get("cached_records_reused")),
+        "metadata_records_returned": safe_int(cache.get("metadata_records_returned")),
         "dataset_version": str(cache.get("dataset_version") or ""),
         "last_success_at": safe_float(cache.get("last_success_at")),
         "api_status": safe_int(cache.get("last_http_status")),
@@ -672,6 +675,18 @@ def publicvpnlist_state(values=None):
             api_summary.get("metadata_records", 0),
             stat_int(refresh_stats.get("metadata_records")),
         ),
+        "network_records_fetched": max(
+            api_summary.get("network_records_fetched", 0),
+            stat_int(refresh_stats.get("network_records_fetched")),
+        ),
+        "cached_records_reused": max(
+            api_summary.get("cached_records_reused", 0),
+            stat_int(refresh_stats.get("cached_records_reused")),
+        ),
+        "metadata_records_returned": max(
+            api_summary.get("metadata_records_returned", 0),
+            stat_int(refresh_stats.get("metadata_records_returned"), api_summary.get("metadata_records", 0)),
+        ),
         "connectable_candidates": connectable_candidates,
         "last_refresh_connectable_candidates": connectable_candidates,
         "usable_cached_profiles": usable,
@@ -702,7 +717,7 @@ def print_publicvpnlist_status():
     print("  mode: " + state["mode"])
     if state["mode"] in ("api", "cache_fallback"):
         print("  API: " + redacted_snapshot_url(values.get("PUBLICVPNLIST_API_BASE_URL") or PUBLICVPNLIST_API_BASE_URL_DEFAULT))
-        print(f"  metadata records: {state['metadata_records']}；connectable candidates: {state['connectable_candidates']}；usable cached profiles: {state['usable_cached_profiles']}；current returned candidates: {state['current_returned_candidates']}；metadata-only skipped: {state['metadata_only_skipped']}；matched existing nodes: {state['matched_existing_nodes']}；profiles downloaded: {state['profiles_downloaded']}；dataset: {state['dataset_version'] or 'unknown'}；last API update: {state['last_success_at'] or 'never'}")
+        print(f"  network records fetched: {state['network_records_fetched']}；cached records reused: {state['cached_records_reused']}；metadata records returned: {state['metadata_records_returned']}；connectable candidates: {state['connectable_candidates']}；usable cached profiles: {state['usable_cached_profiles']}；current returned candidates: {state['current_returned_candidates']}；metadata-only skipped: {state['metadata_only_skipped']}；matched existing nodes: {state['matched_existing_nodes']}；profiles downloaded: {state['profiles_downloaded']}；dataset: {state['dataset_version'] or 'unknown'}；last API update: {state['last_success_at'] or 'never'}")
         print(f"  API status: {state['api_status'] or 'not requested'}；etag_cache_hits={state['etag_cache_hits']}；rate_limited={str(state['rate_limited']).lower()}；backoff={state['backoff_seconds']}s")
     print("  快照 URL: " + redacted_snapshot_url(values.get("PUBLICVPNLIST_SNAPSHOT_URL")))
     print("  本地快照文件: " + ("已设置" if values.get("PUBLICVPNLIST_SNAPSHOT_FILE") else "未设置"))

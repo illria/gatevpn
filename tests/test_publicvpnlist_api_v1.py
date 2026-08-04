@@ -125,6 +125,9 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
             payload = vpngate_manager.fetch_publicvpnlist_api_snapshot(target_countries=["PH", "FR"])
 
         self.assertEqual(payload["_api_meta"]["records_fetched"], 2)
+        self.assertEqual(payload["_api_meta"]["network_records_fetched"], 2)
+        self.assertEqual(payload["_api_meta"]["cached_records_reused"], 0)
+        self.assertEqual(payload["_api_meta"]["metadata_records_returned"], 2)
         self.assertEqual({row["country_code"] for row in payload["data"]}, {"PH", "FR"})
         self.assertEqual(len(calls), 2)
         saved = json.loads(self.api_cache_file.read_text(encoding="utf-8"))
@@ -415,7 +418,10 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
         meta = payload["_api_meta"]
         self.assertEqual(meta["status"], 200)
         self.assertTrue(meta["from_cache"])
-        self.assertEqual(meta["records_fetched"], 0)
+        self.assertEqual(meta["records_fetched"], 1)
+        self.assertEqual(meta["network_records_fetched"], 0)
+        self.assertEqual(meta["cached_records_reused"], 1)
+        self.assertEqual(meta["metadata_records_returned"], 1)
         self.assertFalse(meta["api_stale"])
         self.assertFalse(meta["refresh_failed"])
         self.assertFalse(meta["rate_limited"])
@@ -434,6 +440,9 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
             payload = vpngate_manager.fetch_publicvpnlist_api_snapshot(target_countries=["PH"])
         self.assertEqual(payload["_api_meta"]["status"], 304)
         self.assertFalse(payload["_api_meta"]["rate_limited"])
+        self.assertEqual(payload["_api_meta"]["network_records_fetched"], 0)
+        self.assertEqual(payload["_api_meta"]["cached_records_reused"], 1)
+        self.assertEqual(payload["_api_meta"]["metadata_records_returned"], 1)
 
     def test_active_and_expired_429_backoff_have_distinct_cache_state(self):
         now = time.time()
@@ -490,7 +499,15 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
             ):
                 payload = vpngate_manager.fetch_publicvpnlist_api_snapshot(target_countries=["PH"])
                 self.assertLessEqual(len(payload["data"]), limit)
-                self.assertEqual(payload["_api_meta"]["records_fetched"], 0)
+                self.assertEqual(
+                    payload["_api_meta"]["records_fetched"],
+                    payload["_api_meta"]["metadata_records_returned"],
+                )
+                self.assertEqual(payload["_api_meta"]["network_records_fetched"], 0)
+                self.assertEqual(
+                    payload["_api_meta"]["cached_records_reused"],
+                    payload["_api_meta"]["metadata_records_returned"],
+                )
                 self.assertLessEqual(
                     vpngate_manager.load_publicvpnlist_api_cache()["metadata_record_count"],
                     limit,
@@ -530,6 +547,16 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
         ), mock.patch.object(vpngate_manager, "publicvpnlist_download_host_addresses", return_value=("93.184.216.34",)):
             payload = vpngate_manager.fetch_publicvpnlist_api_snapshot(target_countries=["PH"])
         self.assertLessEqual(len(payload["data"]), 5)
+        self.assertEqual(payload["_api_meta"]["network_records_fetched"], 0)
+        self.assertEqual(
+            payload["_api_meta"]["metadata_records_returned"],
+            len(payload["data"]),
+        )
+        self.assertEqual(
+            payload["_api_meta"]["records_fetched"],
+            payload["_api_meta"]["metadata_records_returned"],
+        )
+        self.assertGreaterEqual(payload["_api_meta"]["cached_records_reused"], len(payload["data"]))
 
     def test_bounded_metadata_deduplicates_public_ids_and_endpoints(self):
         first = self.record("duplicate-id", with_config=False)
@@ -547,6 +574,55 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
             {row["hostname"] for row in bounded},
             {first["hostname"], same_id_other_endpoint["hostname"]},
         )
+
+    def test_bounded_metadata_prefers_verified_then_freshness_and_availability(self):
+        fresh_online = self.record("fresh-online", with_config=True)
+        fresh_online["ip"] = "198.51.100.44"
+        fresh_online["hostname"] = "shared.fixture.invalid"
+        fresh_online["last_checked_at"] = "2026-08-04T12:00:00Z"
+        stale_offline = dict(fresh_online)
+        stale_offline["id"] = "stale-offline"
+        stale_offline["freshness_status"] = "stale"
+        stale_offline["availability_status"] = "offline"
+        stale_offline.pop("config_download_url", None)
+        bounded = vpngate_manager.publicvpnlist_api_normalize_bounded_records(
+            [stale_offline, fresh_online],
+            limit=20,
+        )
+        self.assertEqual([row["id"] for row in bounded], ["fresh-online"])
+        self.assertIn("config_download_url", bounded[0])
+
+        recent_online = dict(fresh_online)
+        recent_online["id"] = "recent-online"
+        recent_online["freshness_status"] = "recent"
+        stale = dict(fresh_online)
+        stale["id"] = "stale"
+        stale["freshness_status"] = "stale"
+        stale["availability_status"] = "unknown"
+        forward = vpngate_manager.publicvpnlist_api_normalize_bounded_records(
+            [stale, recent_online], limit=20
+        )
+        reverse = vpngate_manager.publicvpnlist_api_normalize_bounded_records(
+            [recent_online, stale], limit=20
+        )
+        self.assertEqual([row["id"] for row in forward], ["recent-online"])
+        self.assertEqual([row["id"] for row in reverse], ["recent-online"])
+
+    def test_bounded_metadata_keeps_distinct_ports_and_protocols(self):
+        tcp = self.record("same-host-tcp", with_config=False)
+        tcp["ip"] = "198.51.100.55"
+        tcp["hostname"] = "same-host.fixture.invalid"
+        udp = dict(tcp)
+        udp["id"] = "same-host-udp"
+        udp["transport"] = "udp"
+        udp["port"] = 1194
+        other_port = dict(tcp)
+        other_port["id"] = "same-host-other-port"
+        other_port["port"] = 1195
+        bounded = vpngate_manager.publicvpnlist_api_normalize_bounded_records(
+            [tcp, udp, other_port], limit=20
+        )
+        self.assertEqual({row["id"] for row in bounded}, {"same-host-tcp", "same-host-udp", "same-host-other-port"})
 
     def test_due_retry_country_is_requested_before_full_fresh_cache(self):
         now = time.time()
@@ -647,6 +723,122 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
         )
         vpngate_manager.save_publicvpnlist_api_cache(cache)
 
+    def test_country_page_success_times_do_not_refresh_failed_country(self):
+        now = time.time()
+        old_time = now - 100
+        ph = self.record("fresh-ph", country="PH", with_config=False)
+        us = self.record("old-us", country="US", with_config=False)
+        ph_key = vpngate_manager._publicvpnlist_api_query_key("PH", 1)
+        us_key = vpngate_manager._publicvpnlist_api_query_key("US", 1)
+        cache = vpngate_manager.publicvpnlist_api_cache_default()
+        cache.update(
+            {
+                "last_success_at": now,
+                "next_update_at": 0.0,
+                "records_by_query": {ph_key: [ph], us_key: [us]},
+                "page_meta_by_query": {
+                    ph_key: {
+                        "country": "PH",
+                        "page": 1,
+                        "next_page": 0,
+                        "has_next": False,
+                        "record_count": 1,
+                        "last_success_at": old_time,
+                        "last_validated_at": old_time,
+                    },
+                    us_key: {
+                        "country": "US",
+                        "page": 1,
+                        "next_page": 0,
+                        "has_next": False,
+                        "record_count": 1,
+                        "last_success_at": old_time,
+                        "last_validated_at": old_time,
+                    },
+                },
+            }
+        )
+        vpngate_manager.save_publicvpnlist_api_cache(cache)
+        calls = []
+
+        def refresh_http_get(url, metadata=None, **_kwargs):
+            country = parse_qs(urlsplit(url).query)["country"][0]
+            calls.append(country)
+            if country == "US":
+                raise urllib.error.URLError("US page unavailable")
+            metadata.update({"status": 200, "content_type": "application/json"})
+            return self.api_response([self.record("new-ph", country="PH", with_config=False)])
+
+        with mock.patch.object(vpngate_manager, "PUBLICVPNLIST_API_MAX_RETRIES", 1), mock.patch.object(
+            vpngate_manager,
+            "PUBLICVPNLIST_API_MAX_STALE_SECONDS",
+            10,
+        ), mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_download_host_addresses",
+            return_value=("93.184.216.34",),
+        ), mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_http_get",
+            side_effect=refresh_http_get,
+        ):
+            payload = vpngate_manager.fetch_publicvpnlist_api_snapshot(target_countries=["PH", "US"])
+
+        self.assertEqual(calls, ["PH", "US"])
+        self.assertEqual([row["id"] for row in payload["data"]], ["new-ph"])
+        refreshed = vpngate_manager.load_publicvpnlist_api_cache()
+        self.assertGreater(refreshed["page_meta_by_query"][ph_key]["last_success_at"], old_time)
+        self.assertGreater(refreshed["page_meta_by_query"][ph_key]["last_validated_at"], old_time)
+        self.assertEqual(refreshed["page_meta_by_query"][us_key]["last_success_at"], old_time)
+        self.assertEqual(refreshed["page_meta_by_query"][us_key]["last_validated_at"], old_time)
+        self.assertEqual(
+            [row["id"] for row in vpngate_manager.publicvpnlist_api_cached_records(refreshed)],
+            ["new-ph"],
+        )
+
+    def test_304_updates_only_page_validation_time_and_preserves_page_success_time(self):
+        now = time.time()
+        old_time = now - 100
+        row = self.record("304-page", country="PH", with_config=False)
+        key = vpngate_manager._publicvpnlist_api_query_key("PH", 1)
+        cache = vpngate_manager.publicvpnlist_api_cache_default()
+        cache.update(
+            {
+                "last_success_at": now,
+                "next_update_at": 0.0,
+                "records_by_query": {key: [row]},
+                "page_meta_by_query": {
+                    key: {
+                        "country": "PH",
+                        "page": 1,
+                        "next_page": 0,
+                        "has_next": False,
+                        "record_count": 1,
+                        "etag": '"old"',
+                        "last_success_at": old_time,
+                        "last_validated_at": old_time,
+                    }
+                },
+                "etag_by_query": {key: '"old"'},
+            }
+        )
+        vpngate_manager.save_publicvpnlist_api_cache(cache)
+
+        def not_modified(url, **_kwargs):
+            raise self._not_modified(url, '"new"')
+
+        with mock.patch.object(vpngate_manager, "publicvpnlist_download_host_addresses", return_value=("93.184.216.34",)), mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_http_get",
+            side_effect=not_modified,
+        ):
+            vpngate_manager.fetch_publicvpnlist_api_snapshot(target_countries=["PH"])
+
+        refreshed = vpngate_manager.load_publicvpnlist_api_cache()
+        self.assertEqual(refreshed["page_meta_by_query"][key]["last_success_at"], old_time)
+        self.assertGreater(refreshed["page_meta_by_query"][key]["last_validated_at"], old_time)
+        self.assertEqual(refreshed["page_meta_by_query"][key]["etag"], '"new"')
+
     @staticmethod
     def _not_modified(url, etag):
         headers = Message()
@@ -671,6 +863,9 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
         self.assertEqual([row["id"] for row in payload["data"]], ["cached-p1", "cached-p2"])
         self.assertEqual([page for page, _headers in calls], [1, 2])
         self.assertEqual(payload["_api_meta"]["etag_cache_hits"], 2)
+        self.assertEqual(payload["_api_meta"]["network_records_fetched"], 0)
+        self.assertEqual(payload["_api_meta"]["cached_records_reused"], 2)
+        self.assertEqual(payload["_api_meta"]["metadata_records_returned"], 2)
 
     def test_api_page_1_200_page_2_304_keeps_new_page_1(self):
         old_page_two = self.record("old-p2", page=2, with_config=False)
@@ -693,6 +888,9 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
 
         self.assertEqual([row["id"] for row in payload["data"]], ["new-p1", "old-p2"])
         self.assertEqual([page for page, _headers in calls], [1, 2])
+        self.assertEqual(payload["_api_meta"]["network_records_fetched"], 1)
+        self.assertEqual(payload["_api_meta"]["cached_records_reused"], 1)
+        self.assertEqual(payload["_api_meta"]["metadata_records_returned"], 2)
 
     def test_api_page_1_304_page_2_200_keeps_new_page_2(self):
         old_page_one = self.record("old-p1", page=1, with_config=False)
@@ -741,6 +939,9 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
 
         self.assertEqual([row["id"] for row in payload["data"]], ["new-p1", "old-p2"])
         self.assertEqual(calls, [1, 2, 2])
+        self.assertEqual(payload["_api_meta"]["network_records_fetched"], 1)
+        self.assertGreaterEqual(payload["_api_meta"]["cached_records_reused"], 1)
+        self.assertEqual(payload["_api_meta"]["metadata_records_returned"], 2)
 
     def test_partial_429_preserves_data_and_backoff(self):
         calls = []
@@ -763,6 +964,9 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
         api_cache = vpngate_manager.load_publicvpnlist_api_cache()
         self.assertEqual([row["id"] for row in payload["data"]], ["ph-success"])
         self.assertEqual(calls, ["PH", "US"])
+        self.assertEqual(payload["_api_meta"]["network_records_fetched"], 1)
+        self.assertEqual(payload["_api_meta"]["cached_records_reused"], 0)
+        self.assertEqual(payload["_api_meta"]["metadata_records_returned"], 1)
         self.assertTrue(payload["_api_meta"]["rate_limited"])
         self.assertGreater(payload["_api_meta"]["backoff_until"], time.time())
         self.assertTrue(api_cache["rate_limited"])
@@ -790,6 +994,101 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
         self.assertEqual(recovered["_api_meta"]["rate_limited"], False)
         self.assertEqual(refreshed_cache["rate_limited"], False)
         self.assertEqual(refreshed_cache["backoff_until"], 0.0)
+
+    def test_429_stops_all_later_country_requests_and_reuses_fresh_cache(self):
+        now = time.time()
+        cached_us = self.record("cached-us", country="US", with_config=False)
+        cached_fr = self.record("cached-fr", country="FR", with_config=False)
+        cache = vpngate_manager.publicvpnlist_api_cache_default()
+        cache.update(
+            {
+                "last_success_at": now,
+                "next_update_at": 0.0,
+                "records_by_country": {"US": [cached_us], "FR": [cached_fr]},
+            }
+        )
+        retry_ph = self.record("retry-ph", country="PH", with_config=False)
+        for retry_row in (retry_ph, cached_us, cached_fr):
+            vpngate_manager.publicvpnlist_api_record_profile_retry(
+                cache,
+                vpngate_manager.normalize_publicvpnlist_row(retry_row),
+                now=now - 100,
+            )
+        for entry in cache["profile_retry_entries"]:
+            entry["retry_after"] = now - 1
+        vpngate_manager._publicvpnlist_api_sync_retry_fields(cache)
+        vpngate_manager.save_publicvpnlist_api_cache(cache)
+        headers = Message()
+        headers["Retry-After"] = "120"
+        calls = []
+
+        def rate_limited_http_get(url, **_kwargs):
+            country = parse_qs(urlsplit(url).query)["country"][0]
+            calls.append(country)
+            raise urllib.error.HTTPError(url, 429, "rate limited", headers, io.BytesIO())
+
+        with mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_download_host_addresses",
+            return_value=("93.184.216.34",),
+        ), mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_http_get",
+            side_effect=rate_limited_http_get,
+        ):
+            payload = vpngate_manager.fetch_publicvpnlist_api_snapshot(
+                target_countries=["PH", "US", "FR"]
+            )
+
+        self.assertEqual(calls, ["PH"])
+        self.assertEqual([row["id"] for row in payload["data"]], ["cached-us", "cached-fr"])
+        self.assertTrue(payload["_api_meta"]["rate_limited"])
+        self.assertGreater(payload["_api_meta"]["backoff_until"], now)
+        self.assertEqual(payload["_api_meta"]["network_records_fetched"], 0)
+        self.assertEqual(payload["_api_meta"]["cached_records_reused"], 2)
+
+    def test_active_429_does_not_revive_expired_metadata_but_keeps_profile_cache(self):
+        now = time.time()
+        expired = self.record("expired-metadata", country="PH", with_config=False)
+        profile_cache = vpngate_manager.publicvpnlist_cache_default("fixture")
+        profile_cache["profiles"] = {
+            "keep-profile": {
+                "country_short": "PH",
+                "config_text": "client\nproto tcp\nremote keep.fixture.invalid 443\n",
+                "config_validated_at": now,
+                "last_seen_at": now,
+            }
+        }
+        profile_cache["profile_order"] = ["keep-profile"]
+        vpngate_manager.save_publicvpnlist_cache(profile_cache)
+        for cache_update in (
+            {"last_success_at": now - vpngate_manager.PUBLICVPNLIST_API_MAX_STALE_SECONDS - 1},
+            {"last_success_at": now, "expires_at": now - 1},
+            {"last_success_at": 0.0},
+        ):
+            cache = vpngate_manager.publicvpnlist_api_cache_default()
+            cache.update(
+                {
+                    **cache_update,
+                    "last_http_status": 429,
+                    "rate_limited": True,
+                    "backoff_until": now + 120,
+                    "records_by_country": {"PH": [expired]},
+                }
+            )
+            vpngate_manager.save_publicvpnlist_api_cache(cache)
+            with mock.patch.object(
+                vpngate_manager,
+                "publicvpnlist_http_get",
+                side_effect=AssertionError("active backoff must not request metadata"),
+            ):
+                payload = vpngate_manager.fetch_publicvpnlist_api_snapshot(target_countries=["PH"])
+            self.assertEqual(payload["data"], [])
+            self.assertEqual(payload["_api_meta"]["status"], 429)
+            self.assertTrue(payload["_api_meta"]["rate_limited"])
+            self.assertTrue(payload["_api_meta"]["api_stale"] or cache_update.get("expires_at"))
+            self.assertEqual(vpngate_manager.load_publicvpnlist_api_cache()["records_by_country"]["PH"][0]["id"], "expired-metadata")
+            self.assertIn("keep-profile", vpngate_manager.load_publicvpnlist_cache()["profiles"])
 
     def test_failed_profile_download_retries_after_304_without_persisting_url(self):
         row = self.record("retry-profile", with_config=True)
