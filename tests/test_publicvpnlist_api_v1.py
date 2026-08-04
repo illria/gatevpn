@@ -112,7 +112,8 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
             self.assertEqual(query["page"], ["1"])
             self.assertIn(query["country"][0], {"PH", "FR"})
             metadata.update({"status": 200, "content_type": "application/json", "etag": '"fixture"'})
-            return self.api_response([self.record(country=query["country"][0])])
+            country = query["country"][0]
+            return self.api_response([self.record(node_id=f"{country.lower()}-1", country=country)])
 
         with mock.patch.object(vpngate_manager, "publicvpnlist_download_host_addresses", return_value=("93.184.216.34",)), mock.patch.object(
             vpngate_manager, "publicvpnlist_http_get", side_effect=http_get

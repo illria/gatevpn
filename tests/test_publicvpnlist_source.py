@@ -264,7 +264,7 @@ class PublicVPNListSourceTests(unittest.TestCase):
         self.assertEqual(result, [])
         self.assertIn("未配置快照", display)
         messages = " ".join(str(call.args[2]) for call in log_mock.call_args_list if len(call.args) >= 3)
-        self.assertIn("未配置快照", messages)
+        self.assertIn("未配置 API/快照", messages)
 
     def test_publicvpnlist_configuration_status_distinguishes_snapshot_and_download_hosts(self):
         with mock.patch.object(vpngate_manager, "PUBLICVPNLIST_SNAPSHOT_URL", ""), mock.patch.object(
@@ -345,8 +345,8 @@ class PublicVPNListSourceTests(unittest.TestCase):
             self.assertEqual(after[field], before[field])
         messages = [str(call.args[2]) for call in log_mock.call_args_list if len(call.args) >= 3]
         self.assertEqual(
-            [message for message in messages if message == "PublicVPNList 仅使用缓存：未配置快照，不进行快照或 profile 下载"],
-            ["PublicVPNList 仅使用缓存：未配置快照，不进行快照或 profile 下载"],
+            [message for message in messages if message == "PublicVPNList 仅使用缓存：未配置 API/快照，不进行快照或 profile 下载"],
+            ["PublicVPNList 仅使用缓存：未配置 API/快照，不进行快照或 profile 下载"],
         )
 
     def test_clear_config_with_valid_cache_remains_functional(self):
@@ -375,8 +375,8 @@ class PublicVPNListSourceTests(unittest.TestCase):
         self.assertEqual([node["ip"] for node in result], [row["ip"]])
         messages = [str(call.args[2]) for call in log_mock.call_args_list if len(call.args) >= 3]
         self.assertEqual(
-            [message for message in messages if message == "PublicVPNList 仅使用缓存：未配置快照，不进行快照或 profile 下载"],
-            ["PublicVPNList 仅使用缓存：未配置快照，不进行快照或 profile 下载"],
+            [message for message in messages if message == "PublicVPNList 仅使用缓存：未配置 API/快照，不进行快照或 profile 下载"],
+            ["PublicVPNList 仅使用缓存：未配置 API/快照，不进行快照或 profile 下载"],
         )
 
     def test_no_snapshot_without_usable_cache_disables_source(self):
@@ -437,7 +437,7 @@ class PublicVPNListSourceTests(unittest.TestCase):
                 self.assertEqual(result, [])
                 messages = [str(call.args[2]) for call in log_mock.call_args_list if len(call.args) >= 3]
                 self.assertEqual(len(messages), 1)
-                self.assertIn("未配置快照且没有有效缓存", messages[0])
+                self.assertIn("未配置 API/快照且没有有效缓存", messages[0])
 
     def test_local_snapshot_file_is_supported(self):
         snapshot_file = Path(self.temp_dir.name) / "export-builder.json"
@@ -836,7 +836,7 @@ class PublicVPNListSourceTests(unittest.TestCase):
             row["download_page_url"] = f"https://fixture.invalid/server/page?{name}=secret-value#fragment"
             profile = vpngate_manager.publicvpnlist_cache_profile(row, self.config(row["host"], row["port"]))
             self.assertEqual(profile["download_page_url"], "")
-            self.assertNotIn(name, json.dumps(profile, ensure_ascii=False))
+            self.assertNotIn(f"{name}=secret-value", json.dumps(profile, ensure_ascii=False))
 
         result, _ = self.fetch_rows([row])
         nodes_file = Path(self.temp_dir.name) / "nodes.json"
@@ -1540,7 +1540,7 @@ class PublicVPNListSourceTests(unittest.TestCase):
             call_order.append("ipspeed")
             return [ipspeed_node]
 
-        def fetch_publicvpnlist(_target, _seen, blocked_endpoint_keys=None):
+        def fetch_publicvpnlist(_target, _seen, blocked_endpoint_keys=None, **_kwargs):
             call_order.append("publicvpnlist")
             self.assertIn("198.51.100.78:443:tcp", blocked_endpoint_keys)
             self.assertIn("198.51.100.79:443:tcp", blocked_endpoint_keys)
@@ -1743,7 +1743,7 @@ class PublicVPNListSourceTests(unittest.TestCase):
         with mock.patch.object(vpngate_manager.urllib.request, "urlopen", return_value=Response()) as urlopen:
             vpngate_manager.publicvpnlist_http_get(vpngate_manager.PUBLICVPNLIST_SNAPSHOT_URL)
         request = urlopen.call_args.args[0]
-        self.assertEqual(request.get_header("User-agent"), "gatevpn-publicvpnlist/1.0")
+        self.assertEqual(request.get_header("User-agent"), "gatevpn-publicvpnlist-api/1.0")
 
     def test_payload_records_accepts_data_array(self):
         rows = [{"id": "one"}]

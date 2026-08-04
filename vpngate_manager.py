@@ -4584,7 +4584,7 @@ def refresh_publicvpnlist_cache(
                 "PublicVPNList",
                 f"PublicVPNList API 已接入并读取 {len(records)} 条 metadata，但本轮产生 0 个可连接节点；"
                 f"metadata_only_skipped={metadata_only_skipped}，US 拒绝 {us_rejected}，"
-                "没有官方可自动下载的 OpenVPN 配置，旧缓存未被覆盖",
+                "没有官方可自动下载的 OpenVPN 配置；server_page_url/download_page_url 未被当作配置使用，旧缓存未被覆盖",
             )
         else:
             log_to_json(
@@ -4613,7 +4613,8 @@ def refresh_publicvpnlist_cache(
         f"eligible={eligible_scanned}/{PUBLICVPNLIST_MAX_SCAN_ROWS}，"
         f"固定国家过滤={fixed_country_filtered}，raw_limit_hit={raw_limit_hit}，"
         f"eligible_limit_hit={eligible_limit_hit}，元数据重复={metadata_duplicate_skipped}，"
-        f"高优先级重复={priority_duplicate_skipped}，配置端点重复={actual_duplicate_skipped}",
+        f"高优先级重复={priority_duplicate_skipped}，配置端点重复={actual_duplicate_skipped}；"
+        "server_page_url/download_page_url 仅作页面元数据，不作为配置下载地址",
     )
     return cache
 
