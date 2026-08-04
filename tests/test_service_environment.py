@@ -251,6 +251,42 @@ class ServiceEnvironmentTests(unittest.TestCase):
             self.assertEqual(generated_state["refresh_ready"], manager_state["refresh_ready"])
             self.assertEqual(generated_state["cache_only"], manager_state["cache_only"])
 
+    def test_generated_en_source_toggles_publicvpnlist_without_claiming_failure(self):
+        marker = "cat > /usr/bin/en <<'EOF'\n"
+        start = self.install_text.index(marker) + len(marker)
+        end = self.install_text.index("\nEOF\n", start)
+        source = self.install_text[start:end]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            namespace = {"__name__": "generated_en_ci"}
+            exec(compile(source, "install.sh:generated-en", "exec"), namespace)
+            namespace["ENV_FILE"] = str(root / "eianun-vpngate.env")
+            namespace["LEGACY_ENV_FILE"] = str(root / "legacy.env")
+            namespace["INSTALL_DIR"] = str(root / "install")
+            namespace["load_ui_cfg"] = lambda: {}
+            namespace["publicvpnlist_status_label"] = lambda: "PublicVPNList（API）"
+            namespace["ask_restart"] = lambda: None
+            saved_configs = []
+            namespace["save_ui_cfg"] = lambda cfg: saved_configs.append(dict(cfg))
+
+            for key, expected_enabled, expected_sources in (
+                ("1", "1", "vpngate,vpnbook,ipspeed,vpngate_scraper,publicvpnlist"),
+                ("2", "0", "vpngate,vpnbook,ipspeed,vpngate_scraper"),
+            ):
+                namespace["getch"] = lambda key=key: key
+                with contextlib.redirect_stdout(io.StringIO()):
+                    namespace["configure_source"]()
+                saved = namespace["read_env_file"](namespace["ENV_FILE"])
+                self.assertEqual(saved.get("PUBLICVPNLIST_ENABLED"), expected_enabled)
+                self.assertEqual(saved_configs[-1]["node_sources"], expected_sources)
+
+            namespace["getch"] = lambda: "1"
+            namespace["save_publicvpnlist_environment"] = lambda _updates: False
+            before = len(saved_configs)
+            with contextlib.redirect_stdout(io.StringIO()):
+                namespace["configure_source"]()
+            self.assertEqual(len(saved_configs), before)
+
 
 if __name__ == "__main__":
     unittest.main()

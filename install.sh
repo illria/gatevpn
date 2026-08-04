@@ -590,6 +590,7 @@ def publicvpnlist_api_cache_summary(values=None):
         "backoff_until": backoff_value,
         "backoff_seconds": max(0, int(backoff_value - time.time())) if backoff_value else 0,
         "request_count": safe_int(cache.get("request_count")),
+        "etag_cache_hits": safe_int(cache.get("last_etag_cache_hits")),
         "refresh_failed": str(cache.get("refresh_failed") or "").strip().lower() not in {"", "0", "false", "no", "off"},
     }
 
@@ -614,11 +615,38 @@ def publicvpnlist_state(values=None):
     refresh_stats = publicvpnlist_profile_refresh_stats(values)
     api_summary = publicvpnlist_api_cache_summary(values)
     def stat_int(value, default=0):
+        if value is None or value == "":
+            return default
         try:
-            return int(float(value or default))
+            return int(float(value))
         except (TypeError, ValueError):
             return default
     mode = publicvpnlist_source_mode(values, usable)
+    legacy_connectable = stat_int(refresh_stats.get("connectable_candidates"), usable)
+    connectable_candidates = stat_int(
+        refresh_stats.get("last_refresh_connectable_candidates")
+        if "last_refresh_connectable_candidates" in refresh_stats
+        else None,
+        legacy_connectable,
+    )
+    current_returned_candidates = stat_int(
+        refresh_stats.get("current_returned_candidates")
+        if "current_returned_candidates" in refresh_stats
+        else None,
+        connectable_candidates,
+    )
+    matched_existing_nodes = stat_int(
+        refresh_stats.get("matched_existing_nodes")
+        if "matched_existing_nodes" in refresh_stats
+        else None,
+        0,
+    )
+    profiles_downloaded = stat_int(
+        refresh_stats.get("profiles_downloaded")
+        if "profiles_downloaded" in refresh_stats
+        else None,
+        stat_int(refresh_stats.get("config_downloaded")),
+    )
     if mode == "api" and refresh_failed and usable:
         mode = "cache_fallback"
     enabled = mode != "disabled"
@@ -644,8 +672,14 @@ def publicvpnlist_state(values=None):
             api_summary.get("metadata_records", 0),
             stat_int(refresh_stats.get("metadata_records")),
         ),
-        "connectable_candidates": stat_int(refresh_stats.get("connectable_candidates"), usable),
+        "connectable_candidates": connectable_candidates,
+        "last_refresh_connectable_candidates": connectable_candidates,
+        "usable_cached_profiles": usable,
+        "current_returned_candidates": current_returned_candidates,
         "metadata_only_skipped": stat_int(refresh_stats.get("metadata_only_skipped")),
+        "matched_existing_nodes": matched_existing_nodes,
+        "profiles_downloaded": profiles_downloaded,
+        "etag_cache_hits": api_summary.get("etag_cache_hits", 0),
         "cache_stale": cache_stale,
         "refresh_failed": refresh_failed,
         "mode": mode,
@@ -668,8 +702,8 @@ def print_publicvpnlist_status():
     print("  mode: " + state["mode"])
     if state["mode"] in ("api", "cache_fallback"):
         print("  API: " + redacted_snapshot_url(values.get("PUBLICVPNLIST_API_BASE_URL") or PUBLICVPNLIST_API_BASE_URL_DEFAULT))
-        print(f"  metadata records: {state['metadata_records']}；connectable candidates: {state['connectable_candidates']}；metadata-only skipped: {state['metadata_only_skipped']}；dataset: {state['dataset_version'] or 'unknown'}；last API update: {state['last_success_at'] or 'never'}")
-        print(f"  API status: {state['api_status'] or 'not requested'}；rate_limited={str(state['rate_limited']).lower()}；backoff={state['backoff_seconds']}s")
+        print(f"  metadata records: {state['metadata_records']}；connectable candidates: {state['connectable_candidates']}；usable cached profiles: {state['usable_cached_profiles']}；current returned candidates: {state['current_returned_candidates']}；metadata-only skipped: {state['metadata_only_skipped']}；matched existing nodes: {state['matched_existing_nodes']}；profiles downloaded: {state['profiles_downloaded']}；dataset: {state['dataset_version'] or 'unknown'}；last API update: {state['last_success_at'] or 'never'}")
+        print(f"  API status: {state['api_status'] or 'not requested'}；etag_cache_hits={state['etag_cache_hits']}；rate_limited={str(state['rate_limited']).lower()}；backoff={state['backoff_seconds']}s")
     print("  快照 URL: " + redacted_snapshot_url(values.get("PUBLICVPNLIST_SNAPSHOT_URL")))
     print("  本地快照文件: " + ("已设置" if values.get("PUBLICVPNLIST_SNAPSHOT_FILE") else "未设置"))
     print("  允许下载域名: " + safe_download_hosts_display(values.get("PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS")))
@@ -1374,6 +1408,10 @@ def configure_source():
     elif key in ('p', 'P'):
         cfg['node_sources'] = 'publicvpnlist'
     else:
+        return
+    publicvpnlist_enabled = "1" if "publicvpnlist" in cfg['node_sources'].split(",") else "0"
+    if not save_publicvpnlist_environment({"PUBLICVPNLIST_ENABLED": publicvpnlist_enabled}):
+        print("节点来源未更新：PublicVPNList 开关环境文件写入失败。")
         return
     save_ui_cfg(cfg)
     print(f"节点来源已更新为: {cfg['node_sources']}")
