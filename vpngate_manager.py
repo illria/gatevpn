@@ -160,7 +160,9 @@ PUBLICVPNLIST_MAX_NODES = _publicvpnlist_env_int("PUBLICVPNLIST_MAX_NODES", 100,
 PUBLICVPNLIST_MAX_SCAN_ROWS = _publicvpnlist_env_int("PUBLICVPNLIST_MAX_SCAN_ROWS", 500, 1)
 PUBLICVPNLIST_MAX_RAW_ROWS = _publicvpnlist_env_int("PUBLICVPNLIST_MAX_RAW_ROWS", 5000, 1)
 PUBLICVPNLIST_MAX_RESPONSE_BYTES = _publicvpnlist_env_int("PUBLICVPNLIST_MAX_RESPONSE_BYTES", 8 * 1024 * 1024, 256 * 1024)
-PUBLICVPNLIST_MAX_RETRIES = _publicvpnlist_env_int("PUBLICVPNLIST_MAX_RETRIES", 2, 1)
+# Temporary PublicVPNList links are short-lived/one-time; callers may
+# explicitly opt into retries only for a separately verified reusable URL.
+PUBLICVPNLIST_MAX_RETRIES = _publicvpnlist_env_int("PUBLICVPNLIST_MAX_RETRIES", 1, 1)
 PUBLICVPNLIST_MAX_REDIRECTS = _publicvpnlist_env_int("PUBLICVPNLIST_MAX_REDIRECTS", 5)
 PUBLICVPNLIST_LIVE_FLOW_MAX_ATTEMPTS = _publicvpnlist_env_int(
     "PUBLICVPNLIST_LIVE_FLOW_MAX_ATTEMPTS",
@@ -6507,10 +6509,11 @@ def refresh_publicvpnlist_cache(
             ):
                 live_flow_backoff_skipped += 1
                 continue
-            # Every real profile fetch consumes the same bounded live-flow
-            # budget.  Direct temporary_ovpn_url downloads must not bypass
-            # the attempt/deadline/circuit limits used by the API flow.
-            live_flow_enabled = bool(official_flow or config_url)
+            # The live-flow budget applies to the undocumented official
+            # Check -> token -> download sequence. Snapshot URLs remain
+            # bounded by scan/max-node limits but are never retried with the
+            # same short-lived link.
+            live_flow_enabled = official_flow
             if live_flow_enabled:
                 if (
                     live_flow_attempts >= PUBLICVPNLIST_LIVE_FLOW_MAX_ATTEMPTS
@@ -6561,12 +6564,7 @@ def refresh_publicvpnlist_cache(
                         deadline=live_flow_deadline,
                     )
                 else:
-                    config_text = fetch_publicvpnlist_config(
-                        config_url,
-                        metadata=flow_metadata,
-                        max_retries=1,
-                        deadline=live_flow_deadline,
-                    )
+                    config_text = fetch_publicvpnlist_config(config_url, metadata=flow_metadata)
                 expected_hash = str(effective_row.get("config_sha256") or "").strip().lower()
                 actual_hash = str(flow_metadata.get("response_sha256") or "").strip().lower()
                 if not re.fullmatch(r"[0-9a-f]{64}", actual_hash):
@@ -7444,6 +7442,7 @@ def fetch_publicvpnlist_candidates(
         return []
     source_kind, _source_value = publicvpnlist_source()
     cache = load_publicvpnlist_cache()
+    cache_refreshed = False
 
     def persist_candidate_stats(current_returned: int, matched: int) -> None:
         if not isinstance(cache, dict):
@@ -7505,6 +7504,7 @@ def fetch_publicvpnlist_candidates(
                     blocked_endpoint_keys=blocked_endpoint_keys,
                     target_countries=target_countries,
                 )
+                cache_refreshed = True
 
     if cache is None:
         cache = publicvpnlist_cache_default(publicvpnlist_source_hash())
@@ -7544,10 +7544,14 @@ def fetch_publicvpnlist_candidates(
 
     us_candidates: list[dict[str, Any]] = []
     ordered_rows: list[tuple[str, dict[str, Any], set[str]]] = []
-    # Do not use PublicVPNList profile data as a second risk cache.
-    # Every current US window goes through vpn_utils.enrich_ip_info(), which
-    # owns IP_RISK_CACHE_TTL_SECONDS and fails closed when refresh is missing.
-    us_classifications: dict[str, dict[str, Any]] = {}
+    # Only reuse the in-memory handoff produced by the refresh that
+    # happened in this same call.  It is not persisted and therefore cannot
+    # bypass vpn_utils' IP_RISK_CACHE_TTL_SECONDS on a later cache-only read.
+    us_classifications = (
+        dict(cache.get("_us_classifications"))
+        if cache_refreshed and isinstance(cache.get("_us_classifications"), dict)
+        else {}
+    )
     us_nonresidential = 0
     us_unclassified = 0
     fixed_filtered = 0
@@ -7605,7 +7609,10 @@ def fetch_publicvpnlist_candidates(
         rows_to_classify = [
             (key, row)
             for key, row, _metadata_keys in window
-            if str(row.get("country_short") or "").upper() == "US"
+            if (
+                str(row.get("country_short") or "").upper() == "US"
+                and key not in us_classifications
+            )
         ]
         if rows_to_classify:
             new_classifications, _classification_failed = publicvpnlist_enrich_us_rows(rows_to_classify)
