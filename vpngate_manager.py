@@ -6221,6 +6221,10 @@ def refresh_publicvpnlist_cache(
         records = publicvpnlist_payload_records(payload)
         api_meta = payload.get("_api_meta") if isinstance(payload, dict) and isinstance(payload.get("_api_meta"), dict) else {}
         if source_kind == "api":
+            # Rank the bounded API metadata before spending detail requests.
+            # Only the small, quality-ordered prefix needs official detail
+            # enrichment; never turn every metadata row into a live request.
+            records = publicvpnlist_order_api_candidate_records(records)
             records = publicvpnlist_api_enrich_records_for_download(records, api_meta)
             records = publicvpnlist_order_api_candidate_records(records)
         api_retry_cache = load_publicvpnlist_api_cache() if source_kind == "api" else None
@@ -6747,6 +6751,9 @@ def refresh_publicvpnlist_cache(
                 "priority_duplicate_skipped": priority_duplicate_skipped,
                 "actual_duplicate_skipped": actual_duplicate_skipped,
                 "api_records_fetched": int(api_meta.get("records_fetched") or len(records)) if source_kind == "api" else 0,
+                "api_detail_requests": int(api_meta.get("detail_requests") or 0) if source_kind == "api" else 0,
+                "api_detail_successes": int(api_meta.get("detail_successes") or 0) if source_kind == "api" else 0,
+                "api_detail_failures": int(api_meta.get("detail_failures") or 0) if source_kind == "api" else 0,
                 "network_records_fetched": int(api_meta.get("network_records_fetched") or 0) if source_kind == "api" else 0,
                 "cached_records_considered": int(api_meta.get("cached_records_considered") or 0) if source_kind == "api" else 0,
                 "cached_records_reused": int(api_meta.get("cached_records_reused") or 0) if source_kind == "api" else 0,
@@ -12203,8 +12210,12 @@ def restore_cached_publicvpnlist_nodes() -> int:
             node_id = str(node.get("id") or "")
             if not node_id or node_id in existing_ids:
                 continue
-            config_file = Path(str(node.get("config_file") or ""))
-            if config_file and node.get("config_text") and not config_file.exists():
+            config_path_text = str(node.get("config_file") or "").strip()
+            if config_path_text and node.get("config_text"):
+                config_file = Path(config_path_text)
+            else:
+                config_file = None
+            if config_file is not None and not config_file.exists():
                 try:
                     CONFIG_DIR.mkdir(exist_ok=True, parents=True, mode=0o700)
                     CONFIG_DIR.chmod(0o700)
