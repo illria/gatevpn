@@ -119,7 +119,7 @@ GET /dataset
 GET /health
 ```
 
-默认请求 `https://publicvpnlist.com/api/v1/servers`，参数包括 `protocol=openvpn`、`status=online`、`per_page=200`、`sort=last_checked`、`order=desc` 以及固定允许国家。API 的 metadata 数量和最终可连接节点数量分开统计。只有存在官方 `config_download_url`、`redistribution_allowed=true` 且 `source_url` 是直接 `.ovpn` 文件并通过实际响应校验，或已有有效配置缓存的记录，才会成为可连接节点。metadata 不能被拼接成伪造的 OpenVPN 配置。
+默认请求 `https://publicvpnlist.com/api/v1/servers`，参数包括 `protocol=openvpn`、`status=online`、`per_page=200`、`sort=last_checked`、`order=desc` 以及固定允许国家。API 的 metadata 数量和最终可连接节点数量分开统计。API 常常不返回可复用的 `config_download_url`；对带有 `public_id` 的候选，程序会按官网公开的 Check & download 流程执行：先请求同源实时检查，再 POST `get_token.php` 获取一次性下载令牌，随后下载并校验 `.ovpn`。令牌、Cookie 和短期下载 URL 只存在于本次内存流程中，不写入缓存、节点文件或日志。已有有效配置缓存会优先复用；缺少 public id、实时检查失败或令牌/配置校验失败的记录不会成为可连接节点。metadata 不能被拼接成伪造的 OpenVPN 配置。
 
 人工快照仍可作为高级覆盖方式，URL 和本地文件二选一，不得同时配置；清除覆盖后恢复 API 模式：
 
@@ -131,11 +131,11 @@ PUBLICVPNLIST_SNAPSHOT_URL=
 PUBLICVPNLIST_SNAPSHOT_FILE=
 ```
 
-配置人工 snapshot 后优先使用 snapshot；清除后恢复 API 模式，而不是停用来源。项目不会抓取 HTML 下载按钮、猜测一次性 token、自动操作 Export Builder 或绕过下载保护。`server_page_url` 只作为页面元数据，绝不当作 `.ovpn` 配置。
+配置人工 snapshot 后优先使用 snapshot；清除后恢复 API 模式，而不是停用来源。snapshot 中已有的 `temporary_ovpn_url` 仍按 HTTPS、域名/SSRF、重定向、配置和 endpoint 规则校验；API 模式使用官网确认过的同源 Check & download 接口，不抓取 HTML 下载按钮、不猜测一次性 token、不自动操作 Export Builder，也不绕过下载保护。`server_page_url` 只作为页面元数据，绝不当作 `.ovpn` 配置。
 
-API 支持每个固定国家的分页、请求/页面/记录/响应大小上限、`Content-Type` 校验、429 `Retry-After` 退避，以及 ETag/`If-None-Match`/`Last-Modified`/304 缓存复用。429 不会长时间阻塞抓取，而是保存有界 backoff 状态。API metadata 单独保存到 `publicvpnlist_api_cache.json`（0600），不保存 cookie、凭据、签名 URL、配置 URL 或配置正文。配置下载仍经过 HTTPS、域名/SSRF、重定向、OpenVPN endpoint 一致性和严格 sanitizer 校验；第三方 CDN 或配置域名必须加入 `PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS`，官方 API hostname 可直接作为默认允许域名。下载失败或 API 返回的记录没有配置 URL 时，会分别计入配置失败或 `metadata_only_skipped`，不会把 metadata 计为可连接节点。
+API 支持每个固定国家的分页、请求/页面/记录/响应大小上限、`Content-Type` 校验、429 `Retry-After` 退避，以及 ETag/`If-None-Match`/`Last-Modified`/304 缓存复用。429 不会长时间阻塞抓取，而是保存有界 backoff 状态。API metadata 单独保存到 `publicvpnlist_api_cache.json`（0600），不保存 cookie、凭据、签名 URL、配置 URL 或配置正文。官网 Check & download 的实时检查、token POST 和最终配置请求共享临时 CookieJar，并分别使用 JSON、表单和 OpenVPN 配置的 `Accept`/`Content-Type` 边界。配置下载仍经过 HTTPS、域名/SSRF、重定向、OpenVPN endpoint 一致性和严格 sanitizer 校验；若令牌响应跳转到第三方主机，该主机必须加入 `PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS`，官方 API/web hostname 可直接作为默认允许域名。下载失败、实时检查失败或缺少 public id 的记录不会把 metadata 计为可连接节点。
 
-PublicVPNList 的状态会显示 `mode`、`Metadata records`、`Connectable candidates`、`Metadata-only skipped`、最后 API 更新时间、API 状态和限流退避状态。若当前 API 所有记录都没有合法配置下载方式，日志会明确表示 API 已接入但本轮产生 0 个可连接节点；其他来源仍继续工作。快照 URL、query、签名和 token 不写入缓存、节点文件或日志。
+PublicVPNList 的状态会显示 `mode`、`Metadata records`、`Live checks`、`Connectable candidates`、`Metadata-only skipped`、最后 API 更新时间、API 状态和限流退避状态。若当前 API 的实时检查、一次性下载或配置校验没有产生可连接节点，日志会明确区分 metadata 与 connectable candidates；其他来源仍继续工作。快照 URL、query、签名、Cookie 和 token 不写入缓存、节点文件或日志。
 
 PublicVPNList 的固定允许国家为 `PH, US, FR, GB, ID, FI, DE, TW, AU, NL`，实际结果还会与“拉取地区过滤”取交集：
 

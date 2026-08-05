@@ -21,7 +21,7 @@ import urllib.error
 import urllib.request
 import email.utils
 from datetime import datetime, timezone
-from http import HTTPStatus
+from http import HTTPStatus, cookiejar
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -89,6 +89,10 @@ PUBLICVPNLIST_API_URL = os.environ.get(
     "PUBLICVPNLIST_API_URL",
     f"{PUBLICVPNLIST_API_BASE_URL or PUBLICVPNLIST_DEFAULT_API_BASE_URL}/servers",
 ).strip() or f"{PUBLICVPNLIST_API_BASE_URL or PUBLICVPNLIST_DEFAULT_API_BASE_URL}/servers"
+# The public download page uses same-origin endpoints for the live check and
+# one-time profile token.  This is a confirmed official web origin, not a
+# guessed CDN or a permanent profile feed.
+PUBLICVPNLIST_OFFICIAL_WEB_BASE_URL = "https://publicvpnlist.com/"
 PUBLICVPNLIST_ENABLED = _publicvpnlist_env_bool("PUBLICVPNLIST_ENABLED", True)
 PUBLICVPNLIST_SNAPSHOT_URL = os.environ.get("PUBLICVPNLIST_SNAPSHOT_URL", "").strip()
 PUBLICVPNLIST_SNAPSHOT_FILE = os.environ.get("PUBLICVPNLIST_SNAPSHOT_FILE", "").strip()
@@ -2386,8 +2390,15 @@ def publicvpnlist_http_get(
     opener: urllib.request.OpenerDirector | None = None,
     metadata: dict[str, Any] | None = None,
     extra_headers: dict[str, str] | None = None,
+    data: bytes | None = None,
+    method: str | None = None,
 ) -> bytes:
-    """Fetch a bounded response and reject only clearly identified HTML."""
+    """Fetch a bounded response and reject only clearly identified HTML.
+
+    ``data``/``method`` are intentionally optional so the same bounded reader
+    can perform the official PublicVPNList form POST used to mint a one-time
+    download token.  Existing snapshot and profile callers remain GETs.
+    """
 
     headers = {
         "User-Agent": PUBLICVPNLIST_USER_AGENT,
@@ -2395,7 +2406,7 @@ def publicvpnlist_http_get(
     }
     if extra_headers:
         headers.update({str(key): str(value) for key, value in extra_headers.items()})
-    request = urllib.request.Request(url, headers=headers)
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
     open_url = opener.open if opener is not None else urllib.request.urlopen
     with open_url(request, timeout=timeout) as response:
         if metadata is not None:
@@ -4242,17 +4253,28 @@ def publicvpnlist_explicit_download_hosts() -> frozenset[str]:
 
 
 def publicvpnlist_allowed_download_hosts() -> frozenset[str]:
-    """Return explicit hosts plus the official API host when using API mode."""
+    """Return explicit hosts plus confirmed PublicVPNList API web origins."""
 
     explicit = publicvpnlist_explicit_download_hosts()
     source_kind, source_value = publicvpnlist_source()
     if source_kind == "api":
+        hosts = set(explicit)
         try:
-            host = (urllib.parse.urlsplit(source_value).hostname or "").lower().rstrip(".")
+            api_host = (urllib.parse.urlsplit(source_value).hostname or "").lower().rstrip(".")
         except ValueError:
-            host = ""
-        if host:
-            return frozenset(set(explicit) | {host})
+            api_host = ""
+        if api_host:
+            hosts.add(api_host)
+        try:
+            official_host = (
+                urllib.parse.urlsplit(PUBLICVPNLIST_OFFICIAL_WEB_BASE_URL).hostname
+                or ""
+            ).lower().rstrip(".")
+        except ValueError:
+            official_host = ""
+        if official_host:
+            hosts.add(official_host)
+        return frozenset(hosts)
     return explicit
 
 
@@ -4343,14 +4365,24 @@ class PublicVPNListRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def fetch_publicvpnlist_config(url: str, metadata: dict[str, Any] | None = None) -> str:
+def fetch_publicvpnlist_config(
+    url: str,
+    metadata: dict[str, Any] | None = None,
+    cookie_jar: cookiejar.CookieJar | None = None,
+) -> str:
     """Download one short-lived profile with the same bounded retry policy."""
 
     initial_download_host = publicvpnlist_validate_download_url(url)
     last_error: Exception | None = None
     for attempt in range(1, PUBLICVPNLIST_MAX_RETRIES + 1):
         redirect_handler = PublicVPNListRedirectHandler()
-        opener = urllib.request.build_opener(redirect_handler)
+        if cookie_jar is None:
+            opener = urllib.request.build_opener(redirect_handler)
+        else:
+            opener = urllib.request.build_opener(
+                urllib.request.HTTPCookieProcessor(cookie_jar),
+                redirect_handler,
+            )
         attempt_metadata: dict[str, Any] = {}
         try:
             text = publicvpnlist_http_get(
@@ -4385,6 +4417,140 @@ def fetch_publicvpnlist_config(url: str, metadata: dict[str, Any] | None = None)
             if attempt < PUBLICVPNLIST_MAX_RETRIES:
                 time.sleep(min(0.5 * attempt, 1.0))
     raise PublicVPNListSnapshotError(str(last_error or "配置下载没有返回数据")) from last_error
+
+
+def publicvpnlist_official_web_base_url() -> str:
+    """Return the confirmed same-origin web base used by the live download flow."""
+
+    raw = str(PUBLICVPNLIST_OFFICIAL_WEB_BASE_URL or "").strip()
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+    except ValueError:
+        parsed = None
+    if (
+        parsed is None
+        or parsed.scheme.lower() != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise PublicVPNListSnapshotError("PublicVPNList 官方下载站点配置无效")
+    return raw.rstrip("/") + "/"
+
+
+def _publicvpnlist_json_response(
+    body: bytes,
+    metadata: dict[str, Any],
+    description: str,
+) -> dict[str, Any]:
+    content_type = str(metadata.get("content_type") or "").split(";", 1)[0].strip().lower()
+    if content_type and content_type not in {"application/json", "text/json"}:
+        raise PublicVPNListSnapshotError(f"PublicVPNList {description} 响应不是 JSON")
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise PublicVPNListSnapshotError(f"PublicVPNList {description} 响应 JSON 无效") from exc
+    if not isinstance(payload, dict):
+        raise PublicVPNListSnapshotError(f"PublicVPNList {description} 响应结构无效")
+    return payload
+
+
+def fetch_publicvpnlist_official_config(
+    row: dict[str, Any],
+    metadata: dict[str, Any] | None = None,
+) -> str:
+    """Run the official same-origin Check -> token -> .ovpn flow.
+
+    The API deliberately omits a reusable profile URL.  The public download
+    page first calls ``test_server.php`` and then POSTs the public id to
+    ``get_token.php``.  Cookie state is kept only in this call and the token
+    URL is never returned to callers or written to durable state.
+    """
+
+    public_id = str(row.get("id") or row.get("public_id") or "").strip()
+    if not public_id:
+        raise PublicVPNListSnapshotError("API metadata 缺少 public id，无法执行官方下载流程")
+    base_url = publicvpnlist_official_web_base_url()
+    check_url = urllib.parse.urljoin(base_url, "test_server.php")
+    check_url = f"{check_url}?{urllib.parse.urlencode({'id': public_id, '_': str(int(time.time() * 1000))})}"
+    token_url = urllib.parse.urljoin(base_url, "get_token.php")
+
+    # Each request is validated before opening.  The official web host is
+    # allowlisted only while API mode is active; an unexpected CDN still has
+    # to be explicitly added to PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS.
+    publicvpnlist_validate_download_url(check_url)
+    publicvpnlist_validate_download_url(token_url)
+    session_cookies = cookiejar.CookieJar()
+    live_redirects = PublicVPNListRedirectHandler()
+    live_opener = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(session_cookies),
+        live_redirects,
+    )
+    check_metadata: dict[str, Any] = {}
+    check_body = publicvpnlist_http_get(
+        check_url,
+        timeout=PUBLICVPNLIST_CONFIG_TIMEOUT_SECONDS,
+        max_bytes=min(PUBLICVPNLIST_MAX_RESPONSE_BYTES, 512 * 1024),
+        accept="application/json",
+        opener=live_opener,
+        metadata=check_metadata,
+        extra_headers={"X-Requested-With": "XMLHttpRequest"},
+    )
+    check_payload = _publicvpnlist_json_response(check_body, check_metadata, "实时检查")
+    check_status = str(check_payload.get("status") or "").strip().lower()
+    if not check_payload.get("ok") or check_status != "ok":
+        raise PublicVPNListSnapshotError("PublicVPNList 实时检查未通过")
+
+    token_metadata: dict[str, Any] = {}
+    token_body = urllib.parse.urlencode({"id": public_id}).encode("ascii")
+    token_response = publicvpnlist_http_get(
+        token_url,
+        timeout=PUBLICVPNLIST_CONFIG_TIMEOUT_SECONDS,
+        max_bytes=min(PUBLICVPNLIST_MAX_RESPONSE_BYTES, 512 * 1024),
+        accept="application/json",
+        opener=live_opener,
+        metadata=token_metadata,
+        extra_headers={
+            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+            "X-Requested-With": "XMLHttpRequest",
+        },
+        data=token_body,
+        method="POST",
+    )
+    token_payload = _publicvpnlist_json_response(token_response, token_metadata, "临时令牌")
+    returned_url = str(token_payload.get("url") or "").strip()
+    token_value = str(token_payload.get("token") or "").strip()
+    if returned_url:
+        download_url = urllib.parse.urljoin(token_url, returned_url)
+    elif token_value:
+        download_url = urllib.parse.urljoin(
+            base_url,
+            f"download.php?{urllib.parse.urlencode({'token': token_value})}",
+        )
+    else:
+        raise PublicVPNListSnapshotError("PublicVPNList 临时令牌响应缺少下载地址")
+    initial_download_host = publicvpnlist_validate_download_url(download_url)
+
+    flow_metadata = metadata if metadata is not None else {}
+    flow_metadata.update(
+        {
+            "official_flow": True,
+            "live_check_status": check_status,
+            "live_check_redirect_count": live_redirects.redirect_count,
+            "token_generated": True,
+            "initial_download_host": initial_download_host,
+        }
+    )
+    # fetch_publicvpnlist_config performs the final content-type, redirect,
+    # OpenVPN and endpoint validation.  Reuse the same CookieJar because the
+    # official site may bind the one-time token to its browser session.
+    return fetch_publicvpnlist_config(
+        download_url,
+        metadata=flow_metadata,
+        cookie_jar=session_cookies,
+    )
 
 
 def publicvpnlist_speed_bps(value: Any) -> int:
@@ -5151,6 +5317,10 @@ def publicvpnlist_web_status() -> dict[str, Any]:
         "config_url_available": stat_int("config_url_available"),
         "cache_reused": stat_int("cache_reused"),
         "config_downloaded": stat_int("config_downloaded"),
+        "live_check_attempted": stat_int("live_check_attempted"),
+        "live_check_succeeded": stat_int("live_check_succeeded"),
+        "live_check_failed": stat_int("live_check_failed"),
+        "token_generated": stat_int("token_generated"),
         "profiles_downloaded": profiles_downloaded,
         "etag_cache_hits": etag_cache_hits,
         "last_api_update": float(api_cache.get("last_success_at") or (cache or {}).get("last_api_update") or 0),
@@ -5509,6 +5679,8 @@ def refresh_publicvpnlist_cache(
             return cache
         records = publicvpnlist_payload_records(payload)
         api_meta = payload.get("_api_meta") if isinstance(payload, dict) and isinstance(payload.get("_api_meta"), dict) else {}
+        if source_kind == "api":
+            records = publicvpnlist_order_api_candidate_records(records)
         api_retry_cache = load_publicvpnlist_api_cache() if source_kind == "api" else None
         api_retry_state_changed = False
     except Exception as exc:
@@ -5532,6 +5704,10 @@ def refresh_publicvpnlist_cache(
             "config_url_available": 0,
             "cache_reused": 0,
             "config_downloaded": 0,
+            "live_check_attempted": 0,
+            "live_check_succeeded": 0,
+            "live_check_failed": 0,
+            "token_generated": 0,
             "connectable_candidates": 0,
             "last_refresh_connectable_candidates": 0,
             "usable_cached_profiles": 0,
@@ -5596,6 +5772,10 @@ def refresh_publicvpnlist_cache(
     config_url_available = 0
     cache_reused = 0
     config_downloaded = 0
+    live_check_attempted = 0
+    live_check_succeeded = 0
+    live_check_failed = 0
+    token_generated = 0
     us_residential_accepted = 0
     endpoint_dns_cache: dict[str, str | None] = {}
     metadata_seen_endpoint_keys: set[str] = set()
@@ -5608,7 +5788,8 @@ def refresh_publicvpnlist_cache(
         nonlocal classification_failed, partial_failure, config_download_failed
         nonlocal us_rejected, max_nodes_reached, actual_duplicate_skipped
         nonlocal metadata_only_skipped, config_url_available, cache_reused, config_downloaded
-        nonlocal us_residential_accepted
+        nonlocal us_residential_accepted, live_check_attempted, live_check_succeeded
+        nonlocal live_check_failed, token_generated
         nonlocal api_retry_state_changed
         if not window:
             return False
@@ -5682,22 +5863,40 @@ def refresh_publicvpnlist_cache(
                     continue
 
             config_url = str(effective_row.get("temporary_ovpn_url") or "").strip()
-            if not config_url:
+            official_flow = source_kind == "api" and not config_url
+            if not config_url and not official_flow:
+                metadata_only_skipped += 1
+                if api_retry_cache is not None and not effective_row.get("_pvl_api_not_modified"):
+                    publicvpnlist_api_clear_profile_retry(api_retry_cache, effective_row)
+                    api_retry_state_changed = True
+                continue
+            if official_flow and not str(effective_row.get("id") or "").strip():
                 metadata_only_skipped += 1
                 if api_retry_cache is not None and not effective_row.get("_pvl_api_not_modified"):
                     publicvpnlist_api_clear_profile_retry(api_retry_cache, effective_row)
                     api_retry_state_changed = True
                 continue
             config_url_available += 1
+            official_flow_completed = False
             try:
-                config_text = fetch_publicvpnlist_config(config_url)
+                flow_metadata: dict[str, Any] = {}
+                if official_flow:
+                    live_check_attempted += 1
+                    config_text = fetch_publicvpnlist_official_config(effective_row, metadata=flow_metadata)
+                    live_check_succeeded += 1
+                    if flow_metadata.get("token_generated"):
+                        token_generated += 1
+                    official_flow_completed = True
+                else:
+                    config_text = fetch_publicvpnlist_config(config_url)
                 expected_hash = str(effective_row.get("config_sha256") or "").strip().lower()
+                actual_hash = hashlib.sha256(config_text.encode("utf-8")).hexdigest()
                 if expected_hash:
                     if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
                         raise PublicVPNListSnapshotError("API config_sha256 格式无效")
-                    actual_hash = hashlib.sha256(config_text.encode("utf-8")).hexdigest()
                     if actual_hash != expected_hash:
                         raise PublicVPNListSnapshotError("下载配置 config_sha256 不匹配")
+                effective_row["config_sha256"] = actual_hash
                 node = publicvpnlist_row_to_node(effective_row, config_text)
                 if not node:
                     raise PublicVPNListSnapshotError("OpenVPN remote/port/proto 校验失败")
@@ -5726,15 +5925,27 @@ def refresh_publicvpnlist_cache(
             except Exception as exc:
                 partial_failure = True
                 config_download_failed += 1
+                if official_flow and not official_flow_completed:
+                    live_check_failed += 1
                 if api_retry_cache is not None:
                     publicvpnlist_api_record_profile_retry(api_retry_cache, effective_row, now=now)
                     api_retry_state_changed = True
+                failure_label = (
+                    "官网 Check & download 流程失败"
+                    if official_flow
+                    else "temporary_ovpn_url 失效或配置校验失败"
+                )
+                failure_guidance = (
+                    "API 行将等待下一轮实时检查"
+                    if official_flow
+                    else "人工快照行请重新生成新的临时配置下载链接"
+                )
                 log_to_json(
                     "WARNING",
                     "PublicVPNList",
-                    f"temporary_ovpn_url 失效或配置校验失败，保留旧 profile（如有） {effective_row.get('id') or effective_row.get('host')}；"
+                    f"{failure_label}，保留旧 profile（如有） {effective_row.get('id') or effective_row.get('host')}；"
                     f"错误类型={type(exc).__name__}；"
-                    "请重新生成新的临时快照或配置下载链接",
+                    f"{failure_guidance}",
                 )
         return False
 
@@ -5806,6 +6017,10 @@ def refresh_publicvpnlist_cache(
                 "config_url_available": config_url_available,
                 "cache_reused": cache_reused,
                 "config_downloaded": config_downloaded,
+                "live_check_attempted": live_check_attempted,
+                "live_check_succeeded": live_check_succeeded,
+                "live_check_failed": live_check_failed,
+                "token_generated": token_generated,
                 "connectable_candidates": len(candidate_profiles),
                 "last_refresh_connectable_candidates": len(candidate_profiles),
                 "usable_cached_profiles": 0,
@@ -5860,8 +6075,10 @@ def refresh_publicvpnlist_cache(
                 "INFO",
                 "PublicVPNList",
                 f"PublicVPNList API 已接入并读取 {len(records)} 条 metadata，但本轮产生 0 个可连接节点；"
-                f"metadata_only_skipped={metadata_only_skipped}，US 拒绝 {us_rejected}，"
-                "没有官方可自动下载的 OpenVPN 配置；server_page_url/download_page_url 未被当作配置使用，旧缓存未被覆盖",
+                f"metadata_only_skipped={metadata_only_skipped}，live_check_attempted={live_check_attempted}，"
+                f"live_check_failed={live_check_failed}，US 拒绝 {us_rejected}；"
+                "官网实时检查或一次性配置下载未产生可连接 profile；"
+                "server_page_url/download_page_url 未被当作配置使用，旧缓存未被覆盖",
             )
         else:
             log_to_json(
@@ -5885,6 +6102,8 @@ def refresh_publicvpnlist_cache(
         f"fixed-country accepted={eligible_scanned}，target filtered=按读取阶段处理，"
         f"metadata-only skipped={metadata_only_skipped}，config URL available={config_url_available}，"
         f"cache reused={cache_reused}，config downloaded={config_downloaded}，"
+        f"live check attempted={live_check_attempted}，live check succeeded={live_check_succeeded}，"
+        f"live check failed={live_check_failed}，token generated={token_generated}，"
         f"US residential accepted={us_residential_accepted}，US rejected={us_rejected}，"
         f"raw scan={raw_scanned}/{PUBLICVPNLIST_MAX_RAW_ROWS}，"
         f"eligible={eligible_scanned}/{PUBLICVPNLIST_MAX_SCAN_ROWS}，"
@@ -6354,6 +6573,106 @@ def publicvpnlist_select_best_endpoint_records(
         winners.append((original_index, winner))
     winners.sort(key=lambda item: item[0])
     return [row for _index, row in winners]
+
+
+def _publicvpnlist_api_candidate_selection_key(
+    record: dict[str, Any],
+    original_index: int,
+) -> tuple[Any, ...]:
+    """Rank API metadata before spending a live-check/token request."""
+
+    def numeric(*names: str) -> float:
+        for name in names:
+            value = record.get(name)
+            if value in (None, ""):
+                continue
+            try:
+                number = float(str(value).strip())
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(number):
+                return number
+        return 0.0
+
+    freshness = str(record.get("freshness_status") or "").strip().lower().replace("-", "_")
+    availability = str(record.get("availability_status") or "").strip().lower().replace("-", "_")
+    freshness_rank = {"fresh": 3, "recent": 2}.get(freshness, 0)
+    availability_rank = {
+        "online": 3,
+        "available": 2,
+        "up": 2,
+        "healthy": 2,
+    }.get(availability, 0)
+    quality = numeric("technical_quality_score", "quality", "score")
+    speed = numeric(
+        "checker_measured_throughput_mbps",
+        "speed_mbps",
+        "source_reported_speed_mbps",
+        "speed",
+    )
+    latency = numeric(
+        "checker_measured_tunnel_rtt_ms",
+        "latency_ms",
+        "source_reported_ping_ms",
+        "latency",
+        "ping",
+    )
+    checked_at = _publicvpnlist_api_time(
+        record.get("checked_at")
+        or record.get("checkedAt")
+        or record.get("last_checked_at")
+    )
+    public_id = str(record.get("id") or record.get("public_id") or "").strip()
+    return (
+        -quality,
+        -freshness_rank,
+        -availability_rank,
+        1 if latency <= 0 else 0,
+        latency if latency > 0 else float("inf"),
+        -speed,
+        -checked_at,
+        public_id,
+        original_index,
+    )
+
+
+def publicvpnlist_order_api_candidate_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Interleave fixed countries while ranking each country's best rows.
+
+    This keeps the API refresh source-wide and target-independent, but avoids
+    spending the bounded live-check budget on one country's raw page order.
+    """
+
+    grouped: dict[str, list[tuple[int, dict[str, Any]]]] = {
+        country: [] for country in PUBLICVPNLIST_ALLOWED_COUNTRY_ORDER
+    }
+    remainder: list[tuple[int, dict[str, Any]]] = []
+    for original_index, record in enumerate(records):
+        if not isinstance(record, dict):
+            continue
+        country_short, _country_name = _publicvpnlist_country_values(record)
+        if country_short in grouped:
+            grouped[country_short].append((original_index, record))
+        else:
+            remainder.append((original_index, record))
+    for country in grouped:
+        grouped[country].sort(
+            key=lambda item: _publicvpnlist_api_candidate_selection_key(item[1], item[0])
+        )
+    ordered: list[dict[str, Any]] = []
+    round_index = 0
+    while True:
+        added = False
+        for country in PUBLICVPNLIST_ALLOWED_COUNTRY_ORDER:
+            rows = grouped[country]
+            if round_index < len(rows):
+                ordered.append(rows[round_index][1])
+                added = True
+        if not added:
+            break
+        round_index += 1
+    ordered.extend(record for _index, record in sorted(remainder, key=lambda item: item[0]))
+    return ordered
 
 
 def fetch_publicvpnlist_candidates(
@@ -10187,7 +10506,7 @@ function renderPublicVPNListSettings(data) {
   const lastApiUpdate = status.last_api_update ? new Date(status.last_api_update * 1000).toLocaleString() : "未更新";
   const mode = status.mode || (status.source_kind === "api" ? "api" : "cache_only");
   const rateLimit = status.api_rate_limit || {};
-  statusEl.textContent = `PublicVPNList mode: ${mode}；Network records fetched: ${status.network_records_fetched || 0}；Cached records considered: ${status.cached_records_considered || 0}；Cached records reused: ${status.cached_records_reused || 0}；Metadata records returned: ${status.metadata_records_returned || 0}；Connectable candidates: ${status.connectable_candidates || 0}；Metadata-only skipped: ${status.metadata_only_skipped || 0}；Last API update: ${lastApiUpdate}；API status: ${apiStatus}；Rate-limit/backoff: ${rateLimit.backoff_seconds || 0}s；${status.status_label || "PublicVPNList"}；${snapshotState}；下载域名：${hostState}；缓存 profile：${cache.profile_count || 0}；effective source active: ${active}；refresh_ready: ${refreshReady}；cache_only: ${cacheOnly}${readiness}`;
+  statusEl.textContent = `PublicVPNList mode: ${mode}；Network records fetched: ${status.network_records_fetched || 0}；Cached records considered: ${status.cached_records_considered || 0}；Cached records reused: ${status.cached_records_reused || 0}；Metadata records returned: ${status.metadata_records_returned || 0}；Live checks: ${status.live_check_succeeded || 0}/${status.live_check_attempted || 0}；Connectable candidates: ${status.connectable_candidates || 0}；Metadata-only skipped: ${status.metadata_only_skipped || 0}；Last API update: ${lastApiUpdate}；API status: ${apiStatus}；Rate-limit/backoff: ${rateLimit.backoff_seconds || 0}s；${status.status_label || "PublicVPNList"}；${snapshotState}；下载域名：${hostState}；缓存 profile：${cache.profile_count || 0}；effective source active: ${active}；refresh_ready: ${refreshReady}；cache_only: ${cacheOnly}${readiness}`;
   const fileEl = $("settings_publicvpnlist_file");
   const hostsEl = $("settings_publicvpnlist_hosts");
   const urlEl = $("settings_publicvpnlist_url");

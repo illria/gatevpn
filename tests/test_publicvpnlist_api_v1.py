@@ -119,6 +119,18 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
             self.assertEqual(vpngate_manager.publicvpnlist_source(), ("", ""))
             self.assertNotIn("publicvpnlist", vpngate_manager.get_node_sources())
 
+    def test_api_candidate_selection_ranks_quality_and_interleaves_countries(self):
+        ph_low = self.record("ph-low", country="PH", with_config=False)
+        ph_low.update({"technical_quality_score": 20, "speed_mbps": 5, "latency_ms": 120})
+        ph_high = self.record("ph-high", country="PH", with_config=False)
+        ph_high.update({"technical_quality_score": 99, "speed_mbps": 80, "latency_ms": 10})
+        fr = self.record("fr-best", country="FR", with_config=False)
+        fr.update({"technical_quality_score": 80, "speed_mbps": 40, "latency_ms": 20})
+
+        ordered = vpngate_manager.publicvpnlist_order_api_candidate_records([ph_low, ph_high, fr])
+
+        self.assertEqual([row["id"] for row in ordered], ["ph-high", "fr-best", "ph-low"])
+
     def test_api_fetches_each_country_with_bounded_query_and_maps_known_fields(self):
         calls = []
 
@@ -1558,15 +1570,102 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
         )
         sleep.assert_not_called()
 
-    def test_metadata_only_record_is_not_treated_as_connectable(self):
+    def test_metadata_without_public_id_is_not_treated_as_connectable(self):
         row = self.record(with_config=False)
+        row["id"] = ""
         with mock.patch.object(
             vpngate_manager, "fetch_publicvpnlist_snapshot", return_value={"data": [row]}
         ), mock.patch.object(
             vpngate_manager, "fetch_publicvpnlist_config", side_effect=AssertionError("metadata-only must not download")
+        ), mock.patch.object(
+            vpngate_manager, "fetch_publicvpnlist_official_config", side_effect=AssertionError("missing id must not run live check")
         ), mock.patch.object(vpngate_manager, "log_to_json"):
             result = vpngate_manager.fetch_publicvpnlist_candidates(["PH"], set())
         self.assertEqual(result, [])
+
+    def test_api_metadata_runs_official_live_check_token_and_profile_download(self):
+        row = self.record("live-ph", with_config=False)
+        row["config_sha256"] = ""
+        calls = []
+        config = (
+            "client\nproto tcp\nremote live-ph.fixture.invalid 443\n"
+            "<ca>\nCERT\n</ca>\n"
+        )
+
+        def http_get(url, metadata=None, accept=None, extra_headers=None, data=None, method=None, **_kwargs):
+            parsed = urlsplit(url)
+            calls.append(
+                {
+                    "url": url,
+                    "path": parsed.path,
+                    "query": parse_qs(parsed.query),
+                    "accept": accept,
+                    "headers": dict(extra_headers or {}),
+                    "data": data,
+                    "method": method,
+                }
+            )
+            if parsed.path == "/test_server.php":
+                metadata.update({"status": 200, "content_type": "application/json"})
+                return json.dumps({"ok": True, "status": "ok"}).encode()
+            if parsed.path == "/get_token.php":
+                metadata.update({"status": 200, "content_type": "application/json"})
+                return json.dumps({"ok": True, "token": "fixture-one-time-token"}).encode()
+            if parsed.path == "/download.php":
+                metadata.update({"status": 200, "content_type": "application/x-openvpn-profile"})
+                return config.encode()
+            raise AssertionError(f"unexpected PublicVPNList URL path: {parsed.path}")
+
+        with mock.patch.object(
+            vpngate_manager, "fetch_publicvpnlist_snapshot", return_value={"data": [row]}
+        ), mock.patch.object(
+            vpngate_manager, "publicvpnlist_download_host_addresses", return_value=("93.184.216.34",)
+        ), mock.patch.object(
+            vpngate_manager, "publicvpnlist_http_get", side_effect=http_get
+        ), mock.patch.object(vpngate_manager, "log_to_json"):
+            result = vpngate_manager.fetch_publicvpnlist_candidates(["PH"], set())
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual([call["path"] for call in calls], ["/test_server.php", "/get_token.php", "/download.php"])
+        self.assertEqual(calls[0]["query"]["id"], ["live-ph"])
+        self.assertEqual(calls[0]["accept"], "application/json")
+        self.assertEqual(calls[0]["headers"]["X-Requested-With"], "XMLHttpRequest")
+        self.assertEqual(calls[1]["method"], "POST")
+        self.assertEqual(calls[1]["data"], b"id=live-ph")
+        self.assertEqual(calls[1]["headers"]["Content-Type"], "application/x-www-form-urlencoded;charset=UTF-8")
+        self.assertEqual(calls[2]["accept"], "application/x-openvpn-profile,text/plain")
+        cache_text = self.profile_cache_file.read_text(encoding="utf-8")
+        self.assertNotIn("fixture-one-time-token", cache_text)
+        self.assertNotIn("download.php", cache_text)
+        stats = vpngate_manager.load_publicvpnlist_cache()["last_refresh_stats"]
+        self.assertEqual(stats["live_check_attempted"], 1)
+        self.assertEqual(stats["live_check_succeeded"], 1)
+        self.assertEqual(stats["token_generated"], 1)
+
+    def test_live_check_failure_is_fail_closed_without_token_request(self):
+        row = self.record("live-failed", with_config=False)
+        calls = []
+
+        def http_get(url, metadata=None, **_kwargs):
+            calls.append(urlsplit(url).path)
+            metadata.update({"status": 200, "content_type": "application/json"})
+            return json.dumps({"ok": False, "status": "fail"}).encode()
+
+        with mock.patch.object(
+            vpngate_manager, "fetch_publicvpnlist_snapshot", return_value={"data": [row]}
+        ), mock.patch.object(
+            vpngate_manager, "publicvpnlist_download_host_addresses", return_value=("93.184.216.34",)
+        ), mock.patch.object(
+            vpngate_manager, "publicvpnlist_http_get", side_effect=http_get
+        ), mock.patch.object(vpngate_manager, "log_to_json"):
+            result = vpngate_manager.fetch_publicvpnlist_candidates(["PH"], set())
+
+        self.assertEqual(result, [])
+        self.assertEqual(calls, ["/test_server.php"])
+        stats = vpngate_manager.load_publicvpnlist_cache()["last_refresh_stats"]
+        self.assertEqual(stats["live_check_attempted"], 1)
+        self.assertEqual(stats["live_check_succeeded"], 0)
+        self.assertEqual(stats["token_generated"], 0)
 
     def test_source_url_is_direct_only_when_redistribution_is_allowed(self):
         row = self.record(with_config=False)
