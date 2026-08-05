@@ -6353,6 +6353,11 @@ def refresh_publicvpnlist_cache(
         if isinstance(api_retry_cache, dict)
         else 0,
     )
+    live_flow_backoff_until = (
+        _publicvpnlist_api_time(api_retry_cache.get("live_flow_backoff_until"))
+        if isinstance(api_retry_cache, dict)
+        else 0.0
+    )
     live_flow_deadline = (
         time.monotonic() + PUBLICVPNLIST_LIVE_FLOW_MAX_SECONDS
         if PUBLICVPNLIST_LIVE_FLOW_MAX_SECONDS > 0
@@ -6396,6 +6401,7 @@ def refresh_publicvpnlist_cache(
         nonlocal profile_download_attempted, profile_downloaded, profile_validation_failed
         nonlocal live_flow_attempts, live_flow_failures, live_flow_budget_exhausted, live_flow_circuit_open
         nonlocal live_flow_backoff_skipped, live_flow_deadline_exceeded, live_flow_mapping_missing
+        nonlocal live_flow_backoff_until
         nonlocal api_retry_state_changed
         if not window:
             return False
@@ -6501,7 +6507,11 @@ def refresh_publicvpnlist_cache(
             ):
                 live_flow_backoff_skipped += 1
                 continue
-            if official_flow:
+            # Every real profile fetch consumes the same bounded live-flow
+            # budget.  Direct temporary_ovpn_url downloads must not bypass
+            # the attempt/deadline/circuit limits used by the API flow.
+            live_flow_enabled = bool(official_flow or config_url)
+            if live_flow_enabled:
                 if (
                     live_flow_attempts >= PUBLICVPNLIST_LIVE_FLOW_MAX_ATTEMPTS
                     or (
@@ -6514,6 +6524,14 @@ def refresh_publicvpnlist_cache(
                         PUBLICVPNLIST_LIVE_FLOW_MAX_FAILURES > 0
                         and live_flow_failures >= PUBLICVPNLIST_LIVE_FLOW_MAX_FAILURES
                     )
+                    return True
+                if (
+                    official_flow
+                    and source_kind == "api"
+                    and live_flow_backoff_until > time.time()
+                ):
+                    live_flow_backoff_skipped += 1
+                    live_flow_circuit_open = True
                     return True
                 if live_flow_deadline is not None and time.monotonic() >= live_flow_deadline:
                     live_flow_budget_exhausted = True
@@ -6532,7 +6550,8 @@ def refresh_publicvpnlist_cache(
                         )
                     )
                 live_flow_attempts += 1
-                live_check_attempted += 1
+                if official_flow:
+                    live_check_attempted += 1
             try:
                 flow_metadata: dict[str, Any] = {}
                 if official_flow:
@@ -6542,7 +6561,12 @@ def refresh_publicvpnlist_cache(
                         deadline=live_flow_deadline,
                     )
                 else:
-                    config_text = fetch_publicvpnlist_config(config_url, metadata=flow_metadata)
+                    config_text = fetch_publicvpnlist_config(
+                        config_url,
+                        metadata=flow_metadata,
+                        max_retries=1,
+                        deadline=live_flow_deadline,
+                    )
                 expected_hash = str(effective_row.get("config_sha256") or "").strip().lower()
                 actual_hash = str(flow_metadata.get("response_sha256") or "").strip().lower()
                 if not re.fullmatch(r"[0-9a-f]{64}", actual_hash):
@@ -6580,12 +6604,15 @@ def refresh_publicvpnlist_cache(
                 # profile construction all succeeded.  A downloaded but
                 # invalid profile must still contribute to failure streaks.
                 account_flow_metadata(flow_metadata)
-                if official_flow:
+                if live_flow_enabled:
+                    # Reset the in-memory breaker only after the downloaded
+                    # bytes, hash, endpoint, sanitizer and profile assembly
+                    # all pass.  A merely received response is not success.
                     live_flow_failures = 0
+                    live_flow_backoff_until = 0.0
                     if api_retry_cache is not None:
                         api_retry_cache["live_flow_failure_streak"] = 0
-                        if float(api_retry_cache.get("live_flow_backoff_until") or 0) <= now:
-                            api_retry_cache["live_flow_backoff_until"] = 0.0
+                        api_retry_cache["live_flow_backoff_until"] = 0.0
                         api_retry_state_changed = True
                 if len(candidate_profiles) >= PUBLICVPNLIST_MAX_NODES:
                     max_nodes_reached = True
@@ -6604,6 +6631,8 @@ def refresh_publicvpnlist_cache(
                 if official_flow and not flow_metadata.get("live_check_succeeded"):
                     live_check_failed += 1
                 retry_after_seconds = _publicvpnlist_retry_after_seconds(flow_metadata.get("retry_after"))
+                if live_flow_enabled:
+                    live_flow_failures += 1
                 if api_retry_cache is not None:
                     publicvpnlist_api_record_profile_retry(
                         api_retry_cache,
@@ -6611,8 +6640,7 @@ def refresh_publicvpnlist_cache(
                         now=now,
                         retry_after_seconds=retry_after_seconds or None,
                     )
-                    if official_flow:
-                        live_flow_failures += 1
+                    if live_flow_enabled:
                         api_retry_cache["live_flow_failure_streak"] = live_flow_failures
                         api_retry_cache["live_flow_last_status"] = parse_int(flow_metadata.get("status"))
                         if parse_int(flow_metadata.get("status")) == HTTPStatus.TOO_MANY_REQUESTS:
@@ -6620,13 +6648,12 @@ def refresh_publicvpnlist_cache(
                                 retry_after_seconds or 2,
                                 PUBLICVPNLIST_API_MAX_RETRY_AFTER_SECONDS,
                             )
-                            api_retry_cache["live_flow_backoff_until"] = max(
-                                float(api_retry_cache.get("live_flow_backoff_until") or 0),
+                            live_flow_backoff_until = max(
+                                live_flow_backoff_until,
                                 now + wait_seconds,
                             )
+                            api_retry_cache["live_flow_backoff_until"] = live_flow_backoff_until
                     api_retry_state_changed = True
-                elif official_flow:
-                    live_flow_failures += 1
                 failure_label = (
                     "官网 Check & download 流程失败"
                     if official_flow
@@ -6645,7 +6672,7 @@ def refresh_publicvpnlist_cache(
                     f"{failure_guidance}",
                 )
                 if (
-                    official_flow
+                    live_flow_enabled
                     and PUBLICVPNLIST_LIVE_FLOW_MAX_FAILURES > 0
                     and live_flow_failures >= PUBLICVPNLIST_LIVE_FLOW_MAX_FAILURES
                 ):
@@ -7517,11 +7544,10 @@ def fetch_publicvpnlist_candidates(
 
     us_candidates: list[dict[str, Any]] = []
     ordered_rows: list[tuple[str, dict[str, Any], set[str]]] = []
-    us_classifications = (
-        dict(cache.get("_us_classifications"))
-        if isinstance(cache.get("_us_classifications"), dict)
-        else {}
-    )
+    # Do not use PublicVPNList profile data as a second risk cache.
+    # Every current US window goes through vpn_utils.enrich_ip_info(), which
+    # owns IP_RISK_CACHE_TTL_SECONDS and fails closed when refresh is missing.
+    us_classifications: dict[str, dict[str, Any]] = {}
     us_nonresidential = 0
     us_unclassified = 0
     fixed_filtered = 0
@@ -7579,7 +7605,7 @@ def fetch_publicvpnlist_candidates(
         rows_to_classify = [
             (key, row)
             for key, row, _metadata_keys in window
-            if str(row.get("country_short") or "").upper() == "US" and key not in us_classifications
+            if str(row.get("country_short") or "").upper() == "US"
         ]
         if rows_to_classify:
             new_classifications, _classification_failed = publicvpnlist_enrich_us_rows(rows_to_classify)
