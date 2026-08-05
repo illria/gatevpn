@@ -50,7 +50,12 @@ jobs:
                   start = max(0, match.start() - 260)
                   end = min(len(text), match.end() + 420)
                   snippet = text[start:end].replace("\\n", " ")
-                  snippet = re.sub(r"([?&](?:token|signature|sig|auth|key|session)=[^&\\s'"]+)", r"\\1=<redacted>", snippet, flags=re.I)
+                  snippet = re.sub(
+                      r"""([?&](?:token|signature|sig|auth|key|session)=[^&\\s'"]+)""",
+                      r"\\1=<redacted>",
+                      snippet,
+                      flags=re.I,
+                  )
                   matches.append({"pattern": pattern, "snippet": snippet})
                   if len(matches) >= 120:
                       break
