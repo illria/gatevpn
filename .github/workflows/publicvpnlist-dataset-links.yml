@@ -1,0 +1,54 @@
+name: PublicVPNList dataset links discovery
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect-dataset-links:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Inspect official dataset link metadata
+        shell: bash
+        run: |
+          set -eu
+          python3 <<'PY'
+          import json
+          import urllib.parse
+          import urllib.request
+
+          req = urllib.request.Request(
+              "https://publicvpnlist.com/api/v1/dataset",
+              headers={"Accept": "application/json"},
+          )
+          with urllib.request.urlopen(req, timeout=20) as response:
+              payload = json.load(response)
+
+          def safe(value):
+              if isinstance(value, str):
+                  parsed = urllib.parse.urlsplit(value)
+                  if parsed.scheme and parsed.netloc:
+                      return f"{parsed.scheme}://{parsed.netloc}{parsed.path} query={'yes' if parsed.query else 'no'}"
+                  return value[:120]
+              if isinstance(value, dict):
+                  return {str(k): safe(v) for k, v in value.items() if "token" not in str(k).lower() and "secret" not in str(k).lower()}
+              if isinstance(value, list):
+                  return [safe(v) for v in value[:10]]
+              return value
+
+          if not isinstance(payload, dict):
+              print("payload_type=" + type(payload).__name__)
+          else:
+              print("top_keys=" + ",".join(sorted(payload)))
+              for key, value in payload.items():
+                  if isinstance(value, dict):
+                      print(f"{key}_keys=" + ",".join(sorted(str(k) for k in value)))
+                  if key.lower() in {"data", "links", "meta", "exports", "snapshot"}:
+                      print(f"{key}=" + json.dumps(safe(value), sort_keys=True))
+          PY
