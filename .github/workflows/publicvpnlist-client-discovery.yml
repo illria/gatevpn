@@ -1,0 +1,61 @@
+name: PublicVPNList official client discovery
+
+on:
+  push:
+    branches:
+      - feat/publicvpnlist-live-download
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect-client:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inspect official client route strings
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import re
+          import urllib.request
+
+          request = urllib.request.Request(
+              "https://publicvpnlist.com/local/templates/vpn/assets/app.js",
+              headers={"Accept": "text/javascript, application/javascript"},
+          )
+          with urllib.request.urlopen(request, timeout=30) as response:
+              text = response.read(2 * 1024 * 1024).decode("utf-8", "replace")
+
+          patterns = (
+              r"test_server",
+              r"get_token",
+              r"download\\.php",
+              r"server/",
+              r"download/",
+              r"api/v1",
+              r"fetch\\s*\\(",
+              r"XMLHttpRequest",
+              r"\\.php",
+          )
+          matches = []
+          for pattern in patterns:
+              for match in re.finditer(pattern, text, re.IGNORECASE):
+                  start = max(0, match.start() - 260)
+                  end = min(len(text), match.end() + 420)
+                  snippet = text[start:end].replace("\\n", " ")
+                  snippet = re.sub(r"([?&](?:token|signature|sig|auth|key|session)=[^&\\s'"]+)", r"\\1=<redacted>", snippet, flags=re.I)
+                  matches.append({"pattern": pattern, "snippet": snippet})
+                  if len(matches) >= 120:
+                      break
+              if len(matches) >= 120:
+                  break
+
+          print(json.dumps({
+              "bytes": len(text.encode("utf-8")),
+              "matches": matches,
+          }, ensure_ascii=False))
+          PY
