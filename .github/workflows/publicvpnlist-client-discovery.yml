@@ -23,7 +23,6 @@ jobs:
         run: |
           python3 - <<'PY'
           import json
-          import re
           import urllib.request
 
           request = urllib.request.Request(
@@ -33,30 +32,29 @@ jobs:
           with urllib.request.urlopen(request, timeout=30) as response:
               text = response.read(2 * 1024 * 1024).decode("utf-8", "replace")
 
-          patterns = (
-              r"test_server",
-              r"get_token",
-              r"download\\.php",
-              r"server/",
-              r"download/",
-              r"api/v1",
-              r"fetch\\s*\\(",
-              r"XMLHttpRequest",
-              r"\\.php",
+          needles = (
+              "test_server",
+              "get_token",
+              "download.php",
+              "server/",
+              "download/",
+              "api/v1",
+              "fetch(",
+              "XMLHttpRequest",
+              ".php",
           )
           matches = []
-          for pattern in patterns:
-              for match in re.finditer(pattern, text, re.IGNORECASE):
-                  start = max(0, match.start() - 260)
-                  end = min(len(text), match.end() + 420)
+          for needle in needles:
+              offset = 0
+              while True:
+                  index = text.lower().find(needle.lower(), offset)
+                  if index < 0:
+                      break
+                  start = max(0, index - 260)
+                  end = min(len(text), index + len(needle) + 420)
                   snippet = text[start:end].replace("\\n", " ")
-                  snippet = re.sub(
-                      r"""([?&](?:token|signature|sig|auth|key|session)=[^&\\s'"]+)""",
-                      r"\\1=<redacted>",
-                      snippet,
-                      flags=re.I,
-                  )
-                  matches.append({"pattern": pattern, "snippet": snippet})
+                  matches.append({"needle": needle, "snippet": snippet})
+                  offset = index + len(needle)
                   if len(matches) >= 120:
                       break
               if len(matches) >= 120:
