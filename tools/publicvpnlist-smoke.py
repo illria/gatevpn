@@ -265,9 +265,13 @@ def run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         "countries": countries,
         "metadata_records": 0,
         "metadata_with_download_path": 0,
+        "metadata_export_records": 0,
+        "metadata_export_matches": 0,
         "metadata_only_skipped": 0,
         "connectable_candidates": 0,
         "config_downloads": 0,
+        "profiles_downloaded": 0,
+        "profiles_validated": 0,
         "api_endpoints": [],
         "errors": [],
         "openvpn": "not_started",
@@ -312,6 +316,25 @@ def run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
 
     report["errors"] = endpoint_errors
     report["metadata_records"] = len(all_records)
+    metadata_export_meta: dict[str, Any] = {}
+    all_records = manager.publicvpnlist_attach_official_web_ids(
+        all_records,
+        metadata_export_meta,
+    )
+    report["metadata_export_records"] = int(
+        metadata_export_meta.get("metadata_export_records") or 0
+    )
+    report["metadata_export_matches"] = int(
+        metadata_export_meta.get("metadata_export_matches") or 0
+    )
+    if metadata_export_meta.get("metadata_export_error_code"):
+        report["errors"].append(
+            {
+                "category": "metadata_export_error",
+                "status": int(metadata_export_meta.get("metadata_export_status") or 0),
+                "type": str(metadata_export_meta.get("metadata_export_error_code")),
+            }
+        )
     normalized_rows = [
         manager.normalize_publicvpnlist_row(record)
         for record in all_records
@@ -353,6 +376,8 @@ def run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                 try:
                     result = _download_one(manager, raw, args.timeout)
                     report["config_downloads"] += 1
+                    report["profiles_downloaded"] += 1
+                    report["profiles_validated"] += 1
                     report["connectable_candidates"] += 1
                     report["download_result"] = result
                     break
@@ -370,6 +395,12 @@ def run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         else:
             report["status"] = "mapping_missing"
     report["elapsed_seconds"] = round(time.monotonic() - started, 3)
+    if args.download and (
+        report["profiles_downloaded"] < 1
+        or report["profiles_validated"] < 1
+        or report["connectable_candidates"] < 1
+    ):
+        return 1, report
     return 0, report
 
 
@@ -401,6 +432,8 @@ def main(argv: list[str] | None = None) -> int:
             "metadata_records": 0,
             "connectable_candidates": 0,
             "config_downloads": 0,
+            "profiles_downloaded": 0,
+            "profiles_validated": 0,
             "openvpn": "not_started",
             "redacted": True,
         }
