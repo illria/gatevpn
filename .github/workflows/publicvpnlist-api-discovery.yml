@@ -1,0 +1,52 @@
+name: PublicVPNList API field discovery
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect-api-record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Inspect one redacted API record
+        shell: bash
+        run: |
+          set -eu
+          tmp="$(mktemp)"
+          trap 'rm -f "$tmp"' EXIT
+          curl --fail --silent --show-error --location --max-time 20             --header "Accept: application/json"             "https://publicvpnlist.com/api/v1/servers?country=PH&protocol=openvpn&status=online&per_page=1&sort=last_checked&order=desc" > "$tmp"
+          python3 - "$tmp" <<'PY'
+          import json
+          import sys
+          import urllib.parse
+          payload = json.load(open(sys.argv[1], encoding="utf-8"))
+          if isinstance(payload, dict):
+              records = payload.get("data") or payload.get("servers") or payload.get("records") or payload.get("items") or []
+          else:
+              records = payload
+          if not isinstance(records, list) or not records or not isinstance(records[0], dict):
+              raise SystemExit("no record")
+          record = records[0]
+          print("keys=" + ",".join(sorted(record)))
+          for key in sorted(record):
+              value = record[key]
+              lower = key.lower()
+              if "url" in lower or key in {"source", "links"}:
+                  if isinstance(value, str):
+                      parsed = urllib.parse.urlsplit(value)
+                      if parsed.scheme and parsed.netloc:
+                          value = f"{parsed.scheme}://{parsed.netloc}{parsed.path} query={'yes' if parsed.query else 'no'} fragment={'yes' if parsed.fragment else 'no'}"
+                      else:
+                          value = "<non-url>"
+                  else:
+                      value = "<redacted>"
+              elif key in {"config_text", "token", "signature", "password", "secret"}:
+                  value = "<redacted>"
+              print(f"{key}={value!r}")
+          PY
