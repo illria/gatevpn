@@ -1085,6 +1085,21 @@ class PublicVPNListSourceTests(unittest.TestCase):
         self.assertEqual(proto, "tcp")
         self.assertNotIn("remote-random", node["config_text"])
 
+    def test_same_host_alternate_ports_are_reduced_to_selected_endpoint(self):
+        row = self.row("alternate-ports", "PH", "198.51.100.62", port=80, proto="tcp")
+        config = (
+            "client\nproto tcp\n"
+            "remote 198.51.100.62 80\n"
+            "remote 198.51.100.62 1194\n"
+            "remote 198.51.100.62 53 tcp-client\n"
+            "<ca>\nCERT\n</ca>\n"
+        )
+        node = vpngate_manager.publicvpnlist_row_to_node(row, config)
+        self.assertIsNotNone(node)
+        remotes, proto = vpngate_manager.parse_publicvpnlist_openvpn_remotes(node["config_text"])
+        self.assertEqual(remotes, [{"host": "198.51.100.62", "port": 80, "proto": ""}])
+        self.assertEqual(proto, "tcp")
+
     def test_per_remote_proto_conflicting_with_global_proto_is_rejected(self):
         row = self.row("proto-conflict", "PH", "198.51.100.62", port=443, proto="tcp")
         config = self.config(row["host"], row["port"]).replace(
