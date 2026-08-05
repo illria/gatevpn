@@ -1,0 +1,79 @@
+name: PublicVPNList contract discovery
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover-public-flow:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Inspect public download page script
+        shell: bash
+        run: |
+          set -eu
+          tmp_dir="$(mktemp -d)"
+          trap 'rm -rf "$tmp_dir"' EXIT
+          page="$tmp_dir/page.html"
+          script="$tmp_dir/app.js"
+          curl --fail --silent --show-error --location --max-time 20             "https://publicvpnlist.com/download/1448228/" > "$page"
+          script_url="$(python3 - "$page" <<'PY'
+          import re
+          import sys
+          from html import unescape
+          text = open(sys.argv[1], encoding="utf-8").read()
+          matches = re.findall(
+              r'<script[^>]+src=["'"'"']([^"'"'"']*local/templates/[^"'"'"']*app\.js[^"'"'"']*)',
+              text,
+              flags=re.I,
+          )
+          if not matches:
+              raise SystemExit("public app.js not found")
+          value = unescape(matches[-1])
+          if value.startswith("/"):
+              value = "https://publicvpnlist.com" + value
+          print(value.split("?", 1)[0])
+          PY
+          )"
+          curl --fail --silent --show-error --location --max-time 20             "$script_url" > "$script"
+          python3 - "$script" <<'PY'
+          import re
+          import sys
+          text = open(sys.argv[1], encoding="utf-8").read()
+          patterns = (
+              "downloadCurrentCheckBtn",
+              "test_server",
+              "get_token",
+              "download.php",
+              "csrf",
+              "nonce",
+              "fetch(",
+              "XMLHttpRequest",
+              "XMLHttpRequest",
+              "download/",
+              "server/",
+          )
+          hits = []
+          for pattern in patterns:
+              for match in re.finditer(re.escape(pattern), text, flags=re.I):
+                  start = max(0, match.start() - 220)
+                  end = min(len(text), match.end() + 420)
+                  snippet = re.sub(r"\\s+", " ", text[start:end]).strip()
+                  hits.append((match.start(), pattern, snippet))
+          seen = set()
+          for _, pattern, snippet in sorted(hits):
+              key = (pattern, snippet)
+              if key in seen:
+                  continue
+              seen.add(key)
+              print(f"PATTERN={pattern}")
+              print(snippet)
+          if not hits:
+              raise SystemExit("no public download-flow markers found")
+          PY
