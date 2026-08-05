@@ -14,6 +14,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -30,6 +31,32 @@ def _load_manager():
     return vpngate_manager
 
 
+def _safe_reason_code(exc: BaseException) -> str:
+    message = str(exc or "").lower()
+    known = (
+        ("实时检查未通过", "live_check_failed"),
+        ("临时检查", "live_check_failed"),
+        ("临时令牌响应缺少", "token_response_missing_url"),
+        ("临时令牌", "token_flow_failed"),
+        ("配置下载 content-type", "profile_content_type_rejected"),
+        ("下载内容不像", "profile_not_openvpn"),
+        ("下载主机 dns 解析失败", "download_host_dns_failed"),
+        ("下载主机没有可验证", "download_host_dns_empty"),
+        ("主机不在", "download_host_not_allowlisted"),
+        ("受限网络地址", "download_host_ssrf_rejected"),
+        ("重定向次数超过", "redirect_limit"),
+        ("live flow 超过", "live_flow_deadline"),
+        ("响应不是 json", "json_response_invalid"),
+        ("响应 json 无效", "json_response_invalid"),
+    )
+    for marker, code in known:
+        if marker in message:
+            return code
+    if re.search(r"\b(?:http|https)\b", message):
+        return "http_request_failed"
+    return type(exc).__name__
+
+
 def _redacted_error(exc: BaseException) -> dict[str, Any]:
     if isinstance(exc, urllib.error.HTTPError):
         status = int(getattr(exc, "code", 0) or 0)
@@ -39,10 +66,25 @@ def _redacted_error(exc: BaseException) -> dict[str, Any]:
             category = "github_runner_blocked"
         else:
             category = "http_error"
-        return {"category": category, "status": status, "type": type(exc).__name__}
+        return {
+            "category": category,
+            "status": status,
+            "type": type(exc).__name__,
+            "reason": _safe_reason_code(exc),
+        }
     if isinstance(exc, (urllib.error.URLError, TimeoutError, OSError)):
-        return {"category": "network_error", "status": 0, "type": type(exc).__name__}
-    return {"category": "schema_changed", "status": 0, "type": type(exc).__name__}
+        return {
+            "category": "network_error",
+            "status": 0,
+            "type": type(exc).__name__,
+            "reason": _safe_reason_code(exc),
+        }
+    return {
+        "category": "schema_changed",
+        "status": 0,
+        "type": type(exc).__name__,
+        "reason": _safe_reason_code(exc),
+    }
 
 
 def _api_path_url(manager, base_url: str, path: str, params: dict[str, Any] | None = None) -> str:
