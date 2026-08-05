@@ -1,0 +1,50 @@
+name: PublicVPNList stable export discovery
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect-export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Inspect stable metadata export shape
+        shell: bash
+        run: |
+          set -eu
+          python3 <<'PY'
+          import json
+          import urllib.request
+
+          url = "https://publicvpnlist.com/exports/openvpn-latest.json"
+          req = urllib.request.Request(url, headers={"Accept": "application/json"})
+          with urllib.request.urlopen(req, timeout=30) as response:
+              payload = json.load(response)
+          print("top_type=" + type(payload).__name__)
+          if isinstance(payload, dict):
+              print("top_keys=" + ",".join(sorted(payload)))
+              records = payload.get("servers") or payload.get("data") or payload.get("records") or payload.get("items") or []
+          else:
+              records = payload
+          if not records:
+              print("records=0")
+              raise SystemExit(0)
+          record = next((item for item in records if isinstance(item, dict)), None)
+          if not record:
+              print("records=0")
+              raise SystemExit(0)
+          print("record_keys=" + ",".join(sorted(record)))
+          for key in sorted(record):
+              value = record[key]
+              if "url" in key.lower():
+                  value = "<url-present>" if value else "<url-empty>"
+              elif key in {"config_text", "token", "signature", "password", "secret"}:
+                  value = "<redacted>"
+              print(f"{key}={value!r}")
+          PY
