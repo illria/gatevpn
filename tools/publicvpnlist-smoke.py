@@ -74,7 +74,7 @@ def _redacted_error(exc: BaseException) -> dict[str, Any]:
         ):
             if key in flow and flow.get(key) not in (None, ""):
                 flow_summary[key] = flow.get(key)
-        if isinstance(exc, urllib.error.HTTPError):
+    if isinstance(exc, urllib.error.HTTPError):
         status = int(getattr(exc, "code", 0) or 0)
         if status == 429:
             category = "rate_limited"
