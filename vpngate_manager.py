@@ -104,6 +104,13 @@ PUBLICVPNLIST_API_URL = os.environ.get(
 # one-time profile token.  This is a confirmed official web origin, not a
 # guessed CDN or a permanent profile feed.
 PUBLICVPNLIST_OFFICIAL_WEB_BASE_URL = "https://publicvpnlist.com/"
+# Official stable metadata export used only to correlate API endpoints with the
+# numeric website ID required by the normal Check -> token -> download flow.
+# It is not treated as a profile/configuration feed.
+PUBLICVPNLIST_METADATA_EXPORT_URL = os.environ.get(
+    "PUBLICVPNLIST_METADATA_EXPORT_URL",
+    "https://publicvpnlist.com/exports/openvpn-latest.json",
+).strip()
 PUBLICVPNLIST_ENABLED = _publicvpnlist_env_bool("PUBLICVPNLIST_ENABLED", True)
 PUBLICVPNLIST_SNAPSHOT_URL = os.environ.get("PUBLICVPNLIST_SNAPSHOT_URL", "").strip()
 PUBLICVPNLIST_SNAPSHOT_FILE = os.environ.get("PUBLICVPNLIST_SNAPSHOT_FILE", "").strip()
@@ -2533,6 +2540,10 @@ def publicvpnlist_api_cache_default() -> dict[str, Any]:
         "legacy_last_success_at_by_country": {},
         "record_count_by_country": {},
         "metadata_record_count": 0,
+        "metadata_export_records": 0,
+        "metadata_export_matches": 0,
+        "metadata_export_status": 0,
+        "metadata_export_error_code": "",
         "network_records_fetched": 0,
         "cached_records_considered": 0,
         "cached_records_reused": 0,
@@ -3586,6 +3597,138 @@ def _publicvpnlist_api_record_endpoint_keys(record: dict[str, Any]) -> set[str]:
     return {f"{host}:{port}:{proto}" for host in hosts}
 
 
+
+def _publicvpnlist_metadata_export_records(payload: Any) -> list[dict[str, Any]]:
+    """Extract records from the official stable metadata export."""
+
+    if not isinstance(payload, dict):
+        return []
+    for key in ("records", "servers", "items", "data"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [dict(item) for item in value if isinstance(item, dict)]
+        if isinstance(value, dict):
+            for nested_key in ("records", "servers", "items"):
+                nested = value.get(nested_key)
+                if isinstance(nested, list):
+                    return [dict(item) for item in nested if isinstance(item, dict)]
+    return []
+
+
+def publicvpnlist_metadata_export_url() -> str:
+    """Validate the official metadata-only export before opening it."""
+
+    raw = str(PUBLICVPNLIST_METADATA_EXPORT_URL or "").strip()
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        official_host = (
+            urllib.parse.urlsplit(PUBLICVPNLIST_OFFICIAL_WEB_BASE_URL).hostname
+            or ""
+        ).lower().rstrip(".")
+        host = (parsed.hostname or "").lower().rstrip(".")
+        if (
+            parsed.scheme.lower() != "https"
+            or not host
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or host != official_host
+        ):
+            raise ValueError()
+    except (TypeError, ValueError):
+        raise PublicVPNListSnapshotError(
+            "PublicVPNList 官方 metadata export URL 不安全"
+        ) from None
+    # This performs the same DNS/SSRF check used by profile URLs without
+    # requiring a user-supplied configuration-download allowlist.
+    publicvpnlist_validate_download_url(raw, require_allowlist=False)
+    return raw
+
+
+def publicvpnlist_attach_official_web_ids(
+    records: list[dict[str, Any]],
+    metadata: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Attach verified website numeric IDs to API rows by endpoint identity.
+
+    The API public ID is never transformed. A row is mapped only when exactly
+    one endpoint-matching record in the official metadata export exposes a
+    numeric website path.
+    """
+
+    rows = [record for record in records if isinstance(record, dict)]
+    report = metadata if isinstance(metadata, dict) else {}
+    report.update(
+        {
+            "metadata_export_attempted": False,
+            "metadata_export_records": 0,
+            "metadata_export_matches": 0,
+            "metadata_export_ambiguous": 0,
+            "metadata_export_status": 0,
+            "metadata_export_error_code": "",
+        }
+    )
+    missing = [
+        record
+        for record in rows
+        if not publicvpnlist_web_download_id(record)
+    ]
+    if not missing:
+        return rows
+
+    report["metadata_export_attempted"] = True
+    try:
+        export_url = publicvpnlist_metadata_export_url()
+        response_metadata: dict[str, Any] = {}
+        opener = urllib.request.build_opener(PublicVPNListRedirectHandler())
+        body = publicvpnlist_http_get(
+            export_url,
+            timeout=PUBLICVPNLIST_API_TIMEOUT_SECONDS,
+            max_bytes=PUBLICVPNLIST_API_MAX_RESPONSE_BYTES,
+            accept="application/json",
+            opener=opener,
+            metadata=response_metadata,
+        )
+        content_type = str(
+            response_metadata.get("content_type") or ""
+        ).split(";", 1)[0].strip().lower()
+        if content_type and content_type not in {"application/json", "text/json"} and not content_type.endswith("+json"):
+            raise PublicVPNListSnapshotError(
+                "PublicVPNList metadata export 响应不是 JSON"
+            )
+        payload = json.loads(body.decode("utf-8"))
+        export_records = _publicvpnlist_metadata_export_records(payload)
+        report["metadata_export_records"] = len(export_records)
+        report["metadata_export_status"] = int(
+            response_metadata.get("status") or 200
+        )
+        endpoint_to_ids: dict[str, set[str]] = {}
+        for export_record in export_records:
+            numeric_id = publicvpnlist_web_download_id(export_record)
+            if not numeric_id:
+                continue
+            for alias in _publicvpnlist_api_record_endpoint_keys(export_record):
+                endpoint_to_ids.setdefault(alias, set()).add(numeric_id)
+
+        matches = 0
+        ambiguous = 0
+        for record in missing:
+            candidate_ids: set[str] = set()
+            for alias in _publicvpnlist_api_record_endpoint_keys(record):
+                candidate_ids.update(endpoint_to_ids.get(alias, set()))
+            if len(candidate_ids) != 1:
+                if len(candidate_ids) > 1:
+                    ambiguous += 1
+                continue
+            record["web_download_id"] = next(iter(candidate_ids))
+            matches += 1
+        report["metadata_export_matches"] = matches
+        report["metadata_export_ambiguous"] = ambiguous
+    except Exception as exc:
+        report["metadata_export_error_code"] = type(exc).__name__
+    return rows
+
 def _publicvpnlist_api_record_preference_key(record: dict[str, Any]) -> tuple[Any, ...]:
     """Rank duplicate API metadata without performing network work."""
 
@@ -3887,7 +4030,18 @@ def fetch_publicvpnlist_api_snapshot(
         for country in countries
         if publicvpnlist_api_retry_due(api_cache, country, now)
     }
-    if fresh_cache and not retry_countries:
+    cached_rows_for_mapping = publicvpnlist_api_cached_records(
+        api_cache,
+        countries=countries,
+        now=now,
+    )
+    cached_web_ids_ready = bool(cached_rows_for_mapping) and all(
+        publicvpnlist_web_download_id(record)
+        for record in cached_rows_for_mapping
+    )
+    if fresh_cache and not retry_countries and (
+        not cached_rows_for_mapping or cached_web_ids_ready
+    ):
         return _publicvpnlist_api_cached_payload(api_cache, countries, now)
 
     publicvpnlist_validate_api_url(servers_url, base_url)
@@ -4394,6 +4548,29 @@ def fetch_publicvpnlist_api_snapshot(
     working["page_meta_by_query"] = page_meta_by_query
     working["records_by_country"] = records_by_country
     working["network_records_fetched"] = network_records_fetched
+    metadata_export_meta: dict[str, Any] = {}
+    metadata_export_refs: list[dict[str, Any]] = []
+    for record_list in records_by_query.values():
+        if isinstance(record_list, list):
+            metadata_export_refs.extend(
+                record for record in record_list if isinstance(record, dict)
+            )
+    for record_list in records_by_country.values():
+        if isinstance(record_list, list):
+            metadata_export_refs.extend(
+                record for record in record_list if isinstance(record, dict)
+            )
+    publicvpnlist_attach_official_web_ids(
+        metadata_export_refs,
+        metadata_export_meta,
+    )
+    for key in (
+        "metadata_export_records",
+        "metadata_export_matches",
+        "metadata_export_status",
+        "metadata_export_error_code",
+    ):
+        working[key] = metadata_export_meta.get(key, working.get(key, 0))
     all_cached_records = publicvpnlist_api_cached_records(working)
     all_unique_records = publicvpnlist_api_normalize_bounded_records(all_cached_records)
     working["cached_records_considered"] = cached_records_considered
@@ -4436,6 +4613,10 @@ def fetch_publicvpnlist_api_snapshot(
             "total_limit_hit": bool(working.get("total_limit_hit") or total_limit_hit),
             "etag_cache_hits": etag_cache_hits,
             "profile_retry_count": len(working.get("profile_retry_entries") or []),
+            "metadata_export_records": int(working.get("metadata_export_records") or 0),
+            "metadata_export_matches": int(working.get("metadata_export_matches") or 0),
+            "metadata_export_status": int(working.get("metadata_export_status") or 0),
+            "metadata_export_error_code": str(working.get("metadata_export_error_code") or ""),
             "error_code": str(working.get("last_error_code") or (errors[0] if errors else "")),
         },
     }
