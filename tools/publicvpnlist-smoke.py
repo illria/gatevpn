@@ -248,6 +248,14 @@ def _download_one(manager, raw: dict[str, Any], timeout: int) -> dict[str, Any]:
                 "token_response_keys",
                 "token_response_has_url",
                 "token_response_has_token",
+                "content_type",
+                "body_kind",
+                "download_page_content_type",
+                "download_page_body_kind",
+                "check_content_type",
+                "check_body_kind",
+                "token_content_type",
+                "token_body_kind",
             )
             if metadata.get(key) not in (None, "")
         })
