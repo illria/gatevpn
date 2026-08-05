@@ -129,6 +129,10 @@ jobs:
         run: |
           set -u
           mkdir -p artifacts/logs "$RUNNER_TEMP/gatevpn-data"
+          umask 077
+          cat > "$RUNNER_TEMP/gatevpn-data/ui_auth.json" <<'JSON'
+          {"host": "127.0.0.1", "port": 18787, "node_sources": "publicvpnlist", "target_countries": "PH"}
+          JSON
           export VPNGATE_DATA_DIR="$RUNNER_TEMP/gatevpn-data"
           export NODE_SOURCES=publicvpnlist
           export PUBLICVPNLIST_ENABLED=1
@@ -202,6 +206,8 @@ jobs:
             kill "$manager_pid" 2>/dev/null || true
           fi
           wait "$manager_pid" 2>/dev/null || true
+
+          cat artifacts/logs/runtime-manager.log || true
 
           if pgrep -af '[o]penvpn' > artifacts/logs/openvpn-processes.log 2>&1; then
             openvpn_processes=true
