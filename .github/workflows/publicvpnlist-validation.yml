@@ -85,8 +85,7 @@ jobs:
     name: Real PublicVPNList API smoke
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    continue-on-error: true
-    steps:
+      steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
@@ -106,6 +105,7 @@ jobs:
             --max-profiles 1 \
             --timeout 60 \
             --redact \
+            --download \
             --json-report artifacts/logs/publicvpnlist-smoke.json \
             > artifacts/logs/publicvpnlist-real-smoke.log 2>&1
           smoke_status=$?
@@ -113,6 +113,18 @@ jobs:
           echo "No OpenVPN process was started." >> artifacts/logs/publicvpnlist-real-smoke.log
           cat artifacts/logs/publicvpnlist-smoke.json || true
           tail -n 5 artifacts/logs/publicvpnlist-real-smoke.log || true
+          python3 - artifacts/logs/publicvpnlist-smoke.json <<'PY'
+          import json
+          import sys
+
+          report = json.loads(open(sys.argv[1], encoding="utf-8").read())
+          required = ("profiles_downloaded", "profiles_validated", "connectable_candidates")
+          missing = [name for name in required if int(report.get(name) or 0) < 1]
+          if missing:
+              raise SystemExit("real PublicVPNList smoke did not produce: " + ", ".join(missing))
+          print("real_smoke_requirements=passed")
+          PY
+          test "$smoke_status" -eq 0
 
       - name: Upload real smoke report
         if: always()
