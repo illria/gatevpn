@@ -42,6 +42,7 @@ class PublicVPNListSourceTests(unittest.TestCase):
             DATA_DIR=data_dir,
             CONFIG_DIR=data_dir / "configs",
             PUBLICVPNLIST_CACHE_FILE=self.cache_file,
+            PUBLICVPNLIST_API_URL="",
             PUBLICVPNLIST_SNAPSHOT_URL="https://fixture.invalid/export-builder-snapshot.json?signature=fixture",
             PUBLICVPNLIST_SNAPSHOT_FILE="",
             PUBLICVPNLIST_REFRESH_SECONDS=3600,
@@ -167,10 +168,10 @@ class PublicVPNListSourceTests(unittest.TestCase):
             "proto": proto,
         }
 
-    def test_default_source_order_excludes_publicvpnlist_but_alias_is_available(self):
+    def test_default_source_order_includes_publicvpnlist_and_alias_is_available(self):
         self.assertEqual(
             vpngate_manager.split_node_sources("all"),
-            ["vpngate", "vpnbook", "ipspeed", "vpngate_scraper"],
+            ["vpngate", "vpnbook", "ipspeed", "vpngate_scraper", "publicvpnlist"],
         )
         self.assertEqual(vpngate_manager.split_node_sources("public_vpn_list,pvl"), ["publicvpnlist"])
         self.assertIn("PublicVPNList", vpngate_manager.node_sources_display("publicvpnlist"))
@@ -185,6 +186,54 @@ class PublicVPNListSourceTests(unittest.TestCase):
             vpngate_manager.split_node_sources(("vpnbook", "vpngate", "vpnbook")),
             ["vpnbook", "vpngate"],
         )
+
+    def test_source_transaction_keeps_ui_unchanged_when_environment_write_fails(self):
+        ui_cfg = {"node_sources": "vpngate,publicvpnlist"}
+        with mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_environment_values",
+            return_value={"PUBLICVPNLIST_ENABLED": "0"},
+        ), mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_write_environment",
+            side_effect=OSError("environment unavailable"),
+        ) as env_writer, mock.patch.object(vpngate_manager, "save_ui_config") as save_ui:
+            self.assertFalse(vpngate_manager.save_node_sources_transaction(ui_cfg))
+        env_writer.assert_called_once_with({"PUBLICVPNLIST_ENABLED": "1"})
+        save_ui.assert_not_called()
+
+    def test_source_transaction_rolls_back_environment_when_ui_write_fails(self):
+        ui_cfg = {"node_sources": "vpngate,publicvpnlist"}
+        writes = []
+
+        def write_environment(updates):
+            writes.append(dict(updates))
+            return {}
+
+        with mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_environment_values",
+            return_value={"PUBLICVPNLIST_ENABLED": "0"},
+        ), mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_write_environment",
+            side_effect=write_environment,
+        ), mock.patch.object(vpngate_manager, "save_ui_config", return_value=False):
+            self.assertFalse(vpngate_manager.save_node_sources_transaction(ui_cfg))
+        self.assertEqual(writes, [{"PUBLICVPNLIST_ENABLED": "1"}, {"PUBLICVPNLIST_ENABLED": "0"}])
+
+    def test_source_transaction_commits_switch_only_after_both_writes_succeed(self):
+        ui_cfg = {"node_sources": "vpngate,publicvpnlist"}
+        with mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_environment_values",
+            return_value={"PUBLICVPNLIST_ENABLED": "0"},
+        ), mock.patch.object(
+            vpngate_manager, "publicvpnlist_write_environment", return_value={}
+        ) as env_writer, mock.patch.object(vpngate_manager, "save_ui_config", return_value=True) as save_ui:
+            self.assertTrue(vpngate_manager.save_node_sources_transaction(ui_cfg))
+        env_writer.assert_called_once_with({"PUBLICVPNLIST_ENABLED": "1"})
+        save_ui.assert_called_once_with(ui_cfg)
 
     def test_configured_and_effective_sources_are_separate(self):
         with mock.patch.object(vpngate_manager, "NODE_SOURCES_ENV", ""), mock.patch.object(
@@ -263,7 +312,7 @@ class PublicVPNListSourceTests(unittest.TestCase):
         self.assertEqual(result, [])
         self.assertIn("未配置快照", display)
         messages = " ".join(str(call.args[2]) for call in log_mock.call_args_list if len(call.args) >= 3)
-        self.assertIn("未配置快照", messages)
+        self.assertIn("未配置 API/快照", messages)
 
     def test_publicvpnlist_configuration_status_distinguishes_snapshot_and_download_hosts(self):
         with mock.patch.object(vpngate_manager, "PUBLICVPNLIST_SNAPSHOT_URL", ""), mock.patch.object(
@@ -344,8 +393,8 @@ class PublicVPNListSourceTests(unittest.TestCase):
             self.assertEqual(after[field], before[field])
         messages = [str(call.args[2]) for call in log_mock.call_args_list if len(call.args) >= 3]
         self.assertEqual(
-            [message for message in messages if message == "PublicVPNList 仅使用缓存：未配置快照，不进行快照或 profile 下载"],
-            ["PublicVPNList 仅使用缓存：未配置快照，不进行快照或 profile 下载"],
+            [message for message in messages if message == "PublicVPNList 仅使用缓存：未配置 API/快照，不进行元数据或 profile 下载"],
+            ["PublicVPNList 仅使用缓存：未配置 API/快照，不进行元数据或 profile 下载"],
         )
 
     def test_clear_config_with_valid_cache_remains_functional(self):
@@ -374,8 +423,8 @@ class PublicVPNListSourceTests(unittest.TestCase):
         self.assertEqual([node["ip"] for node in result], [row["ip"]])
         messages = [str(call.args[2]) for call in log_mock.call_args_list if len(call.args) >= 3]
         self.assertEqual(
-            [message for message in messages if message == "PublicVPNList 仅使用缓存：未配置快照，不进行快照或 profile 下载"],
-            ["PublicVPNList 仅使用缓存：未配置快照，不进行快照或 profile 下载"],
+            [message for message in messages if message == "PublicVPNList 仅使用缓存：未配置 API/快照，不进行元数据或 profile 下载"],
+            ["PublicVPNList 仅使用缓存：未配置 API/快照，不进行元数据或 profile 下载"],
         )
 
     def test_no_snapshot_without_usable_cache_disables_source(self):
@@ -436,7 +485,7 @@ class PublicVPNListSourceTests(unittest.TestCase):
                 self.assertEqual(result, [])
                 messages = [str(call.args[2]) for call in log_mock.call_args_list if len(call.args) >= 3]
                 self.assertEqual(len(messages), 1)
-                self.assertIn("未配置快照且没有有效缓存", messages[0])
+                self.assertIn("未配置 API/快照且没有有效缓存", messages[0])
 
     def test_local_snapshot_file_is_supported(self):
         snapshot_file = Path(self.temp_dir.name) / "export-builder.json"
@@ -835,7 +884,7 @@ class PublicVPNListSourceTests(unittest.TestCase):
             row["download_page_url"] = f"https://fixture.invalid/server/page?{name}=secret-value#fragment"
             profile = vpngate_manager.publicvpnlist_cache_profile(row, self.config(row["host"], row["port"]))
             self.assertEqual(profile["download_page_url"], "")
-            self.assertNotIn(name, json.dumps(profile, ensure_ascii=False))
+            self.assertNotIn(f"{name}=secret-value", json.dumps(profile, ensure_ascii=False))
 
         result, _ = self.fetch_rows([row])
         nodes_file = Path(self.temp_dir.name) / "nodes.json"
@@ -865,7 +914,7 @@ class PublicVPNListSourceTests(unittest.TestCase):
         config_builder.assert_not_called()
         messages = " ".join(str(call.args[2]) for call in log_mock.call_args_list if len(call.args) >= 3)
         self.assertIn("download_page_url", messages)
-        self.assertIn("重新生成", messages)
+        self.assertIn("仅作页面元数据，不作为配置下载地址", messages)
 
     def test_expired_temporary_snapshot_profile_is_skipped(self):
         row = self.row("expired-profile", "PH", "198.51.100.61")
@@ -1512,6 +1561,15 @@ class PublicVPNListSourceTests(unittest.TestCase):
         self.assertEqual(vpngate_manager.publicvpnlist_speed_bps("not-a-number"), 0)
         self.assertEqual(vpngate_manager.publicvpnlist_speed_bps("nan"), 0)
         row = self.row("speed-bps", "PH", "198.51.100.68")
+        row.update(
+            {
+                "checkedAt": time.time(),
+                "freshness_status": "fresh",
+                "availability_status": "online",
+                "measurement_quality": "verified",
+                "measurement_status": "success",
+            }
+        )
         result, _ = self.fetch_rows([row])
         self.assertEqual(result[0]["speed"], 12_500_000)
         self.assertEqual(result[0]["score"], 12_500_000)
@@ -1539,7 +1597,7 @@ class PublicVPNListSourceTests(unittest.TestCase):
             call_order.append("ipspeed")
             return [ipspeed_node]
 
-        def fetch_publicvpnlist(_target, _seen, blocked_endpoint_keys=None):
+        def fetch_publicvpnlist(_target, _seen, blocked_endpoint_keys=None, **_kwargs):
             call_order.append("publicvpnlist")
             self.assertIn("198.51.100.78:443:tcp", blocked_endpoint_keys)
             self.assertIn("198.51.100.79:443:tcp", blocked_endpoint_keys)
@@ -1742,7 +1800,7 @@ class PublicVPNListSourceTests(unittest.TestCase):
         with mock.patch.object(vpngate_manager.urllib.request, "urlopen", return_value=Response()) as urlopen:
             vpngate_manager.publicvpnlist_http_get(vpngate_manager.PUBLICVPNLIST_SNAPSHOT_URL)
         request = urlopen.call_args.args[0]
-        self.assertEqual(request.get_header("User-agent"), "gatevpn-publicvpnlist/1.0")
+        self.assertEqual(request.get_header("User-agent"), "gatevpn-publicvpnlist-api/1.0")
 
     def test_payload_records_accepts_data_array(self):
         rows = [{"id": "one"}]

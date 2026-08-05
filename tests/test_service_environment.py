@@ -133,7 +133,7 @@ class ServiceEnvironmentTests(unittest.TestCase):
         self.assertIn('action == "restart"', self.install_text)
         self.assertIn("def redacted_snapshot_url(value):", self.install_text)
         self.assertIn("getpass.getpass", self.install_text)
-        self.assertIn("需快照+下载域名", self.install_text)
+        self.assertIn("默认使用 PublicVPNList 官方 API v1", self.install_text)
 
     def test_service_execstart_does_not_include_snapshot_environment_values(self):
         exec_lines = [line for line in self.install_text.splitlines() if "ExecStart=" in line]
@@ -223,7 +223,9 @@ class ServiceEnvironmentTests(unittest.TestCase):
             exec(compile(source, "install.sh:generated-en", "exec"), namespace)
             values = {
                 "VPNGATE_DATA_DIR": str(data_dir),
+                "PUBLICVPNLIST_ENABLED": "1",
                 "PUBLICVPNLIST_STALE_PROFILE_SECONDS": "604800",
+                "PUBLICVPNLIST_API_URL": "",
                 "PUBLICVPNLIST_SNAPSHOT_URL": "",
                 "PUBLICVPNLIST_SNAPSHOT_FILE": "",
                 "PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS": "",
@@ -234,7 +236,11 @@ class ServiceEnvironmentTests(unittest.TestCase):
 
             with mock.patch.object(vpngate_manager, "DATA_DIR", data_dir), mock.patch.object(
                 vpngate_manager, "PUBLICVPNLIST_CACHE_FILE", cache_path
-            ), mock.patch.object(vpngate_manager, "PUBLICVPNLIST_SNAPSHOT_URL", ""), mock.patch.object(
+            ), mock.patch.object(vpngate_manager, "PUBLICVPNLIST_ENABLED", True), mock.patch.object(
+                vpngate_manager, "PUBLICVPNLIST_API_URL", ""
+            ), mock.patch.object(
+                vpngate_manager, "PUBLICVPNLIST_SNAPSHOT_URL", ""
+            ), mock.patch.object(
                 vpngate_manager, "PUBLICVPNLIST_SNAPSHOT_FILE", ""
             ), mock.patch.object(vpngate_manager, "PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS", frozenset()), mock.patch.object(
                 vpngate_manager, "PUBLICVPNLIST_STALE_PROFILE_SECONDS", 604800
@@ -244,6 +250,51 @@ class ServiceEnvironmentTests(unittest.TestCase):
             self.assertEqual(generated_state["effective_source_active"], manager_state["effective_source_active"])
             self.assertEqual(generated_state["refresh_ready"], manager_state["refresh_ready"])
             self.assertEqual(generated_state["cache_only"], manager_state["cache_only"])
+
+    def test_generated_en_source_toggles_publicvpnlist_without_claiming_failure(self):
+        marker = "cat > /usr/bin/en <<'EOF'\n"
+        start = self.install_text.index(marker) + len(marker)
+        end = self.install_text.index("\nEOF\n", start)
+        source = self.install_text[start:end]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            namespace = {"__name__": "generated_en_ci"}
+            exec(compile(source, "install.sh:generated-en", "exec"), namespace)
+            namespace["ENV_FILE"] = str(root / "eianun-vpngate.env")
+            namespace["LEGACY_ENV_FILE"] = str(root / "legacy.env")
+            namespace["INSTALL_DIR"] = str(root / "install")
+            namespace["load_ui_cfg"] = lambda: {}
+            namespace["publicvpnlist_status_label"] = lambda: "PublicVPNList（API）"
+            namespace["ask_restart"] = lambda: None
+            saved_configs = []
+            namespace["save_ui_cfg"] = lambda cfg: saved_configs.append(dict(cfg)) or True
+            original_env_writer = namespace["save_publicvpnlist_environment"]
+
+            for key, expected_enabled, expected_sources in (
+                ("1", "1", "vpngate,vpnbook,ipspeed,vpngate_scraper,publicvpnlist"),
+                ("2", "0", "vpngate,vpnbook,ipspeed,vpngate_scraper"),
+            ):
+                namespace["getch"] = lambda key=key: key
+                with contextlib.redirect_stdout(io.StringIO()):
+                    namespace["configure_source"]()
+                saved = namespace["read_env_file"](namespace["ENV_FILE"])
+                self.assertEqual(saved.get("PUBLICVPNLIST_ENABLED"), expected_enabled)
+                self.assertEqual(saved_configs[-1]["node_sources"], expected_sources)
+
+            namespace["getch"] = lambda: "1"
+            namespace["save_publicvpnlist_environment"] = lambda _updates: False
+            before = len(saved_configs)
+            with contextlib.redirect_stdout(io.StringIO()):
+                namespace["configure_source"]()
+            self.assertEqual(len(saved_configs), before)
+
+            namespace["save_publicvpnlist_environment"] = original_env_writer
+            namespace["save_ui_cfg"] = lambda _cfg: False
+            namespace["getch"] = lambda: "1"
+            with contextlib.redirect_stdout(io.StringIO()):
+                namespace["configure_source"]()
+            rolled_back = namespace["read_env_file"](namespace["ENV_FILE"])
+            self.assertEqual(rolled_back.get("PUBLICVPNLIST_ENABLED"), "0")
 
 
 if __name__ == "__main__":

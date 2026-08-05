@@ -60,17 +60,24 @@ def profile_is_usable(
         return False
     if not looks_like_openvpn_config(profile.get("config_text")):
         return False
-    timestamp = profile.get("last_seen_at")
-    if timestamp in (None, "", 0):
-        timestamp = profile.get("config_validated_at")
+    seen_timestamp = profile.get("last_seen_at")
+    validated_timestamp = profile.get("config_validated_at")
+    if seen_timestamp in (None, "", 0) or validated_timestamp in (None, "", 0):
+        return False
     try:
-        timestamp_value = float(timestamp)
+        seen_value = float(seen_timestamp)
+        validated_value = float(validated_timestamp)
     except (TypeError, ValueError):
         return False
-    if not math.isfinite(timestamp_value) or timestamp_value <= 0:
+    if (
+        not math.isfinite(seen_value)
+        or not math.isfinite(validated_value)
+        or seen_value <= 0
+        or validated_value <= 0
+    ):
         return False
     current = time.time() if now is None else now
-    return current - timestamp_value < stale_seconds
+    return current - seen_value < stale_seconds and current - validated_value < stale_seconds
 
 
 def cache_profile_summary(
