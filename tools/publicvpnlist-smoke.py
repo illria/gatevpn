@@ -77,6 +77,14 @@ def _redacted_error(exc: BaseException) -> dict[str, Any]:
             "token_response_keys",
             "token_response_has_url",
             "token_response_has_token",
+            "content_type",
+            "body_kind",
+            "download_page_content_type",
+            "download_page_body_kind",
+            "check_content_type",
+            "check_body_kind",
+            "token_content_type",
+            "token_body_kind",
         ):
             if key in flow and flow.get(key) not in (None, ""):
                 flow_summary[key] = flow.get(key)
