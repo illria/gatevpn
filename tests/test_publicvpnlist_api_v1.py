@@ -1633,7 +1633,7 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
                 metadata.update({"status": 200, "content_type": "application/json"})
                 return json.dumps({"ok": True, "status": "ok"}).encode()
             if parsed.path == "/get_token.php":
-                metadata.update({"status": 200, "content_type": "application/json"})
+                metadata.update({"status": 200, "content_type": "text/html"})
                 return json.dumps({"ok": True, "token": "fixture-one-time-token"}).encode()
             if parsed.path == "/download.php":
                 metadata.update({"status": 200, "content_type": "application/x-openvpn-profile"})
