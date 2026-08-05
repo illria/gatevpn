@@ -160,19 +160,19 @@ PUBLICVPNLIST_STALE_PROFILE_SECONDS=604800
 PUBLICVPNLIST_CONFIG_TIMEOUT_SECONDS=45
 PUBLICVPNLIST_MAX_REDIRECTS=5
 PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS=
-PUBLICVPNLIST_LIVE_FLOW_MAX_ATTEMPTS=5
-PUBLICVPNLIST_LIVE_FLOW_DELAY_SECONDS=0.25
-PUBLICVPNLIST_LIVE_FLOW_MAX_FAILURES=5
-PUBLICVPNLIST_LIVE_FLOW_MAX_SECONDS=90
+PUBLICVPNLIST_LIVE_FLOW_MAX_ATTEMPTS=3
+PUBLICVPNLIST_LIVE_FLOW_DELAY_SECONDS=0.2
+PUBLICVPNLIST_LIVE_FLOW_MAX_FAILURES=3
+PUBLICVPNLIST_LIVE_FLOW_MAX_SECONDS=30
 PUBLICVPNLIST_API_REFRESH_SECONDS=900
 PUBLICVPNLIST_API_MAX_STALE_SECONDS=21600
-PUBLICVPNLIST_API_TIMEOUT_SECONDS=20
-PUBLICVPNLIST_API_MAX_RETRIES=2
+PUBLICVPNLIST_API_TIMEOUT_SECONDS=10
+PUBLICVPNLIST_API_MAX_RETRIES=1
 PUBLICVPNLIST_API_MAX_PAGES=20
 PUBLICVPNLIST_API_MAX_RECORDS=4000
 PUBLICVPNLIST_API_PER_PAGE=200
 PUBLICVPNLIST_API_MAX_RETRY_AFTER_SECONDS=300
-PUBLICVPNLIST_API_MAX_REQUESTS_PER_REFRESH=60
+PUBLICVPNLIST_API_MAX_REQUESTS_PER_REFRESH=30
 ```
 
 `PUBLICVPNLIST_API_REFRESH_SECONDS` 是 API metadata 的刷新尝试间隔，`PUBLICVPNLIST_REFRESH_SECONDS` 仍用于人工快照；它们都不是已验证配置的硬过期时间。缓存按稳定的 `public id + normalized host + port + proto` 保存已清洗配置，并记录 `snapshot_source_hash`、`snapshot_fetched_at`、`last_refresh_attempt_at`、`last_refresh_success_at`、`config_validated_at`、`last_seen_at` 和 `snapshot_checked_at`。API 失败、304、配置链接失效或部分节点失败时，缓存会保留仍在保留期内的旧验证配置；只有超过 `PUBLICVPNLIST_STALE_PROFILE_SECONDS` 的 profile 才会移除。地区过滤只在读取缓存后执行，切换 PH/FR 不会重新下载已经验证的配置。
@@ -181,7 +181,7 @@ PUBLICVPNLIST_API_MAX_REQUESTS_PER_REFRESH=60
 
 刷新按快照顺序以最多 100 条 eligible 记录为窗口，只对当前窗口的美国元数据执行批量 IP 类型查询；达到 `PUBLICVPNLIST_MAX_NODES` 后停止后续风控和配置请求。前 `PUBLICVPNLIST_MAX_RAW_ROWS` 条原始记录是额外安全上限，不允许国家不会消耗 eligible 扫描配额，也不会消耗配置下载令牌。API live flow 默认最多尝试 5 个 profile，并受 `PUBLICVPNLIST_LIVE_FLOW_MAX_SECONDS` 墙钟上限、请求间隔和连续失败熔断约束；每个 profile 的失败会按 public id/endpoint 保存指数 backoff，并清理已不再出现在完整 API metadata 中的 retry 条目，429 的 `Retry-After` 会被限制在配置上限内。一次性 token 下载不会复用同一个 token 重试，下一次尝试会重新执行完整 Check → token → download 流程。失败 streak 只有在完整 profile 校验并成功加入缓存后才清零。
 
-PublicVPNList 与 VPNGate、IPSpeed 会按规范化的 `host/IP + port + tcp/udp` endpoint 去重；同一 endpoint 的优先级为 VPNGate > IPSpeed > PublicVPNList。VPNBook 和 Vpngate-Scraper 不参与这次跨来源优先级去重。DNS 临时失败仍保留 hostname key，协议或端口不同的 endpoint 不会误去重。`PUBLICVPNLIST_MAX_NODES` 限制最终节点数，`PUBLICVPNLIST_MAX_SCAN_ROWS` 限制扫描记录数；被美国住宅规则拒绝的节点不消耗最终配额。美国风控按最多 100 个节点一批调用现有 `vpn_utils.enrich_ip_info()`。
+API 元数据刷新在采集流程之外的单例后台线程中执行；服务启动前会先恢复仍在保留期内的已验证 PublicVPNList 配置，因此 API 超时、限流或官网实时下载失败不会阻塞主服务，也不会覆盖 VPNGate、VPNBook、IPSpeed 或 Vpngate-Scraper 的结果。后台刷新完成后，后续采集轮次会读取新缓存；API live flow 具有独立的请求次数、profile 尝试次数和整轮墙钟上限。\n\nPublicVPNList 与 VPNGate、IPSpeed 会按规范化的 `host/IP + port + tcp/udp` endpoint 去重；同一 endpoint 的优先级为 VPNGate > IPSpeed > PublicVPNList。VPNBook 和 Vpngate-Scraper 不参与这次跨来源优先级去重。DNS 临时失败仍保留 hostname key，协议或端口不同的 endpoint 不会误去重。`PUBLICVPNLIST_MAX_NODES` 限制最终节点数，`PUBLICVPNLIST_MAX_SCAN_ROWS` 限制扫描记录数；被美国住宅规则拒绝的节点不消耗最终配额。美国风控按最多 100 个节点一批调用现有 `vpn_utils.enrich_ip_info()`。
 
 ### PublicVPNList 手动真实快照冒烟测试
 
