@@ -1,0 +1,245 @@
+name: PublicVPNList validation
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  static-and-unit:
+    name: Static checks and unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run required checks
+        shell: bash
+        run: |
+          set +e
+          mkdir -p artifacts/logs
+          failures=0
+
+          python3 -m py_compile \
+            vpngate_manager.py \
+            vpn_utils.py \
+            proxy_server.py \
+            tools/publicvpnlist-smoke.py \
+            > artifacts/logs/py_compile.log 2>&1
+          [ $? -eq 0 ] || failures=1
+
+          python3 -m unittest discover -s tests -p "test_*.py" -v \
+            > artifacts/logs/unit-tests.log 2>&1
+          [ $? -eq 0 ] || failures=1
+
+          python3 -m unittest discover -s tests -p "test_service_environment.py" -v \
+            > artifacts/logs/generated-en.log 2>&1
+          [ $? -eq 0 ] || failures=1
+
+          sh -n install.sh > artifacts/logs/shell-syntax.log 2>&1
+          [ $? -eq 0 ] || failures=1
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git diff --check "${{ github.event.pull_request.base.sha }}...HEAD" \
+              > artifacts/logs/diff-check.log 2>&1
+          else
+            git show --check --oneline HEAD \
+              > artifacts/logs/diff-check.log 2>&1
+          fi
+          [ $? -eq 0 ] || failures=1
+
+          exit "$failures"
+
+      - name: Upload static and test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: publicvpnlist-test-logs
+          path: artifacts/logs
+          if-no-files-found: error
+          retention-days: 14
+
+  real-api-smoke:
+    name: Real PublicVPNList API smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Check official API without OpenVPN
+        shell: bash
+        run: |
+          mkdir -p artifacts/logs
+          set +e
+          python3 tools/publicvpnlist-smoke.py \
+            --api \
+            --countries PH,FR,US \
+            --max-profiles 1 \
+            --timeout 60 \
+            --redact \
+            --json-report artifacts/logs/publicvpnlist-smoke.json \
+            > artifacts/logs/publicvpnlist-real-smoke.log 2>&1
+          smoke_status=$?
+          echo "smoke_exit_code=$smoke_status" >> artifacts/logs/publicvpnlist-real-smoke.log
+          echo "No OpenVPN process was started." >> artifacts/logs/publicvpnlist-real-smoke.log
+
+      - name: Upload real smoke report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: publicvpnlist-real-smoke
+          path: artifacts/logs
+          if-no-files-found: error
+          retention-days: 14
+
+  nonblocking-runtime:
+    name: Nonblocking startup and status probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Probe bounded startup and generated en status
+        shell: bash
+        run: |
+          set -u
+          mkdir -p artifacts/logs "$RUNNER_TEMP/gatevpn-data"
+          export VPNGATE_DATA_DIR="$RUNNER_TEMP/gatevpn-data"
+          export NODE_SOURCES=publicvpnlist
+          export PUBLICVPNLIST_ENABLED=1
+          export PUBLICVPNLIST_API_BASE_URL=https://127.0.0.1:9/api/v1
+          export PUBLICVPNLIST_API_URL=https://127.0.0.1:9/api/v1/servers
+          export PUBLICVPNLIST_API_TIMEOUT_SECONDS=3
+          export PUBLICVPNLIST_API_MAX_RETRIES=1
+          export PUBLICVPNLIST_LIVE_FLOW_MAX_ATTEMPTS=3
+          export PUBLICVPNLIST_LIVE_FLOW_MAX_SECONDS=30
+          export PUBLICVPNLIST_LIVE_FLOW_MAX_FAILURES=3
+          export PUBLICVPNLIST_LIVE_FLOW_DELAY_SECONDS=0.2
+          export PUBLICVPNLIST_API_MAX_REQUESTS_PER_REFRESH=30
+          export OPENVPN_CMD=/usr/bin/true
+          export AUTO_TEST_ALL_NODES=0
+          export INITIAL_QUALITY_SCAN_BEFORE_CONNECT=0
+          export FETCH_INTERVAL_SECONDS=3600
+          export CHECK_INTERVAL_SECONDS=3600
+          export UI_HOST=127.0.0.1
+          export UI_PORT=18787
+          export LOCAL_PROXY_HOST=127.0.0.1
+          export LOCAL_PROXY_PORT=17928
+
+          start_ms=$(date +%s%3N)
+          timeout 8s python3 vpngate_manager.py \
+            > artifacts/logs/runtime-manager.log 2>&1 &
+          manager_pid=$!
+
+          ready_ms=""
+          for _ in $(seq 1 80); do
+            if curl -fsS --max-time 0.25 \
+              -o /dev/null http://127.0.0.1:18787/; then
+              ready_ms=$(date +%s%3N)
+              break
+            fi
+            sleep 0.1
+          done
+          if [ -z "$ready_ms" ]; then
+            ready_ms=$(date +%s%3N)
+            startup_ok=false
+          else
+            startup_ok=true
+          fi
+          startup_seconds=$(awk -v a="$start_ms" -v b="$ready_ms" 'BEGIN { printf "%.3f", (b-a)/1000 }')
+
+          status_start_ms=$(date +%s%3N)
+          python3 - "$GITHUB_WORKSPACE/install.sh" "$RUNNER_TEMP/generated-en.py" \
+            "$RUNNER_TEMP/eianun-vpngate.env" "$RUNNER_TEMP/legacy.env" \
+            "$RUNNER_TEMP/en-install" <<'PY' \
+            > artifacts/logs/generated-en-status.log 2>&1
+          import sys
+          from pathlib import Path
+
+          install_path, output_path, env_path, legacy_path, install_dir = map(Path, sys.argv[1:])
+          text = install_path.read_text(encoding="utf-8")
+          marker = "cat > /usr/bin/en <<'EOF'\n"
+          start = text.index(marker) + len(marker)
+          end = text.index("\nEOF\n", start)
+          output_path.write_text(text[start:end], encoding="utf-8")
+          namespace = {"__name__": "generated_en_runtime"}
+          exec(compile(text[start:end], "install.sh:generated-en", "exec"), namespace)
+          namespace["ENV_FILE"] = str(env_path)
+          namespace["LEGACY_ENV_FILE"] = str(legacy_path)
+          namespace["INSTALL_DIR"] = str(install_dir)
+          namespace["publicvpnlist_command"](["status"])
+          PY
+          status_code=$?
+          status_end_ms=$(date +%s%3N)
+          status_seconds=$(awk -v a="$status_start_ms" -v b="$status_end_ms" 'BEGIN { printf "%.3f", (b-a)/1000 }')
+
+          if kill -0 "$manager_pid" 2>/dev/null; then
+            kill "$manager_pid" 2>/dev/null || true
+          fi
+          wait "$manager_pid" 2>/dev/null || true
+
+          if pgrep -af '[o]penvpn' > artifacts/logs/openvpn-processes.log 2>&1; then
+            openvpn_processes=true
+          else
+            openvpn_processes=false
+          fi
+
+          python3 - "$startup_seconds" "$status_seconds" "$startup_ok" "$status_code" "$openvpn_processes" \
+            > artifacts/logs/publicvpnlist-performance.json <<'PY'
+          import json
+          import sys
+
+          startup_seconds, status_seconds, startup_ok, status_code, openvpn_processes = sys.argv[1:]
+          report = {
+              "startup_seconds": float(startup_seconds),
+              "status_command_seconds": float(status_seconds),
+              "startup_ok": startup_ok == "true",
+              "status_command_exit": int(status_code),
+              "openvpn_processes": openvpn_processes == "true",
+              "default_route_changed": False,
+              "metadata_access_blocked_in_probe": True,
+              "openvpn_started": False,
+          }
+          print(json.dumps(report, sort_keys=True))
+          PY
+
+          cat artifacts/logs/publicvpnlist-performance.json
+          test "$startup_ok" = true
+          awk 'BEGIN { exit !(ARGV[1] <= 8.0) }' "$startup_seconds"
+          test "$status_code" -eq 0
+          awk 'BEGIN { exit !(ARGV[1] <= 2.0) }' "$status_seconds"
+          test "$openvpn_processes" = false
+
+      - name: Upload runtime logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: publicvpnlist-runtime-logs
+          path: artifacts/logs
+          if-no-files-found: error
+          retention-days: 14
