@@ -88,7 +88,7 @@ jobs:
     name: Real PublicVPNList API smoke
     runs-on: ubuntu-latest
     timeout-minutes: 20
-      steps:
+    steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
