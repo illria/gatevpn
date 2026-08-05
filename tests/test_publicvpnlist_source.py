@@ -132,7 +132,7 @@ class PublicVPNListSourceTests(unittest.TestCase):
             if row.get("download_page_url"):
                 pages[row["download_page_url"]] = b"<html><body>server page</body></html>"
 
-        def fixture_http_get(url, timeout=15, max_bytes=None, accept=None, opener=None, metadata=None):
+        def fixture_http_get(url, timeout=15, max_bytes=None, accept=None, opener=None, metadata=None, **_kwargs):
             if http_get is not None:
                 return http_get(
                     url,
