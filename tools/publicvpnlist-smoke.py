@@ -71,6 +71,12 @@ def _redacted_error(exc: BaseException) -> dict[str, Any]:
             "profile_download_attempted",
             "profile_downloaded",
             "profile_validation_failed",
+            "download_page_loaded",
+            "download_page_status",
+            "check_response_keys",
+            "token_response_keys",
+            "token_response_has_url",
+            "token_response_has_token",
         ):
             if key in flow and flow.get(key) not in (None, ""):
                 flow_summary[key] = flow.get(key)
@@ -228,6 +234,12 @@ def _download_one(manager, raw: dict[str, Any], timeout: int) -> dict[str, Any]:
                 "profile_download_attempted",
                 "profile_downloaded",
                 "profile_validation_failed",
+                "download_page_loaded",
+                "download_page_status",
+                "check_response_keys",
+                "token_response_keys",
+                "token_response_has_url",
+                "token_response_has_token",
             )
             if metadata.get(key) not in (None, "")
         })
