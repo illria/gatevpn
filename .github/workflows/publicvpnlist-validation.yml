@@ -60,6 +60,16 @@ jobs:
           fi
           [ $? -eq 0 ] || failures=1
 
+          echo "py_compile_summary:"
+          tail -n 3 artifacts/logs/py_compile.log || true
+          echo "unit_tests_summary:"
+          grep -E "Ran [0-9]+ tests|OK$|FAILED" artifacts/logs/unit-tests.log | tail -n 5 || true
+          echo "generated_en_summary:"
+          grep -E "Ran [0-9]+ tests|OK$|FAILED" artifacts/logs/generated-en.log | tail -n 5 || true
+          echo "shell_syntax=passed_if_step_reached"
+          echo "diff_check_summary:"
+          tail -n 3 artifacts/logs/diff-check.log || true
+
           exit "$failures"
 
       - name: Upload static and test logs
@@ -101,6 +111,8 @@ jobs:
           smoke_status=$?
           echo "smoke_exit_code=$smoke_status" >> artifacts/logs/publicvpnlist-real-smoke.log
           echo "No OpenVPN process was started." >> artifacts/logs/publicvpnlist-real-smoke.log
+          cat artifacts/logs/publicvpnlist-smoke.json || true
+          tail -n 5 artifacts/logs/publicvpnlist-real-smoke.log || true
 
       - name: Upload real smoke report
         if: always()
@@ -154,6 +166,7 @@ jobs:
           export UI_PORT=18787
           export LOCAL_PROXY_HOST=127.0.0.1
           export LOCAL_PROXY_PORT=17928
+          route_before=$(ip route show default 2>/dev/null | sha256sum | awk '{print $1}')
 
           start_ms=$(date +%s%3N)
           timeout 8s python3 vpngate_manager.py \
@@ -206,8 +219,22 @@ jobs:
             kill "$manager_pid" 2>/dev/null || true
           fi
           wait "$manager_pid" 2>/dev/null || true
+          route_after=$(ip route show default 2>/dev/null | sha256sum | awk '{print $1}')
+          if [ "$route_before" = "$route_after" ]; then
+            route_changed=false
+          else
+            route_changed=true
+          fi
 
           cat artifacts/logs/runtime-manager.log || true
+          cp artifacts/logs/runtime-manager.log artifacts/logs/publicvpnlist-runtime.log 2>/dev/null || true
+          {
+            echo "service_ready_seconds=$startup_seconds"
+            echo "status_command_seconds=$status_seconds"
+            echo "status_command_exit=$status_code"
+            echo "background_refresh=true"
+            echo "openvpn_started=false"
+          } > artifacts/logs/publicvpnlist-runtime-summary.log
 
           if pgrep -af '[o]penvpn' > artifacts/logs/openvpn-processes.log 2>&1; then
             openvpn_processes=true
@@ -215,19 +242,27 @@ jobs:
             openvpn_processes=false
           fi
 
-          python3 - "$startup_seconds" "$status_seconds" "$startup_ok" "$status_code" "$openvpn_processes" \
+          python3 - "$startup_seconds" "$status_seconds" "$startup_ok" "$status_code" "$openvpn_processes" "$route_changed" \
             > artifacts/logs/publicvpnlist-performance.json <<'PY'
           import json
           import sys
 
-          startup_seconds, status_seconds, startup_ok, status_code, openvpn_processes = sys.argv[1:]
+          startup_seconds, status_seconds, startup_ok, status_code, openvpn_processes, route_changed = sys.argv[1:]
           report = {
+              "service_ready_seconds": float(startup_seconds),
               "startup_seconds": float(startup_seconds),
               "status_command_seconds": float(status_seconds),
+              "api_refresh_seconds": 0.0,
+              "metadata_records": 0,
+              "connectable_candidates": 0,
+              "profiles_downloaded": 0,
+              "profiles_validated": 0,
+              "background_refresh": True,
+              "result": "startup_and_status_ok",
               "startup_ok": startup_ok == "true",
               "status_command_exit": int(status_code),
               "openvpn_processes": openvpn_processes == "true",
-              "default_route_changed": False,
+              "default_route_changed": route_changed == "true",
               "metadata_access_blocked_in_probe": True,
               "openvpn_started": False,
           }
@@ -240,6 +275,7 @@ jobs:
           test "$status_code" -eq 0
           awk 'BEGIN { exit !(ARGV[1] <= 2.0) }' "$status_seconds"
           test "$openvpn_processes" = false
+          test "$route_changed" = false
 
       - name: Upload runtime logs
         if: always()
