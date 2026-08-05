@@ -1626,6 +1626,9 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
                     "method": method,
                 }
             )
+            if parsed.path.startswith("/download/"):
+                metadata.update({"status": 200, "content_type": "text/html"})
+                return b"<html><body>fixture download page</body></html>"
             if parsed.path == "/test_server.php":
                 metadata.update({"status": 200, "content_type": "application/json"})
                 return json.dumps({"ok": True, "status": "ok"}).encode()
@@ -1647,7 +1650,7 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
             result = vpngate_manager.fetch_publicvpnlist_candidates(["PH"], set())
 
         self.assertEqual(len(result), 1)
-        self.assertEqual([call["path"] for call in calls], ["/test_server.php", "/get_token.php", "/download.php"])
+        self.assertEqual([call["path"] for call in calls], ["/download/111206/", "/test_server.php", "/get_token.php", "/download.php"])
         self.assertEqual(calls[0]["query"]["id"], ["111206"])
         self.assertEqual(calls[0]["accept"], "application/json")
         self.assertEqual(calls[0]["headers"]["X-Requested-With"], "XMLHttpRequest")
@@ -1669,7 +1672,11 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
         calls = []
 
         def http_get(url, metadata=None, **_kwargs):
-            calls.append(urlsplit(url).path)
+            path = urlsplit(url).path
+            calls.append(path)
+            if path.startswith("/download/"):
+                metadata.update({"status": 200, "content_type": "text/html"})
+                return b"<html><body>fixture download page</body></html>"
             metadata.update({"status": 200, "content_type": "application/json"})
             return json.dumps({"ok": False, "status": "fail"}).encode()
 
@@ -1683,7 +1690,7 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
             result = vpngate_manager.fetch_publicvpnlist_candidates(["PH"], set())
 
         self.assertEqual(result, [])
-        self.assertEqual(calls, ["/test_server.php"])
+        self.assertEqual(calls, ["/download/111207/", "/test_server.php"])
         stats = vpngate_manager.load_publicvpnlist_cache()["last_refresh_stats"]
         self.assertEqual(stats["live_check_attempted"], 1)
         self.assertEqual(stats["live_check_succeeded"], 0)
@@ -1832,6 +1839,9 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
         def http_get(url, metadata=None, **_kwargs):
             path = urlsplit(url).path
             calls.append(path)
+            if path.startswith("/download/"):
+                metadata.update({"status": 200, "content_type": "text/html"})
+                return b"<html><body>fixture download page</body></html>"
             if path == "/test_server.php":
                 metadata.update({"status": 200, "content_type": "application/json"})
                 return json.dumps({"ok": True, "status": "ok"}).encode()
@@ -1852,7 +1862,7 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
             with self.assertRaises(vpngate_manager.PublicVPNListSnapshotError):
                 vpngate_manager.fetch_publicvpnlist_official_config(row, metadata={})
 
-        self.assertEqual(calls, ["/test_server.php", "/get_token.php", "/download.php"])
+        self.assertEqual(calls, ["/download/111208/", "/test_server.php", "/get_token.php", "/download.php"])
 
     def test_live_flow_budget_and_circuit_breaker_stop_additional_profiles(self):
         rows = [self.record(f"budget-{index}", with_config=False) for index in range(4)]
