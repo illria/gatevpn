@@ -2369,6 +2369,41 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
         self.assertEqual(refreshed_profile["ip_type"], "hosting")
         self.assertEqual(refreshed_profile["risk_sources"], ["ipwho.is"])
 
+
+    def test_official_metadata_export_maps_api_endpoint_to_web_id(self):
+        api_row = self.record("ph-map", country="PH", with_config=False)
+        export_row = dict(api_row)
+        export_row["server_page_url"] = (
+            "https://publicvpnlist.com/download/1448228/"
+        )
+        export_payload = json.dumps({"records": [export_row]}).encode("utf-8")
+        metadata = {}
+        with mock.patch.object(
+            vpngate_manager,
+            "PUBLICVPNLIST_API_BASE_URL",
+            "https://publicvpnlist.com/api/v1",
+        ), mock.patch.object(
+            vpngate_manager,
+            "PUBLICVPNLIST_API_URL",
+            "https://publicvpnlist.com/api/v1/servers",
+        ), mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_validate_download_url",
+            return_value="publicvpnlist.com",
+        ), mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_http_get",
+            return_value=export_payload,
+        ) as http_get:
+            mapped = vpngate_manager.publicvpnlist_attach_official_web_ids(
+                [api_row],
+                metadata,
+            )
+
+        self.assertEqual(mapped[0]["web_download_id"], "1448228")
+        self.assertEqual(metadata["metadata_export_matches"], 1)
+        http_get.assert_called_once()
+
     def test_persisted_live_flow_backoff_skips_new_official_flow(self):
         api_cache = vpngate_manager.publicvpnlist_api_cache_default()
         api_cache.update(
