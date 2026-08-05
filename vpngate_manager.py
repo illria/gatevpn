@@ -5085,9 +5085,14 @@ def _publicvpnlist_json_response(
     body: bytes,
     metadata: dict[str, Any],
     description: str,
+    allow_non_json_content_type: bool = False,
 ) -> dict[str, Any]:
     content_type = str(metadata.get("content_type") or "").split(";", 1)[0].strip().lower()
-    if content_type and content_type not in {"application/json", "text/json"}:
+    if (
+        content_type
+        and content_type not in {"application/json", "text/json"}
+        and not allow_non_json_content_type
+    ):
         raise PublicVPNListSnapshotError(f"PublicVPNList {description} 响应不是 JSON")
     try:
         payload = json.loads(body.decode("utf-8"))
@@ -5267,7 +5272,12 @@ def fetch_publicvpnlist_official_config(
     flow_metadata.update(token_metadata)
     flow_metadata["token_content_type"] = str(token_metadata.get("content_type") or "").split(";", 1)[0].lower()
     flow_metadata["token_body_kind"] = str(token_metadata.get("body_kind") or "")
-    token_payload = _publicvpnlist_json_response(token_response, token_metadata, "临时令牌")
+    token_payload = _publicvpnlist_json_response(
+        token_response,
+        token_metadata,
+        "临时令牌",
+        allow_non_json_content_type=True,
+    )
     flow_metadata["token_response_keys"] = sorted(
         str(key) for key in token_payload.keys()
     )
