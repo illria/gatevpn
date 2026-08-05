@@ -158,6 +158,83 @@ def _download_one(manager, raw: dict[str, Any], timeout: int) -> dict[str, Any]:
     }
 
 
+
+def _run_snapshot_compat(manager) -> int:
+    """Preserve the original two-phase temporary-snapshot smoke contract."""
+
+    snapshot_url = os.environ.get("PUBLICVPNLIST_SNAPSHOT_URL", "").strip()
+    if not snapshot_url:
+        print("错误：请设置 PUBLICVPNLIST_SNAPSHOT_URL，或使用 --api。", file=sys.stderr)
+        return 2
+    os.environ["PUBLICVPNLIST_SNAPSHOT_FILE"] = ""
+    try:
+        payload = manager.fetch_publicvpnlist_snapshot()
+        records = manager.publicvpnlist_payload_records(payload)
+    except Exception:
+        print("失败：临时快照请求或 JSON 解析失败。", file=sys.stderr)
+        return 1
+    selected = None
+    for raw in records:
+        row = manager.normalize_publicvpnlist_row(raw)
+        if row and row.get("country_short") in {"PH", "FR"} and row.get("temporary_ovpn_url"):
+            selected = row
+            break
+    if selected is None:
+        print("失败：快照中没有带临时配置 URL 的 PH/FR 节点。", file=sys.stderr)
+        return 1
+    temporary_url = str(selected["temporary_ovpn_url"])
+    try:
+        discovered_host = manager.publicvpnlist_validate_download_url(
+            temporary_url,
+            require_allowlist=False,
+        )
+    except Exception:
+        print("失败：temporary_ovpn_url 未通过 HTTPS/地址安全检查。", file=sys.stderr)
+        return 1
+    allowed_hosts = manager.publicvpnlist_allowed_download_hosts()
+    if discovered_host not in allowed_hosts:
+        print(
+            f"发现阶段通过：download_host={discovered_host}；未请求配置。\n"
+            "请将该 hostname 加入 PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS 后重试。",
+            file=sys.stderr,
+        )
+        return 2
+    metadata: dict[str, Any] = {}
+    try:
+        config_text = manager.fetch_publicvpnlist_config(
+            temporary_url,
+            metadata=metadata,
+        )
+    except Exception:
+        rejected_host = str(metadata.get("rejected_download_host") or "").strip().lower()
+        if rejected_host:
+            print(
+                f"失败：重定向目标 hostname={rejected_host} 不在允许列表；加入后重试。",
+                file=sys.stderr,
+            )
+        else:
+            print("失败：temporary_ovpn_url 请求、重定向或配置读取失败。", file=sys.stderr)
+        return 1
+    if not manager.looks_like_openvpn_config(config_text):
+        print("失败：临时链接内容不是 OpenVPN 配置。", file=sys.stderr)
+        return 1
+    node = manager.publicvpnlist_row_to_node(selected, config_text)
+    if not node:
+        print("失败：remote、port、proto 不一致，或配置清理/校验失败。", file=sys.stderr)
+        return 1
+    print(
+        "通过：country={country} remote={host}:{port} proto={proto} redirects={redirects} "
+        "final_download_host={download_host} config=valid cleaned=true openvpn=not_started".format(
+            country=node.get("country_short", ""),
+            host=node.get("remote_host", ""),
+            port=node.get("remote_port", ""),
+            proto=node.get("proto", ""),
+            redirects=metadata.get("redirect_count", 0),
+            download_host=metadata.get("final_download_host", discovered_host),
+        )
+    )
+    return 0
+
 def run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     manager = _load_manager()
     started = time.monotonic()
@@ -294,7 +371,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = _parse_args(argv or sys.argv[1:])
+    if argv is None:
+        argv = sys.argv[1:] if __name__ == "__main__" else []
+    args = _parse_args(argv)
+    manager = _load_manager()
+    if not args.api and os.environ.get("PUBLICVPNLIST_SNAPSHOT_URL", "").strip():
+        return _run_snapshot_compat(manager)
     try:
         code, report = run(args)
     except Exception as exc:
