@@ -265,8 +265,8 @@ def run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         "countries": countries,
         "metadata_records": 0,
         "metadata_with_download_path": 0,
-        "metadata_export_records": 0,
-        "metadata_export_matches": 0,
+        "web_catalog_records": 0,
+        "web_catalog_matches": 0,
         "metadata_only_skipped": 0,
         "connectable_candidates": 0,
         "config_downloads": 0,
@@ -316,23 +316,23 @@ def run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
 
     report["errors"] = endpoint_errors
     report["metadata_records"] = len(all_records)
-    metadata_export_meta: dict[str, Any] = {}
+    web_catalog_meta: dict[str, Any] = {}
     all_records = manager.publicvpnlist_attach_official_web_ids(
         all_records,
-        metadata_export_meta,
+        web_catalog_meta,
     )
-    report["metadata_export_records"] = int(
-        metadata_export_meta.get("metadata_export_records") or 0
+    report["web_catalog_records"] = int(
+        web_catalog_meta.get("web_catalog_records") or 0
     )
-    report["metadata_export_matches"] = int(
-        metadata_export_meta.get("metadata_export_matches") or 0
+    report["web_catalog_matches"] = int(
+        web_catalog_meta.get("web_catalog_matches") or 0
     )
-    if metadata_export_meta.get("metadata_export_error_code"):
+    if web_catalog_meta.get("web_catalog_error_code"):
         report["errors"].append(
             {
-                "category": "metadata_export_error",
-                "status": int(metadata_export_meta.get("metadata_export_status") or 0),
-                "type": str(metadata_export_meta.get("metadata_export_error_code")),
+                "category": "web_catalog_error",
+                "status": int(web_catalog_meta.get("web_catalog_status") or 0),
+                "type": str(web_catalog_meta.get("web_catalog_error_code")),
             }
         )
     normalized_rows = [
