@@ -206,6 +206,44 @@ def _select_records(manager, records: list[dict[str, Any]], countries: list[str]
     return selected
 
 
+_FLOW_DIAGNOSTIC_KEYS = (
+    "status",
+    "retry_after",
+    "live_check_succeeded",
+    "live_check_status",
+    "token_request_attempted",
+    "token_generated",
+    "profile_download_attempted",
+    "profile_downloaded",
+    "profile_validation_failed",
+    "download_page_loaded",
+    "download_page_status",
+    "check_response_keys",
+    "token_response_keys",
+    "token_response_has_url",
+    "token_response_has_token",
+    "content_type",
+    "body_kind",
+    "download_page_content_type",
+    "download_page_body_kind",
+    "check_content_type",
+    "check_body_kind",
+    "token_content_type",
+    "token_body_kind",
+)
+
+
+def _attach_flow_diagnostic(exc: BaseException, metadata: dict[str, Any], stage: str = "") -> None:
+    summary = {
+        key: metadata.get(key)
+        for key in _FLOW_DIAGNOSTIC_KEYS
+        if metadata.get(key) not in (None, "")
+    }
+    if stage:
+        summary["validation_stage"] = stage
+    setattr(exc, "_pvl_flow", summary)
+
+
 def _download_one(manager, raw: dict[str, Any], timeout: int) -> dict[str, Any]:
     row = manager.normalize_publicvpnlist_row(raw)
     if not row:
@@ -230,43 +268,22 @@ def _download_one(manager, raw: dict[str, Any], timeout: int) -> dict[str, Any]:
                 deadline=deadline,
             )
     except Exception as exc:
-        setattr(exc, "_pvl_flow", {
-            key: metadata.get(key)
-            for key in (
-                "status",
-                "retry_after",
-                "live_check_succeeded",
-                "live_check_status",
-                "token_request_attempted",
-                "token_generated",
-                "profile_download_attempted",
-                "profile_downloaded",
-                "profile_validation_failed",
-                "download_page_loaded",
-                "download_page_status",
-                "check_response_keys",
-                "token_response_keys",
-                "token_response_has_url",
-                "token_response_has_token",
-                "content_type",
-                "body_kind",
-                "download_page_content_type",
-                "download_page_body_kind",
-                "check_content_type",
-                "check_body_kind",
-                "token_content_type",
-                "token_body_kind",
-            )
-            if metadata.get(key) not in (None, "")
-        })
+        _attach_flow_diagnostic(exc, metadata)
         raise
-    actual_hash = str(metadata.get("response_sha256") or "").strip().lower()
-    expected_hash = str(row.get("config_sha256") or "").strip().lower()
-    if expected_hash and actual_hash != expected_hash:
-        raise ValueError("config_sha256_mismatch")
-    node = manager.publicvpnlist_row_to_node(row, config_text)
-    if not node:
-        raise ValueError("endpoint_validation_failed")
+
+    try:
+        actual_hash = str(metadata.get("response_sha256") or "").strip().lower()
+        expected_hash = str(row.get("config_sha256") or "").strip().lower()
+        if expected_hash and actual_hash != expected_hash:
+            raise ValueError("config_sha256_mismatch")
+        node = manager.publicvpnlist_row_to_node(row, config_text)
+        if not node:
+            raise ValueError("endpoint_validation_failed")
+    except Exception as exc:
+        stage = "config_sha256" if str(exc) == "config_sha256_mismatch" else "endpoint_validation"
+        _attach_flow_diagnostic(exc, metadata, stage)
+        raise
+
     return {
         "country": str(node.get("country_short") or ""),
         "host": str(node.get("remote_host") or ""),
@@ -278,7 +295,6 @@ def _download_one(manager, raw: dict[str, Any], timeout: int) -> dict[str, Any]:
         "initial_download_host": str(metadata.get("initial_download_host") or ""),
         "final_download_host": str(metadata.get("final_download_host") or ""),
     }
-
 
 
 def _run_snapshot_compat(manager) -> int:
