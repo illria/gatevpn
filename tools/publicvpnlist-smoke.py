@@ -33,11 +33,16 @@ def _load_manager():
 def _redacted_error(exc: BaseException) -> dict[str, Any]:
     if isinstance(exc, urllib.error.HTTPError):
         status = int(getattr(exc, "code", 0) or 0)
-        category = "rate_limited" if status == 429 else "http_error"
+        if status == 429:
+            category = "rate_limited"
+        elif status in {401, 403, 407}:
+            category = "github_runner_blocked"
+        else:
+            category = "http_error"
         return {"category": category, "status": status, "type": type(exc).__name__}
     if isinstance(exc, (urllib.error.URLError, TimeoutError, OSError)):
         return {"category": "network_error", "status": 0, "type": type(exc).__name__}
-    return {"category": "schema_error", "status": 0, "type": type(exc).__name__}
+    return {"category": "schema_changed", "status": 0, "type": type(exc).__name__}
 
 
 def _api_path_url(manager, base_url: str, path: str, params: dict[str, Any] | None = None) -> str:
@@ -82,13 +87,23 @@ def classify_api_result(
         categories = {str(item.get("category") or "") for item in errors}
         if "rate_limited" in categories:
             return "rate_limited"
-        if categories <= {"network_error", "http_error"}:
+        if "github_runner_blocked" in categories:
             return "github_runner_blocked"
-        return "schema_error"
+        if categories <= {"network_error"}:
+            return "network_error"
+        if "schema_changed" in categories:
+            return "schema_changed"
+        return "http_error"
     if not metadata_records:
         return "metadata_empty"
     if not mapped_records:
-        return "mapping_missing"
+        has_identity = any(
+            str(record.get("id") or record.get("public_id") or "").strip()
+            or str(record.get("hostname") or record.get("host") or "").strip()
+            for record in metadata_records
+            if isinstance(record, dict)
+        )
+        return "mapping_missing" if has_identity else "metadata_only"
     return "api_success"
 
 
