@@ -925,7 +925,10 @@ class PublicVPNListSourceTests(unittest.TestCase):
         ) as config_builder, mock.patch.object(vpngate_manager, "log_to_json") as log_mock:
             result = vpngate_manager.fetch_publicvpnlist_candidates(["PH"], set())
         self.assertEqual(result, [])
-        config_builder.assert_called_once_with(row["temporary_ovpn_url"])
+        config_builder.assert_called_once_with(
+            row["temporary_ovpn_url"],
+            metadata=mock.ANY,
+        )
         messages = " ".join(str(call.args[2]) for call in log_mock.call_args_list if len(call.args) >= 3)
         self.assertIn("temporary_ovpn_url", messages)
         self.assertIn("重新生成", messages)
