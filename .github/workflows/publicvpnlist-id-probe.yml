@@ -1,0 +1,78 @@
+name: PublicVPNList ID compatibility probe
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe-id-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe public and API ID forms without token generation
+        shell: bash
+        run: |
+          set -eu
+          python3 <<'PY'
+          import json
+          import urllib.parse
+          import urllib.request
+          import urllib.error
+
+          api = (
+              "https://publicvpnlist.com/api/v1/servers?"
+              "country=PH&protocol=openvpn&status=online&per_page=1&"
+              "sort=last_checked&order=desc"
+          )
+          request = urllib.request.Request(api, headers={"Accept": "application/json"})
+          with urllib.request.urlopen(request, timeout=20) as response:
+              payload = json.load(response)
+          records = payload.get("data", []) if isinstance(payload, dict) else payload
+          if not records or not isinstance(records[0], dict):
+              raise SystemExit("no API record")
+          public_id = str(records[0].get("id") or "")
+          if not public_id:
+              raise SystemExit("API record has no public ID")
+
+          def probe(value):
+              query = urllib.parse.urlencode({"id": value})
+              url = "https://publicvpnlist.com/test_server.php?" + query
+              req = urllib.request.Request(
+                  url,
+                  headers={"Accept": "application/json", "X-Requested-With": "XMLHttpRequest"},
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as response:
+                      raw = response.read(256 * 1024)
+                      status = int(getattr(response, "status", 200) or 200)
+                      content_type = response.headers.get("Content-Type", "").split(";", 1)[0].lower()
+              except urllib.error.HTTPError as exc:
+                  raw = exc.read(256 * 1024)
+                  status = int(exc.code)
+                  content_type = exc.headers.get("Content-Type", "").split(";", 1)[0].lower()
+              try:
+                  body = json.loads(raw.decode("utf-8"))
+              except Exception:
+                  body = None
+              if isinstance(body, dict):
+                  safe = {
+                      "keys": sorted(str(key) for key in body),
+                      "ok": body.get("ok"),
+                      "status": body.get("status"),
+                      "error_present": bool(body.get("error") or body.get("message")),
+                  }
+              else:
+                  safe = {"json": False}
+              return {"http_status": status, "content_type": content_type, **safe}
+
+          print(json.dumps({
+              "pvl_id_shape": "pvl_" + "<24 hex>" if public_id.startswith("pvl_") else "unexpected",
+              "pvl_id_probe": probe(public_id),
+              "numeric_id_probe": probe("1448228"),
+          }, sort_keys=True))
+          PY
