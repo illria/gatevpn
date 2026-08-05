@@ -1,0 +1,64 @@
+name: PublicVPNList dataset field discovery
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect-dataset:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Inspect redacted dataset shape
+        shell: bash
+        run: |
+          set -eu
+          tmp="$(mktemp)"
+          trap 'rm -f "$tmp"' EXIT
+          curl --fail --silent --show-error --location --max-time 20             --header "Accept: application/json"             "https://publicvpnlist.com/api/v1/dataset" > "$tmp"
+          python3 - "$tmp" <<'PY'
+          import json
+          import sys
+          import urllib.parse
+          payload = json.load(open(sys.argv[1], encoding="utf-8"))
+          print("top_type=" + type(payload).__name__)
+          if isinstance(payload, dict):
+              print("top_keys=" + ",".join(sorted(payload)))
+          def walk(value):
+              if isinstance(value, list):
+                  for item in value:
+                      if isinstance(item, dict):
+                          yield item
+                          return
+                      if isinstance(item, (list, dict)):
+                          yield from walk(item)
+              elif isinstance(value, dict):
+                  for key in ("data", "servers", "records", "items", "dataset"):
+                      if key in value:
+                          yield from walk(value[key])
+          record = next(walk(payload), None)
+          if not isinstance(record, dict):
+              print("first_record=none")
+              raise SystemExit(0)
+          print("record_keys=" + ",".join(sorted(record)))
+          for key in sorted(record):
+              value = record[key]
+              if "url" in key.lower():
+                  if isinstance(value, str):
+                      parsed = urllib.parse.urlsplit(value)
+                      value = (
+                          f"{parsed.scheme}://{parsed.netloc}{parsed.path} "
+                          f"query={'yes' if parsed.query else 'no'} fragment={'yes' if parsed.fragment else 'no'}"
+                          if parsed.scheme and parsed.netloc else "<non-url>"
+                      )
+                  else:
+                      value = "<empty-or-non-string>"
+              elif key in {"config_text", "token", "signature", "password", "secret"}:
+                  value = "<redacted>"
+              print(f"{key}={value!r}")
+          PY
