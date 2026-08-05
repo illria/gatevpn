@@ -7369,14 +7369,24 @@ def sanitize_publicvpnlist_openvpn_config(config_text: str, row: dict[str, Any])
         raise PublicVPNListSnapshotError("OpenVPN 配置缺少可验证 endpoint")
     if global_proto and global_proto != expected_proto:
         raise PublicVPNListSnapshotError("OpenVPN 全局 proto 与快照不一致")
+    matching_expected_port = False
     for remote in remotes:
         remote_proto = str(remote.get("proto") or global_proto or expected_proto)
         if remote.get("proto") and global_proto and remote.get("proto") != global_proto:
             raise PublicVPNListSnapshotError("OpenVPN per-remote proto 与全局 proto 冲突")
         if remote_proto != expected_proto:
             raise PublicVPNListSnapshotError("OpenVPN remote proto 与快照不一致")
-        if int(remote["port"]) != expected_port or not publicvpnlist_hosts_match(row, str(remote["host"])):
+        # The official profile can advertise alternate ports for the same
+        # server.  Keep the boundary strict: every remote must resolve to the
+        # metadata host, and at least one must be the selected metadata port.
+        # Sanitization below drops the alternates and writes exactly one
+        # verified metadata endpoint.
+        if not publicvpnlist_hosts_match(row, str(remote["host"])):
             raise PublicVPNListSnapshotError("OpenVPN remote endpoint 与快照不一致")
+        if int(remote["port"]) == expected_port:
+            matching_expected_port = True
+    if not matching_expected_port:
+        raise PublicVPNListSnapshotError("OpenVPN 配置缺少与快照一致的 endpoint")
 
     kept: list[str] = []
     inline_block = ""
