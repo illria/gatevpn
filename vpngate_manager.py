@@ -2454,6 +2454,7 @@ def publicvpnlist_http_get(
     extra_headers: dict[str, str] | None = None,
     data: bytes | None = None,
     method: str | None = None,
+    allow_html: bool = False,
 ) -> bytes:
     """Fetch a bounded response and reject only clearly identified HTML.
 
@@ -2503,7 +2504,7 @@ def publicvpnlist_http_get(
             chunks.append(chunk)
         body = b"".join(chunks)
     stripped = body.lstrip().lower()
-    if any(stripped.startswith(marker) for marker in (b"<!doctype", b"<html", b"<head", b"<body")):
+    if not allow_html and any(stripped.startswith(marker) for marker in (b"<!doctype", b"<html", b"<head", b"<body")):
         raise PublicVPNListSnapshotError("服务返回 HTML challenge 或页面，而不是 JSON")
     return body
 
@@ -4953,6 +4954,7 @@ def fetch_publicvpnlist_config(
     cookie_jar: cookiejar.CookieJar | None = None,
     max_retries: int | None = None,
     deadline: float | None = None,
+    referer: str | None = None,
 ) -> str:
     """Download one short-lived profile with the same bounded retry policy."""
 
@@ -4986,6 +4988,7 @@ def fetch_publicvpnlist_config(
                 accept="application/x-openvpn-profile,text/plain",
                 opener=opener,
                 metadata=attempt_metadata,
+                extra_headers={"Referer": referer} if referer else None,
             )
             _publicvpnlist_live_flow_check_deadline(deadline, metadata)
             attempt_metadata["response_sha256"] = hashlib.sha256(response_body).hexdigest()
@@ -5144,6 +5147,27 @@ def fetch_publicvpnlist_official_config(
         urllib.request.HTTPCookieProcessor(session_cookies),
         live_redirects,
     )
+    download_page_url = urllib.parse.urljoin(
+        base_url,
+        f"download/{urllib.parse.quote(web_download_id, safe='')}/",
+    )
+    publicvpnlist_validate_download_url(download_page_url)
+    page_metadata: dict[str, Any] = {}
+    publicvpnlist_http_get(
+        download_page_url,
+        timeout=_publicvpnlist_live_flow_timeout(
+            PUBLICVPNLIST_CONFIG_TIMEOUT_SECONDS,
+            deadline,
+            flow_metadata,
+        ),
+        max_bytes=min(PUBLICVPNLIST_MAX_RESPONSE_BYTES, 512 * 1024),
+        accept="text/html",
+        opener=live_opener,
+        metadata=page_metadata,
+        allow_html=True,
+    )
+    flow_metadata["download_page_loaded"] = True
+    flow_metadata["download_page_status"] = int(page_metadata.get("status") or 200)
     check_metadata: dict[str, Any] = {}
     try:
         _publicvpnlist_live_flow_check_deadline(deadline, flow_metadata)
@@ -5158,7 +5182,11 @@ def fetch_publicvpnlist_official_config(
             accept="application/json",
             opener=live_opener,
             metadata=check_metadata,
-            extra_headers={"X-Requested-With": "XMLHttpRequest"},
+            extra_headers={
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": download_page_url,
+                "Origin": base_url.rstrip("/"),
+            },
         )
         _publicvpnlist_live_flow_check_deadline(deadline, flow_metadata)
     except urllib.error.HTTPError as exc:
@@ -5168,6 +5196,9 @@ def fetch_publicvpnlist_official_config(
         raise
     flow_metadata.update(check_metadata)
     check_payload = _publicvpnlist_json_response(check_body, check_metadata, "实时检查")
+    flow_metadata["check_response_keys"] = sorted(
+        str(key) for key in check_payload.keys()
+    )
     check_status = str(check_payload.get("status") or "").strip().lower()
     if not check_payload.get("ok") or check_status != "ok":
         raise PublicVPNListSnapshotError("PublicVPNList 实时检查未通过")
@@ -5198,6 +5229,8 @@ def fetch_publicvpnlist_official_config(
             extra_headers={
                 "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
                 "X-Requested-With": "XMLHttpRequest",
+                "Referer": download_page_url,
+                "Origin": base_url.rstrip("/"),
             },
             data=token_body,
             method="POST",
@@ -5207,7 +5240,13 @@ def fetch_publicvpnlist_official_config(
         _publicvpnlist_capture_http_error(token_metadata, exc)
         flow_metadata.update(token_metadata)
         raise
+    flow_metadata.update(token_metadata)
     token_payload = _publicvpnlist_json_response(token_response, token_metadata, "临时令牌")
+    flow_metadata["token_response_keys"] = sorted(
+        str(key) for key in token_payload.keys()
+    )
+    flow_metadata["token_response_has_url"] = bool(token_payload.get("url"))
+    flow_metadata["token_response_has_token"] = bool(token_payload.get("token"))
     returned_url = str(token_payload.get("url") or "").strip()
     token_value = str(token_payload.get("token") or "").strip()
     if returned_url:
@@ -5236,6 +5275,7 @@ def fetch_publicvpnlist_official_config(
         cookie_jar=session_cookies,
         max_retries=1,
         deadline=deadline,
+        referer=download_page_url,
     )
 
 
