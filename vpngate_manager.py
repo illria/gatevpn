@@ -12266,29 +12266,32 @@ def main() -> None:
     restore_cached_publicvpnlist_nodes()
     threading.Thread(target=proxy_server.start_proxy_server, args=(LOCAL_PROXY_HOST, LOCAL_PROXY_PORT), daemon=True).start()
     
-    # Wait for the gateway to officially start
-    print("[网关] 正在启动代理网关...", flush=True)
-    gateway_ready = False
-    for _ in range(30):
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            s.settimeout(0.5)
-            s.connect((LOCAL_PROXY_HOST, LOCAL_PROXY_PORT))
-            gateway_ready = True
-            break
-        except Exception:
-            time.sleep(0.5)
-        finally:
+    # The local proxy is intentionally independent from the management UI and
+    # source collector. Report readiness in a daemon watcher instead of
+    # holding the UI/collector behind a 15-second socket wait.
+    def report_gateway_readiness() -> None:
+        print("[网关] 正在启动代理网关...", flush=True)
+        gateway_ready = False
+        for _ in range(30):
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
-                s.close()
+                s.settimeout(0.5)
+                s.connect((LOCAL_PROXY_HOST, LOCAL_PROXY_PORT))
+                gateway_ready = True
+                break
             except Exception:
-                pass
-            
-    if gateway_ready:
-        print("[网关] 代理网关已成功启动监听，启动同步与检测脚本...", flush=True)
-    else:
-        print("[警告] 代理网关启动超时，继续执行脚本...", flush=True)
+                time.sleep(0.5)
+            finally:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+        if gateway_ready:
+            print("[网关] 代理网关已成功启动监听，后台采集与检测继续运行...", flush=True)
+        else:
+            print("[警告] 代理网关启动超时，后台采集与管理界面不受阻塞...", flush=True)
 
+    threading.Thread(target=report_gateway_readiness, name="gateway-readiness", daemon=True).start()
     threading.Thread(target=collector_loop, daemon=True).start()
     threading.Thread(target=background_proxy_checker, daemon=True).start()
     threading.Thread(target=active_node_pinger, daemon=True).start()
