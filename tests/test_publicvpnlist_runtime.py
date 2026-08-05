@@ -32,7 +32,7 @@ class PublicVPNListRuntimeTests(unittest.TestCase):
 
     def test_smoke_classifies_blocked_runner_without_false_success(self):
         smoke = load_smoke_module()
-        errors = [{"category": "network_error", "status": 0, "type": "URLError"}]
+        errors = [{"category": "github_runner_blocked", "status": 403, "type": "HTTPError"}]
         self.assertEqual(smoke.classify_api_result([], [], errors), "github_runner_blocked")
 
     def test_detail_enrichment_uses_documented_api_id_only(self):
