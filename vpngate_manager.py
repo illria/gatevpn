@@ -4046,10 +4046,22 @@ def fetch_publicvpnlist_api_snapshot(
         countries=countries,
         now=now,
     )
-    cached_web_ids_ready = bool(cached_rows_for_mapping) and all(
-        publicvpnlist_web_download_id(record)
-        for record in cached_rows_for_mapping
-    )
+    api_origin_host = (
+        urllib.parse.urlsplit(base_url).hostname or ""
+    ).lower().rstrip(".")
+    official_origin_host = (
+        urllib.parse.urlsplit(PUBLICVPNLIST_OFFICIAL_WEB_BASE_URL).hostname
+        or ""
+    ).lower().rstrip(".")
+    if api_origin_host != official_origin_host:
+        # Unit fixtures and explicitly configured non-official API mirrors do
+        # not participate in the website numeric-ID mapping flow.
+        cached_web_ids_ready = True
+    else:
+        cached_web_ids_ready = bool(cached_rows_for_mapping) and all(
+            publicvpnlist_web_download_id(record)
+            for record in cached_rows_for_mapping
+        )
     if fresh_cache and not retry_countries and (
         not cached_rows_for_mapping or cached_web_ids_ready
     ):
