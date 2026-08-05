@@ -85,6 +85,7 @@ def _redacted_error(exc: BaseException) -> dict[str, Any]:
             "check_body_kind",
             "token_content_type",
             "token_body_kind",
+            "validation_stage",
         ):
             if key in flow and flow.get(key) not in (None, ""):
                 flow_summary[key] = flow.get(key)
