@@ -58,7 +58,23 @@ def _safe_reason_code(exc: BaseException) -> str:
 
 
 def _redacted_error(exc: BaseException) -> dict[str, Any]:
-    if isinstance(exc, urllib.error.HTTPError):
+    flow = getattr(exc, "_pvl_flow", {})
+    flow_summary = {}
+    if isinstance(flow, dict):
+        for key in (
+            "status",
+            "retry_after",
+            "live_check_succeeded",
+            "live_check_status",
+            "token_request_attempted",
+            "token_generated",
+            "profile_download_attempted",
+            "profile_downloaded",
+            "profile_validation_failed",
+        ):
+            if key in flow and flow.get(key) not in (None, ""):
+                flow_summary[key] = flow.get(key)
+        if isinstance(exc, urllib.error.HTTPError):
         status = int(getattr(exc, "code", 0) or 0)
         if status == 429:
             category = "rate_limited"
@@ -71,6 +87,7 @@ def _redacted_error(exc: BaseException) -> dict[str, Any]:
             "status": status,
             "type": type(exc).__name__,
             "reason": _safe_reason_code(exc),
+            "flow": flow_summary,
         }
     if isinstance(exc, (urllib.error.URLError, TimeoutError, OSError)):
         return {
@@ -78,12 +95,14 @@ def _redacted_error(exc: BaseException) -> dict[str, Any]:
             "status": 0,
             "type": type(exc).__name__,
             "reason": _safe_reason_code(exc),
+            "flow": flow_summary,
         }
     return {
         "category": "schema_changed",
         "status": 0,
         "type": type(exc).__name__,
         "reason": _safe_reason_code(exc),
+        "flow": flow_summary,
     }
 
 
@@ -182,19 +201,37 @@ def _download_one(manager, raw: dict[str, Any], timeout: int) -> dict[str, Any]:
     manager.PUBLICVPNLIST_API_TIMEOUT_SECONDS = max(1, int(timeout))
     temporary_url = str(row.get("temporary_ovpn_url") or "").strip()
     deadline = time.monotonic() + max(1, int(timeout))
-    if temporary_url:
-        config_text = manager.fetch_publicvpnlist_config(
-            temporary_url,
-            metadata=metadata,
-            max_retries=1,
-            deadline=deadline,
-        )
-    else:
-        config_text = manager.fetch_publicvpnlist_official_config(
-            row,
-            metadata=metadata,
-            deadline=deadline,
-        )
+    try:
+        if temporary_url:
+            config_text = manager.fetch_publicvpnlist_config(
+                temporary_url,
+                metadata=metadata,
+                max_retries=1,
+                deadline=deadline,
+            )
+        else:
+            config_text = manager.fetch_publicvpnlist_official_config(
+                row,
+                metadata=metadata,
+                deadline=deadline,
+            )
+    except Exception as exc:
+        setattr(exc, "_pvl_flow", {
+            key: metadata.get(key)
+            for key in (
+                "status",
+                "retry_after",
+                "live_check_succeeded",
+                "live_check_status",
+                "token_request_attempted",
+                "token_generated",
+                "profile_download_attempted",
+                "profile_downloaded",
+                "profile_validation_failed",
+            )
+            if metadata.get(key) not in (None, "")
+        })
+        raise
     actual_hash = str(metadata.get("response_sha256") or "").strip().lower()
     expected_hash = str(row.get("config_sha256") or "").strip().lower()
     if expected_hash and actual_hash != expected_hash:
