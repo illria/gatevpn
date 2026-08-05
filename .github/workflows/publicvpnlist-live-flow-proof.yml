@@ -26,38 +26,6 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Inspect official export page-path shapes
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          import collections
-          import json
-          import re
-          import urllib.request
-          import urllib.parse
-
-          request = urllib.request.Request(
-              "https://publicvpnlist.com/exports/openvpn-latest.json",
-              headers={"Accept": "application/json"},
-          )
-          with urllib.request.urlopen(request, timeout=30) as response:
-              payload = json.load(response)
-          records = payload.get("records", []) if isinstance(payload, dict) else []
-          patterns = collections.Counter()
-          for record in records:
-              if not isinstance(record, dict):
-                  continue
-              for field in ("server_page_url", "download_page_url"):
-                  value = str(record.get(field) or "")
-                  if not value:
-                      continue
-                  path = urllib.parse.urlsplit(value).path
-                  path = re.sub(r"/[0-9]+(?=/|$)", "/<numeric>", path)
-                  path = re.sub(r"/pvl_[0-9a-fA-F]+(?=/|$)", "/<public>", path)
-                  patterns[field + ":" + (path or "<empty>")] += 1
-          print(json.dumps({"records": len(records), "path_shapes": patterns}, sort_keys=True))
-          PY
-
       - name: API to validated profile without OpenVPN
         shell: bash
         run: |
