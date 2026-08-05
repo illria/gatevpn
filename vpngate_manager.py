@@ -3679,6 +3679,17 @@ def publicvpnlist_attach_official_web_ids(
 
     report["metadata_export_attempted"] = True
     try:
+        api_host = (
+            urllib.parse.urlsplit(publicvpnlist_api_base_url()).hostname
+            or ""
+        ).lower().rstrip(".")
+        official_host = (
+            urllib.parse.urlsplit(PUBLICVPNLIST_OFFICIAL_WEB_BASE_URL).hostname
+            or ""
+        ).lower().rstrip(".")
+        if api_host != official_host:
+            report["metadata_export_error_code"] = "non_official_api_origin"
+            return rows
         export_url = publicvpnlist_metadata_export_url()
         response_metadata: dict[str, Any] = {}
         opener = urllib.request.build_opener(PublicVPNListRedirectHandler())
