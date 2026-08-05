@@ -134,6 +134,8 @@ class ServiceEnvironmentTests(unittest.TestCase):
         self.assertIn("def redacted_snapshot_url(value):", self.install_text)
         self.assertIn("getpass.getpass", self.install_text)
         self.assertIn("默认使用 PublicVPNList 官方 API v1", self.install_text)
+        self.assertIn("live_flow_mapping_missing", self.install_text)
+        self.assertIn("profile_validation_failed", self.install_text)
 
     def test_service_execstart_does_not_include_snapshot_environment_values(self):
         exec_lines = [line for line in self.install_text.splitlines() if "ExecStart=" in line]
@@ -214,7 +216,12 @@ class ServiceEnvironmentTests(unittest.TestCase):
                                 "last_seen_at": 2_000_000_000,
                                 "config_validated_at": 2_000_000_000,
                             }
-                        }
+                        },
+                        "last_refresh_stats": {
+                            "live_flow_mapping_missing": 3,
+                            "profile_validation_failed": 2,
+                            "live_flow_deadline_exceeded": True,
+                        },
                     }
                 ),
                 encoding="utf-8",
@@ -231,6 +238,9 @@ class ServiceEnvironmentTests(unittest.TestCase):
                 "PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS": "",
             }
             generated_state = namespace["publicvpnlist_state"](values)
+            self.assertEqual(generated_state["live_flow_mapping_missing"], 3)
+            self.assertEqual(generated_state["profile_validation_failed"], 2)
+            self.assertTrue(generated_state["live_flow_deadline_exceeded"])
 
             import vpngate_manager
 

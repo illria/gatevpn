@@ -119,7 +119,7 @@ GET /dataset
 GET /health
 ```
 
-默认请求 `https://publicvpnlist.com/api/v1/servers`，参数包括 `protocol=openvpn`、`status=online`、`per_page=200`、`sort=last_checked`、`order=desc` 以及固定允许国家。API 的 metadata 数量和最终可连接节点数量分开统计。API 常常不返回可复用的 `config_download_url`；对带有 `public_id` 的候选，程序会按官网公开的 Check & download 流程执行：先请求同源实时检查，再 POST `get_token.php` 获取一次性下载令牌，随后下载并校验 `.ovpn`。令牌、Cookie 和短期下载 URL 只存在于本次内存流程中，不写入缓存、节点文件或日志。已有有效配置缓存会优先复用；缺少 public id、实时检查失败或令牌/配置校验失败的记录不会成为可连接节点。metadata 不能被拼接成伪造的 OpenVPN 配置。
+默认请求 `https://publicvpnlist.com/api/v1/servers`，参数包括 `protocol=openvpn`、`status=online`、`per_page=200`、`sort=last_checked`、`order=desc` 以及固定允许国家。API 的 metadata 数量和最终可连接节点数量分开统计。API 常常不返回可复用的 `config_download_url`；只有 metadata 同时提供了明确的官网数字下载 ID（或官方 `server/download` 页面路径中的数字 ID）时，程序才会按官网公开的 Check & download 流程执行：先请求同源实时检查，再 POST `get_token.php` 获取一次性下载令牌，随后下载并校验 `.ovpn`。API 的 `pvl_...` public ID 不会被猜测或直接当作官网数字 ID。令牌、Cookie 和短期下载 URL 只存在于本次内存流程中，不写入缓存、节点文件或日志。已有有效配置缓存会优先复用；缺少可验证网页 ID、实时检查失败或令牌/配置校验失败的记录不会成为可连接节点。metadata 不能被拼接成伪造的 OpenVPN 配置。
 
 人工快照仍可作为高级覆盖方式，URL 和本地文件二选一，不得同时配置；清除覆盖后恢复 API 模式：
 
@@ -131,11 +131,11 @@ PUBLICVPNLIST_SNAPSHOT_URL=
 PUBLICVPNLIST_SNAPSHOT_FILE=
 ```
 
-配置人工 snapshot 后优先使用 snapshot；清除后恢复 API 模式，而不是停用来源。snapshot 中已有的 `temporary_ovpn_url` 仍按 HTTPS、域名/SSRF、重定向、配置和 endpoint 规则校验；API 模式使用官网确认过的同源 Check & download 接口，不抓取 HTML 下载按钮、不猜测一次性 token、不自动操作 Export Builder，也不绕过下载保护。`server_page_url` 只作为页面元数据，绝不当作 `.ovpn` 配置。
+配置人工 snapshot 后优先使用 snapshot；清除后恢复 API 模式，而不是停用来源。snapshot 中已有的 `temporary_ovpn_url` 仍按 HTTPS、域名/SSRF、重定向、配置和 endpoint 规则校验；API 模式只在取得明确网页数字 ID 后进入受限的 Check & download 实现，不抓取 HTML 下载按钮、不猜测一次性 token、不自动操作 Export Builder，也不绕过下载保护。`server_page_url` 最多只用于提取明确的官网数字 ID，绝不当作 `.ovpn` 配置或直接交给 OpenVPN。代码中的 PHP 路径和响应字段属于待真实站点冒烟确认的兼容实现，不是 PublicVPNList API v1 的公开契约；在真实流程确认前，缺少映射的记录会安全跳过。
 
-API 支持每个固定国家的分页、请求/页面/记录/响应大小上限、`Content-Type` 校验、429 `Retry-After` 退避，以及 ETag/`If-None-Match`/`Last-Modified`/304 缓存复用。429 不会长时间阻塞抓取，而是保存有界 backoff 状态。API metadata 单独保存到 `publicvpnlist_api_cache.json`（0600），不保存 cookie、凭据、签名 URL、配置 URL 或配置正文。官网 Check & download 的实时检查、token POST 和最终配置请求共享临时 CookieJar，并分别使用 JSON、表单和 OpenVPN 配置的 `Accept`/`Content-Type` 边界。配置下载仍经过 HTTPS、域名/SSRF、重定向、OpenVPN endpoint 一致性和严格 sanitizer 校验；若令牌响应跳转到第三方主机，该主机必须加入 `PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS`，官方 API/web hostname 可直接作为默认允许域名。下载失败、实时检查失败或缺少 public id 的记录不会把 metadata 计为可连接节点。
+API 支持每个固定国家的分页、请求/页面/记录/响应大小上限、`Content-Type` 校验、429 `Retry-After` 退避，以及 ETag/`If-None-Match`/`Last-Modified`/304 缓存复用。429 不会长时间阻塞抓取，而是保存有界 backoff 状态。API metadata 单独保存到 `publicvpnlist_api_cache.json`（0600），不保存 cookie、凭据、签名 URL、配置 URL 或配置正文。Check & download 的实时检查、token POST 和最终配置请求共享临时 CookieJar，并分别使用 JSON、表单和 OpenVPN 配置的 `Accept`/`Content-Type` 边界；这些私有请求的真实 Cookie/CSRF/字段协议仍需在隔离环境中通过当前官网验证。配置下载仍经过 HTTPS、域名/SSRF、重定向、OpenVPN endpoint 一致性和严格 sanitizer 校验；若令牌响应跳转到第三方主机，该主机必须加入 `PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS`，官方 API/web hostname 可直接作为默认允许域名。下载失败、实时检查失败或缺少明确网页数字 ID 的记录不会把 metadata 计为可连接节点；`live_flow_mapping_missing` 会单独显示。
 
-PublicVPNList 的状态会显示 `mode`、`Metadata records`、`Live checks`、`Connectable candidates`、`Metadata-only skipped`、最后 API 更新时间、API 状态和限流退避状态。若当前 API 的实时检查、一次性下载或配置校验没有产生可连接节点，日志会明确区分 metadata 与 connectable candidates；其他来源仍继续工作。快照 URL、query、签名、Cookie 和 token 不写入缓存、节点文件或日志。
+PublicVPNList 的状态会显示 `mode`、`Metadata records`、`Live checks`、token、profile 下载/校验、`Connectable candidates`、`Metadata-only skipped`、网页 ID 缺失、熔断/预算/deadline、持久化失败 streak、最后 API 更新时间、API 状态和限流退避状态。若当前 API 的实时检查、一次性下载或配置校验没有产生可连接节点，日志会明确区分 metadata 与 connectable candidates；其他来源仍继续工作。快照 URL、query、签名、Cookie 和 token 不写入缓存、节点文件或日志。
 
 PublicVPNList 的固定允许国家为 `PH, US, FR, GB, ID, FI, DE, TW, AU, NL`，实际结果还会与“拉取地区过滤”取交集：
 
@@ -160,9 +160,10 @@ PUBLICVPNLIST_STALE_PROFILE_SECONDS=604800
 PUBLICVPNLIST_CONFIG_TIMEOUT_SECONDS=45
 PUBLICVPNLIST_MAX_REDIRECTS=5
 PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS=
-PUBLICVPNLIST_LIVE_FLOW_MAX_ATTEMPTS=100
+PUBLICVPNLIST_LIVE_FLOW_MAX_ATTEMPTS=5
 PUBLICVPNLIST_LIVE_FLOW_DELAY_SECONDS=0.25
 PUBLICVPNLIST_LIVE_FLOW_MAX_FAILURES=5
+PUBLICVPNLIST_LIVE_FLOW_MAX_SECONDS=90
 PUBLICVPNLIST_API_REFRESH_SECONDS=900
 PUBLICVPNLIST_API_MAX_STALE_SECONDS=21600
 PUBLICVPNLIST_API_TIMEOUT_SECONDS=20
@@ -178,7 +179,7 @@ PUBLICVPNLIST_API_MAX_REQUESTS_PER_REFRESH=60
 
 配置下载 URL 只允许 HTTPS，并且必须通过 `PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS` 或官方 API hostname 的精确域名限制；程序会拒绝用户名密码、localhost、回环/私网/链路本地/云元数据地址，并在每次重定向时重新执行相同检查，超过 `PUBLICVPNLIST_MAX_REDIRECTS` 也会 fail closed。临时 URL、query、签名和 token 不写日志或缓存。`PUBLICVPNLIST_MAX_RAW_ROWS` 是原始记录安全上限，`PUBLICVPNLIST_MAX_SCAN_ROWS` 只计算规范化后属于固定允许国家的记录；美国节点会先按最多 100 条批量风控，非住宅或无法分类的节点不会消耗配置下载和最终配额。
 
-刷新按快照顺序以最多 100 条 eligible 记录为窗口，只对当前窗口的美国元数据执行批量 IP 类型查询；达到 `PUBLICVPNLIST_MAX_NODES` 后停止后续风控和配置请求。前 `PUBLICVPNLIST_MAX_RAW_ROWS` 条原始记录是额外安全上限，不允许国家不会消耗 eligible 扫描配额，也不会消耗配置下载令牌。API live flow 另有总尝试预算、请求间隔和连续失败熔断；每个 profile 的失败会按 public id/endpoint 保存 backoff，429 的 `Retry-After` 会被限制在配置上限内。一次性 token 下载不会复用同一个 token 重试，下一次尝试会重新执行完整 Check → token → download 流程。
+刷新按快照顺序以最多 100 条 eligible 记录为窗口，只对当前窗口的美国元数据执行批量 IP 类型查询；达到 `PUBLICVPNLIST_MAX_NODES` 后停止后续风控和配置请求。前 `PUBLICVPNLIST_MAX_RAW_ROWS` 条原始记录是额外安全上限，不允许国家不会消耗 eligible 扫描配额，也不会消耗配置下载令牌。API live flow 默认最多尝试 5 个 profile，并受 `PUBLICVPNLIST_LIVE_FLOW_MAX_SECONDS` 墙钟上限、请求间隔和连续失败熔断约束；每个 profile 的失败会按 public id/endpoint 保存指数 backoff，并清理已不再出现在完整 API metadata 中的 retry 条目，429 的 `Retry-After` 会被限制在配置上限内。一次性 token 下载不会复用同一个 token 重试，下一次尝试会重新执行完整 Check → token → download 流程。失败 streak 只有在完整 profile 校验并成功加入缓存后才清零。
 
 PublicVPNList 与 VPNGate、IPSpeed 会按规范化的 `host/IP + port + tcp/udp` endpoint 去重；同一 endpoint 的优先级为 VPNGate > IPSpeed > PublicVPNList。VPNBook 和 Vpngate-Scraper 不参与这次跨来源优先级去重。DNS 临时失败仍保留 hostname key，协议或端口不同的 endpoint 不会误去重。`PUBLICVPNLIST_MAX_NODES` 限制最终节点数，`PUBLICVPNLIST_MAX_SCAN_ROWS` 限制扫描记录数；被美国住宅规则拒绝的节点不消耗最终配额。美国风控按最多 100 个节点一批调用现有 `vpn_utils.enrich_ip_info()`。
 

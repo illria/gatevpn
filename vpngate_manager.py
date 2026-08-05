@@ -38,6 +38,16 @@ def _publicvpnlist_env_int(name: str, default: int, minimum: int = 0) -> int:
     return max(minimum, value)
 
 
+def _publicvpnlist_env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    if not math.isfinite(value):
+        value = default
+    return max(minimum, value)
+
+
 def _publicvpnlist_env_bool(name: str, default: bool = True) -> bool:
     raw = os.environ.get(name)
     if raw is None or not str(raw).strip():
@@ -150,20 +160,31 @@ PUBLICVPNLIST_MAX_RETRIES = _publicvpnlist_env_int("PUBLICVPNLIST_MAX_RETRIES", 
 PUBLICVPNLIST_MAX_REDIRECTS = _publicvpnlist_env_int("PUBLICVPNLIST_MAX_REDIRECTS", 5)
 PUBLICVPNLIST_LIVE_FLOW_MAX_ATTEMPTS = _publicvpnlist_env_int(
     "PUBLICVPNLIST_LIVE_FLOW_MAX_ATTEMPTS",
-    100,
+    5,
     0,
 )
-try:
-    PUBLICVPNLIST_LIVE_FLOW_DELAY_SECONDS = max(
-        0.0,
-        float(os.environ.get("PUBLICVPNLIST_LIVE_FLOW_DELAY_SECONDS", "0.25")),
-    )
-except (TypeError, ValueError):
-    PUBLICVPNLIST_LIVE_FLOW_DELAY_SECONDS = 0.25
+PUBLICVPNLIST_LIVE_FLOW_DELAY_SECONDS = _publicvpnlist_env_float(
+    "PUBLICVPNLIST_LIVE_FLOW_DELAY_SECONDS",
+    0.25,
+)
 PUBLICVPNLIST_LIVE_FLOW_MAX_FAILURES = _publicvpnlist_env_int(
     "PUBLICVPNLIST_LIVE_FLOW_MAX_FAILURES",
     5,
     0,
+)
+PUBLICVPNLIST_LIVE_FLOW_MAX_SECONDS = _publicvpnlist_env_float(
+    "PUBLICVPNLIST_LIVE_FLOW_MAX_SECONDS",
+    90.0,
+)
+PUBLICVPNLIST_PROFILE_RETRY_MAX_ENTRIES = _publicvpnlist_env_int(
+    "PUBLICVPNLIST_PROFILE_RETRY_MAX_ENTRIES",
+    200,
+    1,
+)
+PUBLICVPNLIST_PROFILE_RETRY_MAX_SECONDS = _publicvpnlist_env_int(
+    "PUBLICVPNLIST_PROFILE_RETRY_MAX_SECONDS",
+    7 * 24 * 3600,
+    60,
 )
 PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS = frozenset(
     item.strip().lower().rstrip(".")
@@ -2478,6 +2499,7 @@ PUBLICVPNLIST_API_STORED_FIELDS = frozenset(
         "uptime_percent_7d", "uptime_hours", "sessions", "score_label", "first_seen_at",
         "config_updated_at", "source_updated_at", "server_page_url", "source_url",
         "config_download_url", "download_page_url", "temporary_ovpn_url",
+        "web_download_id",
     }
 )
 
@@ -2602,6 +2624,11 @@ def _publicvpnlist_api_retry_entry(value: Any) -> dict[str, Any] | None:
         retry_after = retry_after if math.isfinite(retry_after) else 0.0
     except (TypeError, ValueError):
         retry_after = 0.0
+    try:
+        created_at = float(value.get("created_at") or 0)
+        created_at = created_at if math.isfinite(created_at) else 0.0
+    except (TypeError, ValueError):
+        created_at = 0.0
     return {
         "country": country,
         "public_id": public_id,
@@ -2609,6 +2636,7 @@ def _publicvpnlist_api_retry_entry(value: Any) -> dict[str, Any] | None:
         "config_sha256": config_sha256,
         "retry_after": max(0.0, retry_after),
         "attempts": max(0, parse_int(value.get("attempts"))),
+        "created_at": max(0.0, created_at),
     }
 
 
@@ -2842,7 +2870,11 @@ def publicvpnlist_api_record_profile_retry(
             previous_attempts = entry["attempts"]
             break
     if retry_after_seconds is None:
-        retry_delay = max(PUBLICVPNLIST_API_REFRESH_SECONDS, 60)
+        retry_delay = min(
+            max(PUBLICVPNLIST_API_REFRESH_SECONDS, 60)
+            * (2 ** min(previous_attempts, 6)),
+            PUBLICVPNLIST_PROFILE_RETRY_MAX_SECONDS,
+        )
     else:
         retry_delay = min(
             max(1, int(retry_after_seconds)),
@@ -2853,6 +2885,7 @@ def publicvpnlist_api_record_profile_retry(
             **identity,
             "retry_after": now + retry_delay,
             "attempts": previous_attempts + 1,
+            "created_at": now,
         }
     )
     cache["profile_retry_entries"] = entries
@@ -2870,6 +2903,57 @@ def publicvpnlist_api_clear_profile_retry(cache: dict[str, Any], row: dict[str, 
     _publicvpnlist_api_sync_retry_fields(cache)
 
 
+def publicvpnlist_api_prune_profile_retries(
+    cache: dict[str, Any],
+    rows: list[dict[str, Any]],
+    now: float | None = None,
+) -> bool:
+    """Drop retry records for profiles absent from a complete API result.
+
+    A failed profile is allowed to back off only while the provider still
+    advertises that profile.  Do not use an incomplete/error response for
+    pruning, but once a complete metadata result is available, vanished
+    public IDs/endpoints must not keep reopening a country's retry state.
+    """
+
+    _now = time.time() if now is None else now
+    current_identities: set[tuple[str, str, str]] = set()
+    for raw_row in rows:
+        row = raw_row if isinstance(raw_row, dict) and "country_short" in raw_row else normalize_publicvpnlist_row(raw_row)
+        if not isinstance(row, dict):
+            continue
+        identity = _publicvpnlist_api_retry_identity(row)
+        if identity["country"] not in PUBLICVPNLIST_ALLOWED_COUNTRIES:
+            continue
+        if identity["public_id"]:
+            current_identities.add((identity["country"], "id", identity["public_id"]))
+        if identity["endpoint"]:
+            current_identities.add((identity["country"], "endpoint", identity["endpoint"]))
+
+    before = [
+        entry
+        for raw_entry in cache.get("profile_retry_entries", [])
+        for entry in [_publicvpnlist_api_retry_entry(raw_entry)]
+        if entry
+    ]
+    retained: list[dict[str, Any]] = []
+    for entry in before:
+        created_at = float(entry.get("created_at") or 0)
+        if created_at and _now - created_at > PUBLICVPNLIST_PROFILE_RETRY_MAX_SECONDS:
+            continue
+        identities = []
+        if entry.get("public_id"):
+            identities.append((entry["country"], "id", entry["public_id"]))
+        if entry.get("endpoint"):
+            identities.append((entry["country"], "endpoint", entry["endpoint"]))
+        if any(identity in current_identities for identity in identities):
+            retained.append(entry)
+    changed = retained != before
+    cache["profile_retry_entries"] = retained
+    _publicvpnlist_api_sync_retry_fields(cache)
+    return changed
+
+
 def _publicvpnlist_api_sync_retry_fields(cache: dict[str, Any]) -> None:
     entries = [
         entry
@@ -2877,7 +2961,30 @@ def _publicvpnlist_api_sync_retry_fields(cache: dict[str, Any]) -> None:
         for entry in [_publicvpnlist_api_retry_entry(raw_entry)]
         if entry
     ]
-    cache["profile_retry_entries"] = entries
+    now = time.time()
+    retained: list[dict[str, Any]] = []
+    for entry in entries:
+        created_at = float(entry.get("created_at") or 0)
+        if not created_at:
+            # Migrate old entries to a stable age anchor.  A future retry time
+            # is not allowed to make the entry immortal; a missing timestamp
+            # starts its bounded retention window at this load.
+            retry_after = float(entry.get("retry_after") or 0)
+            entry["created_at"] = min(now, retry_after) if retry_after > 0 else now
+            created_at = float(entry["created_at"])
+        if created_at and now - created_at > PUBLICVPNLIST_PROFILE_RETRY_MAX_SECONDS:
+            continue
+        retained.append(entry)
+    retained.sort(
+        key=lambda entry: (
+            float(entry.get("created_at") or 0),
+            float(entry.get("retry_after") or 0),
+            str(entry.get("public_id") or entry.get("endpoint") or ""),
+        ),
+        reverse=True,
+    )
+    cache["profile_retry_entries"] = retained[:PUBLICVPNLIST_PROFILE_RETRY_MAX_ENTRIES]
+    entries = cache["profile_retry_entries"]
     cache["profile_retry_countries"] = sorted({entry["country"] for entry in entries})
     cache["profile_retry_public_ids"] = sorted({entry["public_id"] for entry in entries if entry["public_id"]})
     cache["profile_retry_endpoints"] = sorted({entry["endpoint"] for entry in entries if entry["endpoint"]})
@@ -3044,6 +3151,11 @@ def load_publicvpnlist_api_cache() -> dict[str, Any]:
         for entry in [_publicvpnlist_api_retry_entry(raw_entry)]
         if entry
     ]
+    if any(
+        isinstance(raw_entry, dict) and not raw_entry.get("created_at")
+        for raw_entry in (raw.get("profile_retry_entries") or [])
+    ):
+        migration_changed = True
     _publicvpnlist_api_sync_retry_fields(normalized)
     if migration_changed:
         try:
@@ -4428,11 +4540,36 @@ class PublicVPNListRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+def _publicvpnlist_live_flow_check_deadline(
+    deadline: float | None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        if metadata is not None:
+            metadata["live_flow_deadline_exceeded"] = True
+        raise PublicVPNListSnapshotError("PublicVPNList live flow 超过刷新墙钟上限")
+
+
+def _publicvpnlist_live_flow_timeout(
+    timeout: int,
+    deadline: float | None,
+    metadata: dict[str, Any] | None = None,
+) -> int:
+    _publicvpnlist_live_flow_check_deadline(deadline, metadata)
+    if deadline is None:
+        return max(1, int(timeout))
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        _publicvpnlist_live_flow_check_deadline(deadline, metadata)
+    return max(1, min(int(timeout), int(math.ceil(remaining))))
+
+
 def fetch_publicvpnlist_config(
     url: str,
     metadata: dict[str, Any] | None = None,
     cookie_jar: cookiejar.CookieJar | None = None,
     max_retries: int | None = None,
+    deadline: float | None = None,
 ) -> str:
     """Download one short-lived profile with the same bounded retry policy."""
 
@@ -4440,6 +4577,7 @@ def fetch_publicvpnlist_config(
     last_error: Exception | None = None
     retry_limit = PUBLICVPNLIST_MAX_RETRIES if max_retries is None else max(1, int(max_retries))
     for attempt in range(1, retry_limit + 1):
+        _publicvpnlist_live_flow_check_deadline(deadline, metadata)
         redirect_handler = PublicVPNListRedirectHandler()
         if cookie_jar is None:
             opener = urllib.request.build_opener(redirect_handler)
@@ -4456,12 +4594,17 @@ def fetch_publicvpnlist_config(
                 ) + 1
             response_body = publicvpnlist_http_get(
                 url,
-                timeout=PUBLICVPNLIST_CONFIG_TIMEOUT_SECONDS,
+                timeout=_publicvpnlist_live_flow_timeout(
+                    PUBLICVPNLIST_CONFIG_TIMEOUT_SECONDS,
+                    deadline,
+                    metadata,
+                ),
                 max_bytes=min(PUBLICVPNLIST_MAX_RESPONSE_BYTES, 1024 * 1024),
                 accept="application/x-openvpn-profile,text/plain",
                 opener=opener,
                 metadata=attempt_metadata,
             )
+            _publicvpnlist_live_flow_check_deadline(deadline, metadata)
             attempt_metadata["response_sha256"] = hashlib.sha256(response_body).hexdigest()
             attempt_metadata["profile_downloaded"] = int(
                 attempt_metadata.get("profile_downloaded") or 0
@@ -4494,7 +4637,14 @@ def fetch_publicvpnlist_config(
                 if attempt_metadata.get("profile_downloaded"):
                     metadata["profile_validation_failed"] = True
             if attempt < retry_limit:
-                time.sleep(min(0.5 * attempt, 1.0))
+                _publicvpnlist_live_flow_check_deadline(deadline, metadata)
+                time.sleep(
+                    min(
+                        0.5 * attempt,
+                        1.0,
+                        max(0.0, (deadline - time.monotonic()) if deadline is not None else 1.0),
+                    )
+                )
         except (PublicVPNListSnapshotError, OSError, UnicodeError, ValueError) as exc:
             last_error = exc
             if metadata is not None:
@@ -4504,12 +4654,19 @@ def fetch_publicvpnlist_config(
                 if attempt_metadata.get("profile_downloaded"):
                     metadata["profile_validation_failed"] = True
             if attempt < retry_limit:
-                time.sleep(min(0.5 * attempt, 1.0))
+                _publicvpnlist_live_flow_check_deadline(deadline, metadata)
+                time.sleep(
+                    min(
+                        0.5 * attempt,
+                        1.0,
+                        max(0.0, (deadline - time.monotonic()) if deadline is not None else 1.0),
+                    )
+                )
     raise PublicVPNListSnapshotError(str(last_error or "配置下载没有返回数据")) from last_error
 
 
 def publicvpnlist_official_web_base_url() -> str:
-    """Return the confirmed same-origin web base used by the live download flow."""
+    """Return the configured same-origin web base used by the live flow."""
 
     raw = str(PUBLICVPNLIST_OFFICIAL_WEB_BASE_URL or "").strip()
     try:
@@ -4558,21 +4715,39 @@ def _publicvpnlist_capture_http_error(metadata: dict[str, Any], exc: urllib.erro
 def fetch_publicvpnlist_official_config(
     row: dict[str, Any],
     metadata: dict[str, Any] | None = None,
+    deadline: float | None = None,
 ) -> str:
     """Run the official same-origin Check -> token -> .ovpn flow.
 
-    The API deliberately omits a reusable profile URL.  The public download
-    page first calls ``test_server.php`` and then POSTs the public id to
-    ``get_token.php``.  Cookie state is kept only in this call and the token
-    URL is never returned to callers or written to durable state.
+    The API deliberately omits a reusable profile URL.  When metadata carries
+    an explicit website numeric ID, the public download page first calls
+    ``test_server.php`` and then POSTs that website ID to ``get_token.php``.
+    The API ``pvl_...`` public ID is never substituted for it. Cookie state is
+    kept only in this call and the token URL is never returned to callers or
+    written to durable state.
     """
 
     public_id = str(row.get("id") or row.get("public_id") or "").strip()
     if not public_id:
         raise PublicVPNListSnapshotError("API metadata 缺少 public id，无法执行官方下载流程")
+    web_download_id = publicvpnlist_web_download_id(row)
+    flow_metadata = metadata if metadata is not None else {}
+    if not web_download_id:
+        flow_metadata["live_flow_mapping_missing"] = True
+        raise PublicVPNListSnapshotError(
+            "API metadata 缺少已验证的官网数字下载 ID；不会把 pvl public id 发送到官网私有接口"
+        )
+    flow_metadata.update(
+        {
+            "official_flow": True,
+            "live_flow_mapping_verified": True,
+            "web_download_id": web_download_id,
+        }
+    )
+    _publicvpnlist_live_flow_check_deadline(deadline, flow_metadata)
     base_url = publicvpnlist_official_web_base_url()
     check_url = urllib.parse.urljoin(base_url, "test_server.php")
-    check_url = f"{check_url}?{urllib.parse.urlencode({'id': public_id, '_': str(int(time.time() * 1000))})}"
+    check_url = f"{check_url}?{urllib.parse.urlencode({'id': web_download_id, '_': str(int(time.time() * 1000))})}"
     token_url = urllib.parse.urljoin(base_url, "get_token.php")
 
     # Each request is validated before opening.  The official web host is
@@ -4588,25 +4763,31 @@ def fetch_publicvpnlist_official_config(
     )
     check_metadata: dict[str, Any] = {}
     try:
+        _publicvpnlist_live_flow_check_deadline(deadline, flow_metadata)
         check_body = publicvpnlist_http_get(
             check_url,
-            timeout=PUBLICVPNLIST_CONFIG_TIMEOUT_SECONDS,
+            timeout=_publicvpnlist_live_flow_timeout(
+                PUBLICVPNLIST_CONFIG_TIMEOUT_SECONDS,
+                deadline,
+                flow_metadata,
+            ),
             max_bytes=min(PUBLICVPNLIST_MAX_RESPONSE_BYTES, 512 * 1024),
             accept="application/json",
             opener=live_opener,
             metadata=check_metadata,
             extra_headers={"X-Requested-With": "XMLHttpRequest"},
         )
+        _publicvpnlist_live_flow_check_deadline(deadline, flow_metadata)
     except urllib.error.HTTPError as exc:
         _publicvpnlist_capture_http_error(check_metadata, exc)
         if metadata is not None:
             metadata.update(check_metadata)
         raise
+    flow_metadata.update(check_metadata)
     check_payload = _publicvpnlist_json_response(check_body, check_metadata, "实时检查")
     check_status = str(check_payload.get("status") or "").strip().lower()
     if not check_payload.get("ok") or check_status != "ok":
         raise PublicVPNListSnapshotError("PublicVPNList 实时检查未通过")
-    flow_metadata = metadata if metadata is not None else {}
     flow_metadata.update(
         {
             "live_check_succeeded": True,
@@ -4617,11 +4798,16 @@ def fetch_publicvpnlist_official_config(
     )
 
     token_metadata: dict[str, Any] = {}
-    token_body = urllib.parse.urlencode({"id": public_id}).encode("ascii")
+    token_body = urllib.parse.urlencode({"id": web_download_id}).encode("ascii")
     try:
+        _publicvpnlist_live_flow_check_deadline(deadline, flow_metadata)
         token_response = publicvpnlist_http_get(
             token_url,
-            timeout=PUBLICVPNLIST_CONFIG_TIMEOUT_SECONDS,
+            timeout=_publicvpnlist_live_flow_timeout(
+                PUBLICVPNLIST_CONFIG_TIMEOUT_SECONDS,
+                deadline,
+                flow_metadata,
+            ),
             max_bytes=min(PUBLICVPNLIST_MAX_RESPONSE_BYTES, 512 * 1024),
             accept="application/json",
             opener=live_opener,
@@ -4633,6 +4819,7 @@ def fetch_publicvpnlist_official_config(
             data=token_body,
             method="POST",
         )
+        _publicvpnlist_live_flow_check_deadline(deadline, flow_metadata)
     except urllib.error.HTTPError as exc:
         _publicvpnlist_capture_http_error(token_metadata, exc)
         flow_metadata.update(token_metadata)
@@ -4653,7 +4840,6 @@ def fetch_publicvpnlist_official_config(
 
     flow_metadata.update(
         {
-            "official_flow": True,
             "token_generated": True,
             "initial_download_host": initial_download_host,
         }
@@ -4666,6 +4852,7 @@ def fetch_publicvpnlist_official_config(
         metadata=flow_metadata,
         cookie_jar=session_cookies,
         max_retries=1,
+        deadline=deadline,
     )
 
 
@@ -4766,6 +4953,62 @@ def _publicvpnlist_country_values(row: dict[str, Any]) -> tuple[str, str]:
     return code, display or country_name or code
 
 
+def publicvpnlist_web_download_id(row: dict[str, Any]) -> str:
+    """Return only an explicitly supplied website numeric server ID.
+
+    API ``id`` values are stable ``pvl_...`` public IDs and are not assumed to
+    be the numeric web/Bitrix IDs used by the download page.  A live flow may
+    therefore run only when the API gives an explicit numeric mapping or an
+    official server/download URL whose path contains that mapping.
+    """
+
+    if not isinstance(row, dict):
+        return ""
+    for field in (
+        "web_download_id",
+        "numeric_id",
+        "server_numeric_id",
+        "bitrix_id",
+        "download_id",
+    ):
+        value = str(row.get(field) or "").strip()
+        if re.fullmatch(r"[0-9]+", value):
+            return value
+
+    allowed_hosts = {
+        host
+        for host in {
+            urllib.parse.urlsplit(PUBLICVPNLIST_OFFICIAL_WEB_BASE_URL).hostname,
+            urllib.parse.urlsplit(publicvpnlist_api_base_url()).hostname,
+        }
+        if host
+    }
+    for field in ("download_page_url", "server_page_url"):
+        raw_url = str(row.get(field) or "").strip()
+        if not raw_url:
+            continue
+        try:
+            parsed = urllib.parse.urlsplit(raw_url)
+        except ValueError:
+            continue
+        if (
+            parsed.scheme.lower() != "https"
+            or parsed.username is not None
+            or parsed.password is not None
+            or (parsed.hostname or "").lower().rstrip(".") not in allowed_hosts
+        ):
+            continue
+        parts = [urllib.parse.unquote(part) for part in parsed.path.split("/") if part]
+        for marker in ("download", "server", "servers"):
+            try:
+                index = [part.lower() for part in parts].index(marker)
+            except ValueError:
+                continue
+            if index + 1 < len(parts) and re.fullmatch(r"[0-9]+", parts[index + 1]):
+                return parts[index + 1]
+    return ""
+
+
 def normalize_publicvpnlist_row(row: dict[str, Any]) -> dict[str, Any] | None:
     country_short, country_name = _publicvpnlist_country_values(row)
     host = str(row.get("host") or row.get("hostname") or row.get("remote_host") or "").strip()
@@ -4818,6 +5061,7 @@ def normalize_publicvpnlist_row(row: dict[str, Any]) -> dict[str, Any] | None:
     )
     return {
         "id": str(row.get("id") or row.get("public_id") or "").strip(),
+        "web_download_id": publicvpnlist_web_download_id(row),
         "country_short": country_short,
         "country_long": country_name,
         "host": host,
@@ -4920,6 +5164,7 @@ def publicvpnlist_cache_profile(
         raw_speed = row.get("speed")
     profile = {
         "id": str(row.get("id") or row.get("public_id") or "").strip(),
+        "web_download_id": publicvpnlist_web_download_id(row),
         "country_short": str(row.get("country_short") or "").strip().upper(),
         "country_long": str(row.get("country_long") or "").strip(),
         "host": str(row.get("host") or row.get("hostname") or row.get("ip") or "").strip(),
@@ -5440,8 +5685,10 @@ def publicvpnlist_web_status() -> dict[str, Any]:
         "profile_download_attempted": stat_int("profile_download_attempted"),
         "profile_downloaded": stat_int("profile_downloaded"),
         "profile_validation_failed": stat_int("profile_validation_failed"),
+        "live_flow_mapping_missing": stat_int("live_flow_mapping_missing"),
         "live_flow_attempts": stat_int("live_flow_attempts"),
         "live_flow_budget_exhausted": bool(refresh_stats.get("live_flow_budget_exhausted")),
+        "live_flow_deadline_exceeded": bool(refresh_stats.get("live_flow_deadline_exceeded")),
         "live_flow_circuit_open": bool(refresh_stats.get("live_flow_circuit_open")),
         "live_flow_backoff_skipped": stat_int("live_flow_backoff_skipped"),
         "profiles_downloaded": profiles_downloaded,
@@ -5457,6 +5704,7 @@ def publicvpnlist_web_status() -> dict[str, Any]:
             "request_count": int(api_cache.get("request_count") or 0),
             "live_flow_backoff_until": float(api_cache.get("live_flow_backoff_until") or 0),
             "live_flow_failure_streak": int(api_cache.get("live_flow_failure_streak") or 0),
+            "live_flow_last_status": int(api_cache.get("live_flow_last_status") or 0),
         },
         "api_stale": bool(api_cache.get("api_stale")),
         "api_refresh_failed": bool(api_cache.get("refresh_failed")),
@@ -5877,6 +6125,16 @@ def refresh_publicvpnlist_cache(
             records = publicvpnlist_order_api_candidate_records(records)
         api_retry_cache = load_publicvpnlist_api_cache() if source_kind == "api" else None
         api_retry_state_changed = False
+        if (
+            source_kind == "api"
+            and isinstance(api_retry_cache, dict)
+            and not bool(api_meta.get("refresh_failed"))
+        ):
+            api_retry_state_changed = publicvpnlist_api_prune_profile_retries(
+                api_retry_cache,
+                records,
+                now=now,
+            )
     except Exception as exc:
         cache["snapshot_source_hash"] = source_hash
         cache["profiles"] = old_profiles
@@ -5906,8 +6164,10 @@ def refresh_publicvpnlist_cache(
             "profile_download_attempted": 0,
             "profile_downloaded": 0,
             "profile_validation_failed": 0,
+            "live_flow_mapping_missing": 0,
             "live_flow_attempts": 0,
             "live_flow_budget_exhausted": False,
+            "live_flow_deadline_exceeded": False,
             "live_flow_circuit_open": False,
             "live_flow_backoff_skipped": 0,
             "connectable_candidates": 0,
@@ -5983,10 +6243,22 @@ def refresh_publicvpnlist_cache(
     profile_downloaded = 0
     profile_validation_failed = 0
     live_flow_attempts = 0
-    live_flow_failures = 0
+    live_flow_failures = max(
+        0,
+        parse_int(api_retry_cache.get("live_flow_failure_streak"))
+        if isinstance(api_retry_cache, dict)
+        else 0,
+    )
+    live_flow_deadline = (
+        time.monotonic() + PUBLICVPNLIST_LIVE_FLOW_MAX_SECONDS
+        if PUBLICVPNLIST_LIVE_FLOW_MAX_SECONDS > 0
+        else None
+    )
     live_flow_budget_exhausted = False
+    live_flow_deadline_exceeded = False
     live_flow_circuit_open = False
     live_flow_backoff_skipped = 0
+    live_flow_mapping_missing = 0
     us_residential_accepted = 0
     endpoint_dns_cache: dict[str, str | None] = {}
     metadata_seen_endpoint_keys: set[str] = set()
@@ -6019,7 +6291,7 @@ def refresh_publicvpnlist_cache(
         nonlocal live_check_failed, token_generated, token_request_attempted
         nonlocal profile_download_attempted, profile_downloaded, profile_validation_failed
         nonlocal live_flow_attempts, live_flow_failures, live_flow_budget_exhausted, live_flow_circuit_open
-        nonlocal live_flow_backoff_skipped
+        nonlocal live_flow_backoff_skipped, live_flow_deadline_exceeded, live_flow_mapping_missing
         nonlocal api_retry_state_changed
         if not window:
             return False
@@ -6106,6 +6378,16 @@ def refresh_publicvpnlist_cache(
                     publicvpnlist_api_clear_profile_retry(api_retry_cache, effective_row)
                     api_retry_state_changed = True
                 continue
+            if official_flow and not publicvpnlist_web_download_id(effective_row):
+                # The API public ID is intentionally not treated as the
+                # numeric website/Bitrix ID.  Without an explicit mapping,
+                # do not call undocumented live endpoints with a guessed ID.
+                metadata_only_skipped += 1
+                live_flow_mapping_missing += 1
+                if api_retry_cache is not None and not effective_row.get("_pvl_api_not_modified"):
+                    publicvpnlist_api_clear_profile_retry(api_retry_cache, effective_row)
+                    api_retry_state_changed = True
+                continue
             if config_url:
                 config_url_available += 1
             if source_kind == "api" and publicvpnlist_api_profile_retry_active(
@@ -6129,24 +6411,34 @@ def refresh_publicvpnlist_cache(
                         and live_flow_failures >= PUBLICVPNLIST_LIVE_FLOW_MAX_FAILURES
                     )
                     return True
+                if live_flow_deadline is not None and time.monotonic() >= live_flow_deadline:
+                    live_flow_budget_exhausted = True
+                    live_flow_deadline_exceeded = True
+                    return True
                 if live_flow_attempts and PUBLICVPNLIST_LIVE_FLOW_DELAY_SECONDS > 0:
-                    time.sleep(PUBLICVPNLIST_LIVE_FLOW_DELAY_SECONDS)
+                    remaining = live_flow_deadline - time.monotonic() if live_flow_deadline is not None else None
+                    if remaining is not None and remaining <= 0:
+                        live_flow_budget_exhausted = True
+                        live_flow_deadline_exceeded = True
+                        return True
+                    time.sleep(
+                        min(
+                            PUBLICVPNLIST_LIVE_FLOW_DELAY_SECONDS,
+                            remaining if remaining is not None else PUBLICVPNLIST_LIVE_FLOW_DELAY_SECONDS,
+                        )
+                    )
                 live_flow_attempts += 1
                 live_check_attempted += 1
             try:
                 flow_metadata: dict[str, Any] = {}
                 if official_flow:
-                    config_text = fetch_publicvpnlist_official_config(effective_row, metadata=flow_metadata)
+                    config_text = fetch_publicvpnlist_official_config(
+                        effective_row,
+                        metadata=flow_metadata,
+                        deadline=live_flow_deadline,
+                    )
                 else:
                     config_text = fetch_publicvpnlist_config(config_url, metadata=flow_metadata)
-                account_flow_metadata(flow_metadata)
-                if official_flow:
-                    live_flow_failures = 0
-                    if api_retry_cache is not None:
-                        api_retry_cache["live_flow_failure_streak"] = 0
-                        if float(api_retry_cache.get("live_flow_backoff_until") or 0) <= now:
-                            api_retry_cache["live_flow_backoff_until"] = 0.0
-                        api_retry_state_changed = True
                 expected_hash = str(effective_row.get("config_sha256") or "").strip().lower()
                 actual_hash = str(flow_metadata.get("response_sha256") or "").strip().lower()
                 if not re.fullmatch(r"[0-9a-f]{64}", actual_hash):
@@ -6163,6 +6455,7 @@ def refresh_publicvpnlist_cache(
                 actual_keys = normalize_endpoint_keys(node, endpoint_dns_cache)
                 if actual_keys & (priority_endpoint_keys | accepted_endpoint_keys):
                     actual_duplicate_skipped += 1
+                    account_flow_metadata(flow_metadata)
                     continue
                 profile = publicvpnlist_cache_profile(
                     effective_row,
@@ -6179,12 +6472,28 @@ def refresh_publicvpnlist_cache(
                     publicvpnlist_api_clear_profile_retry(api_retry_cache, effective_row)
                     api_retry_state_changed = True
                 accepted_endpoint_keys.update(metadata_keys | actual_keys)
+                # Count and reset only after hash, sanitizer, endpoint and
+                # profile construction all succeeded.  A downloaded but
+                # invalid profile must still contribute to failure streaks.
+                account_flow_metadata(flow_metadata)
+                if official_flow:
+                    live_flow_failures = 0
+                    if api_retry_cache is not None:
+                        api_retry_cache["live_flow_failure_streak"] = 0
+                        if float(api_retry_cache.get("live_flow_backoff_until") or 0) <= now:
+                            api_retry_cache["live_flow_backoff_until"] = 0.0
+                        api_retry_state_changed = True
                 if len(candidate_profiles) >= PUBLICVPNLIST_MAX_NODES:
                     max_nodes_reached = True
                     return True
             except Exception as exc:
                 if flow_metadata.get("profile_downloaded"):
                     flow_metadata["profile_validation_failed"] = True
+                if flow_metadata.get("live_flow_deadline_exceeded"):
+                    live_flow_deadline_exceeded = True
+                    live_flow_budget_exhausted = True
+                if flow_metadata.get("live_flow_mapping_missing"):
+                    live_flow_mapping_missing += 1
                 account_flow_metadata(flow_metadata)
                 partial_failure = True
                 config_download_failed += 1
@@ -6316,8 +6625,10 @@ def refresh_publicvpnlist_cache(
                 "profile_download_attempted": profile_download_attempted,
                 "profile_downloaded": profile_downloaded,
                 "profile_validation_failed": profile_validation_failed,
+                "live_flow_mapping_missing": live_flow_mapping_missing,
                 "live_flow_attempts": live_flow_attempts,
                 "live_flow_budget_exhausted": live_flow_budget_exhausted,
+                "live_flow_deadline_exceeded": live_flow_deadline_exceeded,
                 "live_flow_circuit_open": live_flow_circuit_open,
                 "live_flow_backoff_skipped": live_flow_backoff_skipped,
                 "connectable_candidates": len(candidate_profiles),
@@ -6354,7 +6665,12 @@ def refresh_publicvpnlist_cache(
                 "api_request_limit_hit": bool(api_meta.get("request_limit_hit")) if source_kind == "api" else False,
                 "api_error_code": str(api_meta.get("error_code") or "") if source_kind == "api" else "",
                 "etag_cache_hits": int(api_meta.get("etag_cache_hits") or 0) if source_kind == "api" else 0,
-                "profile_retry_count": int(api_meta.get("profile_retry_count") or 0) if source_kind == "api" else 0,
+                "profile_retry_count": len(api_retry_cache.get("profile_retry_entries") or [])
+                if source_kind == "api" and isinstance(api_retry_cache, dict)
+                else 0,
+                "live_flow_failure_streak": int(api_retry_cache.get("live_flow_failure_streak") or 0)
+                if source_kind == "api" and isinstance(api_retry_cache, dict)
+                else 0,
             },
         }
     )
@@ -6405,8 +6721,10 @@ def refresh_publicvpnlist_cache(
         f"live check failed={live_check_failed}，token request attempted={token_request_attempted}，"
         f"token generated={token_generated}，profile download attempted={profile_download_attempted}，"
         f"profile downloaded={profile_downloaded}，profile validation failed={profile_validation_failed}，"
+        f"live flow mapping missing={live_flow_mapping_missing}，"
         f"live flow attempts={live_flow_attempts}/{PUBLICVPNLIST_LIVE_FLOW_MAX_ATTEMPTS}，"
         f"live flow budget exhausted={live_flow_budget_exhausted}，"
+        f"live flow deadline exceeded={live_flow_deadline_exceeded}，"
         f"live flow circuit open={live_flow_circuit_open}，"
         f"live flow backoff skipped={live_flow_backoff_skipped}，"
         f"US residential accepted={us_residential_accepted}，US rejected={us_rejected}，"

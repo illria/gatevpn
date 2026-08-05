@@ -1584,8 +1584,28 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
             result = vpngate_manager.fetch_publicvpnlist_candidates(["PH"], set())
         self.assertEqual(result, [])
 
+    def test_public_id_is_not_sent_to_private_flow_without_verified_web_mapping(self):
+        row = self.record("pvl_0123456789abcdef0123456789", with_config=False)
+        metadata = {}
+        with mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_http_get",
+            side_effect=AssertionError("private flow must not run without web ID mapping"),
+        ):
+            with self.assertRaises(vpngate_manager.PublicVPNListSnapshotError):
+                vpngate_manager.fetch_publicvpnlist_official_config(row, metadata=metadata)
+        self.assertTrue(metadata["live_flow_mapping_missing"])
+
+    def test_official_server_page_numeric_id_is_explicitly_mapped(self):
+        row = self.record("pvl_0123456789abcdef0123456789", with_config=False)
+        row["server_page_url"] = "https://publicvpnlist.com/server/111206/"
+        normalized = vpngate_manager.normalize_publicvpnlist_row(row)
+        self.assertEqual(vpngate_manager.publicvpnlist_web_download_id(row), "111206")
+        self.assertEqual(normalized["web_download_id"], "111206")
+
     def test_api_metadata_runs_official_live_check_token_and_profile_download(self):
         row = self.record("live-ph", with_config=False)
+        row["web_download_id"] = "111206"
         row["config_sha256"] = ""
         calls = []
         config = (
@@ -1628,11 +1648,11 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
 
         self.assertEqual(len(result), 1)
         self.assertEqual([call["path"] for call in calls], ["/test_server.php", "/get_token.php", "/download.php"])
-        self.assertEqual(calls[0]["query"]["id"], ["live-ph"])
+        self.assertEqual(calls[0]["query"]["id"], ["111206"])
         self.assertEqual(calls[0]["accept"], "application/json")
         self.assertEqual(calls[0]["headers"]["X-Requested-With"], "XMLHttpRequest")
         self.assertEqual(calls[1]["method"], "POST")
-        self.assertEqual(calls[1]["data"], b"id=live-ph")
+        self.assertEqual(calls[1]["data"], b"id=111206")
         self.assertEqual(calls[1]["headers"]["Content-Type"], "application/x-www-form-urlencoded;charset=UTF-8")
         self.assertEqual(calls[2]["accept"], "application/x-openvpn-profile,text/plain")
         cache_text = self.profile_cache_file.read_text(encoding="utf-8")
@@ -1645,6 +1665,7 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
 
     def test_live_check_failure_is_fail_closed_without_token_request(self):
         row = self.record("live-failed", with_config=False)
+        row["web_download_id"] = "111207"
         calls = []
 
         def http_get(url, metadata=None, **_kwargs):
@@ -1670,6 +1691,7 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
 
     def test_cached_profile_is_reused_only_while_fresh_and_metadata_matches(self):
         raw_row = self.record("reuse-profile", with_config=False)
+        raw_row["web_download_id"] = "111230"
         raw_row["config_sha256"] = ""
         row = vpngate_manager.normalize_publicvpnlist_row(raw_row)
         config = (
@@ -1764,6 +1786,7 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
 
     def test_profile_metadata_change_forces_a_new_live_download(self):
         raw_row = self.record("metadata-changed", with_config=False)
+        raw_row["web_download_id"] = "111231"
         raw_row.update({"config_sha256": "", "config_updated_at": "v1"})
         row = vpngate_manager.normalize_publicvpnlist_row(raw_row)
         config = (
@@ -1803,6 +1826,7 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
 
     def test_official_flow_does_not_retry_a_one_time_download_token(self):
         row = self.record("one-time-failure", with_config=False)
+        row["web_download_id"] = "111208"
         calls = []
 
         def http_get(url, metadata=None, **_kwargs):
@@ -1832,6 +1856,8 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
 
     def test_live_flow_budget_and_circuit_breaker_stop_additional_profiles(self):
         rows = [self.record(f"budget-{index}", with_config=False) for index in range(4)]
+        for index, row in enumerate(rows):
+            row["web_download_id"] = str(111210 + index)
         with mock.patch.object(
             vpngate_manager,
             "fetch_publicvpnlist_snapshot",
@@ -1856,8 +1882,121 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
         self.assertEqual(stats["live_flow_attempts"], 2)
         self.assertTrue(stats["live_flow_budget_exhausted"])
 
+    def test_downloaded_but_invalid_profile_counts_validation_failure_and_keeps_streak(self):
+        row = self.record("validation-after-download", with_config=False)
+        row["web_download_id"] = "111240"
+        config = (
+            "client\nproto tcp\nremote another-endpoint.fixture.invalid 443\n"
+            "<ca>\nCERT\n</ca>\n"
+        )
+
+        def fake_live_flow(_row, metadata=None, **_kwargs):
+            metadata.update(
+                {
+                    "official_flow": True,
+                    "live_check_succeeded": True,
+                    "token_request_attempted": 1,
+                    "token_generated": True,
+                    "profile_download_attempted": 1,
+                    "profile_downloaded": 1,
+                    "response_sha256": hashlib.sha256(config.encode()).hexdigest(),
+                }
+            )
+            return config
+
+        with mock.patch.object(
+            vpngate_manager,
+            "fetch_publicvpnlist_snapshot",
+            return_value={"data": [row]},
+        ), mock.patch.object(
+            vpngate_manager,
+            "fetch_publicvpnlist_official_config",
+            side_effect=fake_live_flow,
+        ), mock.patch.object(vpngate_manager, "log_to_json"):
+            result = vpngate_manager.fetch_publicvpnlist_candidates(["PH"], set())
+
+        self.assertEqual(result, [])
+        stats = vpngate_manager.load_publicvpnlist_cache()["last_refresh_stats"]
+        self.assertEqual(stats["profile_downloaded"], 1)
+        self.assertEqual(stats["profile_validation_failed"], 1)
+        self.assertEqual(vpngate_manager.load_publicvpnlist_api_cache()["live_flow_failure_streak"], 1)
+
+    def test_persisted_live_flow_failure_streak_opens_circuit_on_next_refresh(self):
+        api_cache = vpngate_manager.publicvpnlist_api_cache_default()
+        api_cache["live_flow_failure_streak"] = 2
+        vpngate_manager.save_publicvpnlist_api_cache(api_cache)
+        row = self.record("persisted-circuit", with_config=False)
+        row["web_download_id"] = "111241"
+        with mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_refresh_needed",
+            return_value=True,
+        ), mock.patch.object(
+            vpngate_manager,
+            "fetch_publicvpnlist_snapshot",
+            return_value={"data": [row]},
+        ), mock.patch.object(
+            vpngate_manager,
+            "fetch_publicvpnlist_official_config",
+            side_effect=AssertionError("persisted circuit must stop before the next live flow"),
+        ), mock.patch.object(
+            vpngate_manager,
+            "PUBLICVPNLIST_LIVE_FLOW_MAX_FAILURES",
+            2,
+        ):
+            vpngate_manager.refresh_publicvpnlist_cache()
+
+        stats = vpngate_manager.load_publicvpnlist_cache()["last_refresh_stats"]
+        self.assertEqual(stats["live_flow_attempts"], 0)
+        self.assertTrue(stats["live_flow_circuit_open"])
+
+    def test_retry_entries_for_profiles_missing_from_complete_metadata_are_pruned(self):
+        cache = vpngate_manager.publicvpnlist_api_cache_default()
+        old_row = vpngate_manager.normalize_publicvpnlist_row(self.record("gone-retry", with_config=False))
+        current_row = vpngate_manager.normalize_publicvpnlist_row(self.record("current-retry", with_config=False))
+        now = time.time()
+        vpngate_manager.publicvpnlist_api_record_profile_retry(cache, old_row, now=now)
+        vpngate_manager.publicvpnlist_api_record_profile_retry(cache, current_row, now=now)
+        changed = vpngate_manager.publicvpnlist_api_prune_profile_retries(
+            cache,
+            [self.record("current-retry", with_config=False)],
+            now=now + 1,
+        )
+        self.assertTrue(changed)
+        self.assertEqual(
+            [entry["public_id"] for entry in cache["profile_retry_entries"]],
+            ["current-retry"],
+        )
+
+    def test_live_flow_deadline_stops_before_private_flow(self):
+        row = self.record("deadline", with_config=False)
+        row["web_download_id"] = "111242"
+        with mock.patch.object(
+            vpngate_manager,
+            "fetch_publicvpnlist_snapshot",
+            return_value={"data": [row]},
+        ), mock.patch.object(
+            vpngate_manager,
+            "fetch_publicvpnlist_official_config",
+            side_effect=AssertionError("deadline must stop before live flow"),
+        ), mock.patch.object(
+            vpngate_manager,
+            "PUBLICVPNLIST_LIVE_FLOW_MAX_SECONDS",
+            0.5,
+        ), mock.patch.object(
+            vpngate_manager.time,
+            "monotonic",
+            side_effect=[100.0, 101.0],
+        ):
+            vpngate_manager.refresh_publicvpnlist_cache()
+
+        stats = vpngate_manager.load_publicvpnlist_cache()["last_refresh_stats"]
+        self.assertTrue(stats["live_flow_deadline_exceeded"])
+        self.assertTrue(stats["live_flow_budget_exhausted"])
+
     def test_live_flow_429_persists_bounded_retry_after_and_global_backoff(self):
         row = self.record("live-429", with_config=False)
+        row["web_download_id"] = "111220"
         row["config_sha256"] = ""
         headers = Message()
         headers["Retry-After"] = "120"
