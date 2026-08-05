@@ -140,14 +140,18 @@ PUBLICVPNLIST_STALE_PROFILE_SECONDS = publicvpnlist_shared_stale_profile_seconds
 )
 PUBLICVPNLIST_API_REFRESH_SECONDS = _publicvpnlist_env_int("PUBLICVPNLIST_API_REFRESH_SECONDS", 900)
 PUBLICVPNLIST_API_MAX_STALE_SECONDS = _publicvpnlist_env_int("PUBLICVPNLIST_API_MAX_STALE_SECONDS", 21600, 1)
-PUBLICVPNLIST_API_TIMEOUT_SECONDS = _publicvpnlist_env_int("PUBLICVPNLIST_API_TIMEOUT_SECONDS", 20, 1)
-PUBLICVPNLIST_API_MAX_RETRIES = _publicvpnlist_env_int("PUBLICVPNLIST_API_MAX_RETRIES", 2, 1)
+PUBLICVPNLIST_API_TIMEOUT_SECONDS = _publicvpnlist_env_int("PUBLICVPNLIST_API_TIMEOUT_SECONDS", 10, 1)
+PUBLICVPNLIST_API_MAX_RETRIES = _publicvpnlist_env_int("PUBLICVPNLIST_API_MAX_RETRIES", 1, 1)
 PUBLICVPNLIST_API_MAX_PAGES = _publicvpnlist_env_int("PUBLICVPNLIST_API_MAX_PAGES", 20, 1)
 PUBLICVPNLIST_API_MAX_RECORDS = _publicvpnlist_env_int("PUBLICVPNLIST_API_MAX_RECORDS", 4000, 1)
 PUBLICVPNLIST_API_MAX_RESPONSE_BYTES = _publicvpnlist_env_int("PUBLICVPNLIST_API_MAX_RESPONSE_BYTES", 8 * 1024 * 1024, 256 * 1024)
 PUBLICVPNLIST_API_PER_PAGE = min(200, _publicvpnlist_env_int("PUBLICVPNLIST_API_PER_PAGE", 200, 1))
 PUBLICVPNLIST_API_MAX_RETRY_AFTER_SECONDS = _publicvpnlist_env_int("PUBLICVPNLIST_API_MAX_RETRY_AFTER_SECONDS", 300, 1)
-PUBLICVPNLIST_API_MAX_REQUESTS_PER_REFRESH = min(60, _publicvpnlist_env_int("PUBLICVPNLIST_API_MAX_REQUESTS_PER_REFRESH", 60, 1))
+PUBLICVPNLIST_API_MAX_REQUESTS_PER_REFRESH = min(60, _publicvpnlist_env_int("PUBLICVPNLIST_API_MAX_REQUESTS_PER_REFRESH", 30, 1))
+PUBLICVPNLIST_API_DETAIL_MAX_REQUESTS = min(
+    10,
+    _publicvpnlist_env_int("PUBLICVPNLIST_API_DETAIL_MAX_REQUESTS", 10, 0),
+)
 PUBLICVPNLIST_API_CACHE_SCHEMA_VERSION = 3
 # Compatibility aliases retained for the existing snapshot/config tests.
 PUBLICVPNLIST_API_MAX_BACKOFF_SECONDS = PUBLICVPNLIST_API_MAX_RETRY_AFTER_SECONDS
@@ -160,21 +164,21 @@ PUBLICVPNLIST_MAX_RETRIES = _publicvpnlist_env_int("PUBLICVPNLIST_MAX_RETRIES", 
 PUBLICVPNLIST_MAX_REDIRECTS = _publicvpnlist_env_int("PUBLICVPNLIST_MAX_REDIRECTS", 5)
 PUBLICVPNLIST_LIVE_FLOW_MAX_ATTEMPTS = _publicvpnlist_env_int(
     "PUBLICVPNLIST_LIVE_FLOW_MAX_ATTEMPTS",
-    5,
+    3,
     0,
 )
 PUBLICVPNLIST_LIVE_FLOW_DELAY_SECONDS = _publicvpnlist_env_float(
     "PUBLICVPNLIST_LIVE_FLOW_DELAY_SECONDS",
-    0.25,
+    0.2,
 )
 PUBLICVPNLIST_LIVE_FLOW_MAX_FAILURES = _publicvpnlist_env_int(
     "PUBLICVPNLIST_LIVE_FLOW_MAX_FAILURES",
-    5,
+    3,
     0,
 )
 PUBLICVPNLIST_LIVE_FLOW_MAX_SECONDS = _publicvpnlist_env_float(
     "PUBLICVPNLIST_LIVE_FLOW_MAX_SECONDS",
-    90.0,
+    30.0,
 )
 PUBLICVPNLIST_PROFILE_RETRY_MAX_ENTRIES = _publicvpnlist_env_int(
     "PUBLICVPNLIST_PROFILE_RETRY_MAX_ENTRIES",
@@ -290,6 +294,8 @@ PUBLICVPNLIST_CACHE_FILE = DATA_DIR / "publicvpnlist_cache.json"
 PUBLICVPNLIST_API_CACHE_FILE = DATA_DIR / "publicvpnlist_api_cache.json"
 
 lock = threading.RLock()
+publicvpnlist_api_refresh_lock = threading.Lock()
+publicvpnlist_api_refresh_thread: threading.Thread | None = None
 active_sessions: dict[str, float] = {}
 active_openvpn_process: subprocess.Popen[str] | None = None
 active_openvpn_node_id = ""
@@ -2499,7 +2505,7 @@ PUBLICVPNLIST_API_STORED_FIELDS = frozenset(
         "uptime_percent_7d", "uptime_hours", "sessions", "score_label", "first_seen_at",
         "config_updated_at", "source_updated_at", "server_page_url", "source_url",
         "config_download_url", "download_page_url", "temporary_ovpn_url",
-        "web_download_id",
+        "web_download_id", "numeric_id", "server_numeric_id", "bitrix_id", "download_id",
     }
 )
 
@@ -2533,6 +2539,9 @@ def publicvpnlist_api_cache_default() -> dict[str, Any]:
         "live_flow_backoff_until": 0.0,
         "live_flow_failure_streak": 0,
         "live_flow_last_status": 0,
+        "detail_requests": 0,
+        "detail_successes": 0,
+        "detail_failures": 0,
         "profile_retry_entries": [],
         "profile_retry_countries": [],
         "profile_retry_public_ids": [],
@@ -3758,6 +3767,96 @@ def _publicvpnlist_api_normalize_next_update_at(value: Any, now: float) -> tuple
 def _publicvpnlist_api_cache_records_for_country(cache: dict[str, Any], country: str) -> list[dict[str, Any]]:
     return publicvpnlist_api_cached_records(cache, countries=[str(country or "").upper()])
 
+
+
+
+def _publicvpnlist_api_detail_record(payload: Any) -> dict[str, Any]:
+    """Extract one server record from the documented API detail response."""
+
+    if isinstance(payload, dict):
+        known = set(PUBLICVPNLIST_API_STORED_FIELDS) | {
+            "numeric_id", "server_numeric_id", "bitrix_id", "download_id",
+            "server_page_url", "download_page_url", "config_download_url",
+            "source_url", "temporary_ovpn_url",
+        }
+        if any(key in payload for key in known):
+            return dict(payload)
+        for key in ("data", "server", "result"):
+            nested = payload.get(key)
+            if isinstance(nested, dict):
+                found = _publicvpnlist_api_detail_record(nested)
+                if found:
+                    return found
+            elif isinstance(nested, list):
+                for item in nested:
+                    found = _publicvpnlist_api_detail_record(item)
+                    if found:
+                        return found
+    elif isinstance(payload, list):
+        for item in payload:
+            found = _publicvpnlist_api_detail_record(item)
+            if found:
+                return found
+    return {}
+
+
+def publicvpnlist_api_enrich_records_for_download(
+    records: list[dict[str, Any]],
+    api_meta: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Use the documented detail endpoint for explicit download metadata only."""
+
+    if not isinstance(records, list):
+        return []
+    meta = api_meta if isinstance(api_meta, dict) else {}
+    used_requests = max(0, parse_int(meta.get("request_count")))
+    remaining = max(0, PUBLICVPNLIST_API_MAX_REQUESTS_PER_REFRESH - used_requests)
+    budget = min(PUBLICVPNLIST_API_DETAIL_MAX_REQUESTS, remaining)
+    enriched: list[dict[str, Any]] = []
+    attempted = successes = failures = 0
+    base_url = publicvpnlist_api_base_url()
+    allowed_fields = set(PUBLICVPNLIST_API_STORED_FIELDS) | {
+        "numeric_id", "server_numeric_id", "bitrix_id", "download_id",
+    }
+    for raw_record in records:
+        row = dict(raw_record) if isinstance(raw_record, dict) else {}
+        needs_detail = bool(
+            not str(row.get("config_download_url") or row.get("temporary_ovpn_url") or "").strip()
+            and not publicvpnlist_web_download_id(row)
+        )
+        public_id = str(row.get("id") or row.get("public_id") or "").strip()
+        if needs_detail and re.fullmatch(r"pvl_[0-9a-fA-F]{24}", public_id) and attempted < budget:
+            attempted += 1
+            detail_meta: dict[str, Any] = {}
+            try:
+                detail_url = f"{base_url}/servers/{urllib.parse.quote(public_id, safe='')}"
+                publicvpnlist_validate_api_url(detail_url, base_url)
+                opener = urllib.request.build_opener(PublicVPNListAPIRedirectHandler(base_url))
+                body = publicvpnlist_http_get(
+                    detail_url,
+                    timeout=PUBLICVPNLIST_API_TIMEOUT_SECONDS,
+                    max_bytes=min(PUBLICVPNLIST_API_MAX_RESPONSE_BYTES, 512 * 1024),
+                    accept="application/json",
+                    opener=opener,
+                    metadata=detail_meta,
+                )
+                detail = _publicvpnlist_api_detail_record(json.loads(body.decode("utf-8")))
+                if detail:
+                    for key, value in detail.items():
+                        if key in allowed_fields or key.endswith("_url"):
+                            row[key] = value
+                    successes += 1
+                else:
+                    failures += 1
+            except Exception:
+                failures += 1
+            meta["request_count"] = used_requests + attempted
+        enriched.append(row)
+    if api_meta is not None:
+        api_meta["detail_requests"] = attempted
+        api_meta["detail_successes"] = successes
+        api_meta["detail_failures"] = failures
+    return enriched
 
 def fetch_publicvpnlist_api_snapshot(
     cache: dict[str, Any] | None = None,
@@ -6122,6 +6221,7 @@ def refresh_publicvpnlist_cache(
         records = publicvpnlist_payload_records(payload)
         api_meta = payload.get("_api_meta") if isinstance(payload, dict) and isinstance(payload.get("_api_meta"), dict) else {}
         if source_kind == "api":
+            records = publicvpnlist_api_enrich_records_for_download(records, api_meta)
             records = publicvpnlist_order_api_candidate_records(records)
         api_retry_cache = load_publicvpnlist_api_cache() if source_kind == "api" else None
         api_retry_state_changed = False
@@ -7303,6 +7403,7 @@ def fetch_publicvpnlist_candidates(
     seen_keys: set[str],
     blocked_endpoint_keys: set[str] | None = None,
     existing_nodes: list[dict[str, Any]] | None = None,
+    allow_network: bool = True,
 ) -> list[dict[str, Any]]:
     if not publicvpnlist_is_enabled():
         log_to_json("INFO", "PublicVPNList", "PublicVPNList 已停用，本轮不读取 API、快照或缓存")
@@ -7343,28 +7444,33 @@ def fetch_publicvpnlist_candidates(
             "PublicVPNList 仅使用缓存：未配置 API/快照，不进行元数据或 profile 下载",
         )
     else:
-        explicit_download_hosts = publicvpnlist_explicit_download_hosts()
-        if source_kind in {"url", "file"} and not explicit_download_hosts:
-            if not publicvpnlist_cache_has_usable_profiles(cache):
-                persist_candidate_stats(0, 0)
+        if source_kind == "api" and not allow_network:
+            # API refresh is scheduled by the collector; this branch only
+            # assembles validated profiles and never opens a socket.
+            cache = cache or publicvpnlist_cache_default(publicvpnlist_source_hash())
+        else:
+            explicit_download_hosts = publicvpnlist_explicit_download_hosts()
+            if source_kind in {"url", "file"} and not explicit_download_hosts:
+                if not publicvpnlist_cache_has_usable_profiles(cache):
+                    persist_candidate_stats(0, 0)
+                    log_to_json(
+                        "INFO",
+                        "PublicVPNList",
+                        "PublicVPNList 未配置下载域名且没有有效缓存，本轮来源返回空；请设置 PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS",
+                    )
+                    return []
                 log_to_json(
                     "INFO",
                     "PublicVPNList",
-                    "PublicVPNList 未配置下载域名且没有有效缓存，本轮来源返回空；请设置 PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS",
+                    "PublicVPNList 仅使用缓存：未配置 PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS，不尝试下载新的 profile",
                 )
-                return []
-            log_to_json(
-                "INFO",
-                "PublicVPNList",
-                "PublicVPNList 仅使用缓存：未配置 PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS，不尝试下载新的 profile",
-            )
-            cache = cache or publicvpnlist_cache_default(publicvpnlist_source_hash())
-        else:
-            cache = refresh_publicvpnlist_cache(
-                cache,
-                blocked_endpoint_keys=blocked_endpoint_keys,
-                target_countries=target_countries,
-            )
+                cache = cache or publicvpnlist_cache_default(publicvpnlist_source_hash())
+            else:
+                cache = refresh_publicvpnlist_cache(
+                    cache,
+                    blocked_endpoint_keys=blocked_endpoint_keys,
+                    target_countries=target_countries,
+                )
 
     if cache is None:
         cache = publicvpnlist_cache_default(publicvpnlist_source_hash())
@@ -7569,6 +7675,50 @@ def fetch_publicvpnlist_candidates(
     return result
 
 
+
+
+def schedule_publicvpnlist_api_refresh(
+    target_countries: list[str] | None = None,
+    blocked_endpoint_keys: set[str] | None = None,
+) -> bool:
+    """Start at most one bounded API refresh without blocking node assembly."""
+
+    global publicvpnlist_api_refresh_thread
+    if not publicvpnlist_is_enabled() or publicvpnlist_source()[0] != "api":
+        return False
+    with publicvpnlist_api_refresh_lock:
+        if publicvpnlist_api_refresh_thread is not None and publicvpnlist_api_refresh_thread.is_alive():
+            return False
+
+        def worker() -> None:
+            global publicvpnlist_api_refresh_thread
+            try:
+                cache = load_publicvpnlist_cache()
+                refresh_publicvpnlist_cache(
+                    cache,
+                    blocked_endpoint_keys=blocked_endpoint_keys,
+                    target_countries=target_countries,
+                )
+                log_to_json("INFO", "PublicVPNList", "PublicVPNList API 刷新已转入后台完成")
+            except Exception as exc:
+                log_to_json(
+                    "WARNING",
+                    "PublicVPNList",
+                    f"PublicVPNList API 后台刷新失败，继续使用缓存；错误类型={type(exc).__name__}",
+                )
+            finally:
+                with publicvpnlist_api_refresh_lock:
+                    publicvpnlist_api_refresh_thread = None
+
+        publicvpnlist_api_refresh_thread = threading.Thread(
+            target=worker,
+            name="publicvpnlist-api-refresh",
+            daemon=True,
+        )
+        publicvpnlist_api_refresh_thread.start()
+        log_to_json("INFO", "PublicVPNList", "PublicVPNList API 刷新已在后台调度，不阻塞当前来源")
+        return True
+
 def fetch_candidates(target_override: list[str] | None = None) -> list[dict[str, Any]]:
     blacklist = load_blacklist()
     candidates: list[dict[str, Any]] = []
@@ -7602,12 +7752,17 @@ def fetch_candidates(target_override: list[str] | None = None) -> list[dict[str,
         source_seen_keys: set[str] = set()
         try:
             blocked_endpoint_keys = publicvpnlist_blocking_endpoint_keys(candidates)
+            schedule_publicvpnlist_api_refresh(
+                target_countries=target_countries,
+                blocked_endpoint_keys=blocked_endpoint_keys,
+            )
             candidates.extend(
                 fetch_publicvpnlist_candidates(
                     target_countries,
                     source_seen_keys,
                     blocked_endpoint_keys=blocked_endpoint_keys,
                     existing_nodes=candidates,
+                    allow_network=False,
                 )
             )
         except Exception as exc:
@@ -12015,6 +12170,56 @@ class Tee:
         self.stdout.flush()
         self.file.flush()
 
+
+
+def restore_cached_publicvpnlist_nodes() -> int:
+    """Make validated PublicVPNList profiles available before the first refresh."""
+
+    if not publicvpnlist_is_enabled():
+        return 0
+    try:
+        cached_candidates = fetch_publicvpnlist_candidates(
+            get_target_countries(),
+            set(),
+            allow_network=False,
+        )
+    except Exception as exc:
+        log_to_json(
+            "WARNING",
+            "PublicVPNList",
+            f"启动时恢复缓存 profile 失败；错误类型={type(exc).__name__}",
+        )
+        return 0
+    if not cached_candidates:
+        return 0
+    with lock:
+        current_nodes = read_json(NODES_FILE, [])
+        if not isinstance(current_nodes, list):
+            current_nodes = []
+        merged = list(current_nodes)
+        existing_ids = {str(node.get("id") or "") for node in merged if isinstance(node, dict)}
+        added = 0
+        for node in cached_candidates:
+            node_id = str(node.get("id") or "")
+            if not node_id or node_id in existing_ids:
+                continue
+            config_file = Path(str(node.get("config_file") or ""))
+            if config_file and node.get("config_text") and not config_file.exists():
+                try:
+                    CONFIG_DIR.mkdir(exist_ok=True, parents=True, mode=0o700)
+                    CONFIG_DIR.chmod(0o700)
+                    atomic_write_text(config_file, str(node["config_text"]), mode=0o600)
+                except OSError:
+                    continue
+            merged.append(node)
+            existing_ids.add(node_id)
+            added += 1
+        if added:
+            write_json(NODES_FILE, merged)
+    if added:
+        log_to_json("INFO", "PublicVPNList", f"启动时立即恢复已验证缓存节点 {added} 个")
+    return added
+
 def main() -> None:
     ensure_dirs()
     kill_existing_openvpn_processes()
@@ -12047,6 +12252,7 @@ def main() -> None:
             "target_ip_types_display": target_ip_types_display(load_ui_config().get("target_ip_types") or TARGET_IP_TYPES_ENV or "residential"),
         },
     )
+    restore_cached_publicvpnlist_nodes()
     threading.Thread(target=proxy_server.start_proxy_server, args=(LOCAL_PROXY_HOST, LOCAL_PROXY_PORT), daemon=True).start()
     
     # Wait for the gateway to officially start
