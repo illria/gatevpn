@@ -1,191 +1,61 @@
-name: PublicVPNList live flow proof
+name: PublicVPNList live profile smoke
 
 on:
   pull_request:
     branches:
       - main
+  push:
+    branches:
+      - feat/publicvpnlist-live-download
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  prove-live-flow:
+  real-live-profile:
+    name: Real PublicVPNList profile smoke
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
-      - name: Match API metadata to official export and download one profile
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: API to validated profile without OpenVPN
         shell: bash
         run: |
-          set -eu
-          python3 <<'PY'
-          import hashlib
+          mkdir -p artifacts/logs
+          set +e
+          python3 tools/publicvpnlist-smoke.py             --api             --countries PH,FR             --max-profiles 3             --timeout 60             --redact             --download             --json-report artifacts/logs/publicvpnlist-live-smoke.json             > artifacts/logs/publicvpnlist-live-smoke.log 2>&1
+          smoke_status=$?
+          cat artifacts/logs/publicvpnlist-live-smoke.json || true
+          tail -n 20 artifacts/logs/publicvpnlist-live-smoke.log || true
+          python3 - artifacts/logs/publicvpnlist-live-smoke.json <<'PY'
           import json
-          import re
-          import time
-          import urllib.parse
-          import urllib.request
-          import urllib.error
-          from http import cookiejar
+          import sys
 
-          def fetch_json(url, timeout=45):
-              request = urllib.request.Request(url, headers={"Accept": "application/json"})
-              with urllib.request.urlopen(request, timeout=timeout) as response:
-                  return json.load(response)
-
-          def records_from_api(payload):
-              return payload.get("data", []) if isinstance(payload, dict) else payload
-
-          api_records = []
-          for country in ("PH", "FR", "US"):
-              params = {
-                  "country": country,
-                  "protocol": "openvpn",
-                  "status": "online",
-                  "per_page": "200",
-                  "sort": "last_checked",
-                  "order": "desc",
-              }
-              url = "https://publicvpnlist.com/api/v1/servers?" + urllib.parse.urlencode(params)
-              try:
-                  api_records.extend(
-                      record for record in records_from_api(fetch_json(url))
-                      if isinstance(record, dict)
-                  )
-              except Exception:
-                  pass
-
-          export = fetch_json("https://publicvpnlist.com/exports/openvpn-latest.json")
-          export_records = (
-              export.get("records") or export.get("servers") or export.get("data") or []
-              if isinstance(export, dict) else export
-          )
-          export_by_endpoint = {}
-          for record in export_records:
-              if not isinstance(record, dict):
-                  continue
-              host = str(record.get("ip") or record.get("host") or record.get("hostname") or "").strip().lower()
-              port = str(record.get("port") or "").strip()
-              proto = str(record.get("transport") or record.get("proto") or "").strip().lower()
-              page = str(record.get("server_page_url") or record.get("download_page_url") or "")
-              match = re.search(r"/(?:server|download)/([0-9]+)/?", page)
-              if host and port and proto and match:
-                  export_by_endpoint[(host, port, proto)] = (record, match.group(1))
-
-          matches = []
-          for record in api_records:
-              host = str(record.get("ip") or record.get("hostname") or "").strip().lower()
-              key = (host, str(record.get("port") or "").strip(), str(record.get("transport") or "").strip().lower())
-              if key in export_by_endpoint:
-                  matches.append((record, export_by_endpoint[key][0], export_by_endpoint[key][1]))
-
-          report = {
-              "api_records": len(api_records),
-              "export_records": len(export_records) if isinstance(export_records, list) else 0,
-              "numeric_endpoint_matches": len(matches),
-              "live_check_attempted": False,
-              "live_check_succeeded": False,
-              "token_request_attempted": False,
-              "token_generated": False,
-              "profile_download_attempted": False,
-              "profile_downloaded": False,
-              "profile_looks_like_openvpn": False,
-              "profile_sha256_verified_against_api": False,
-              "openvpn_started": False,
-          }
-          if not matches:
-              print(json.dumps(report, sort_keys=True))
-              raise SystemExit(0)
-
-          api_record, export_record, numeric_id = matches[0]
-          opener = urllib.request.build_opener(
-              urllib.request.HTTPCookieProcessor(cookiejar.CookieJar())
-          )
-
-          def read_json_request(request):
-              with opener.open(request, timeout=45) as response:
-                  return int(getattr(response, "status", 200) or 200), response.headers, json.loads(response.read())
-
-          report["live_check_attempted"] = True
-          check_url = "https://publicvpnlist.com/test_server.php?" + urllib.parse.urlencode({
-              "id": numeric_id,
-              "_": str(int(time.time() * 1000)),
-          })
-          try:
-              status, headers, check = read_json_request(urllib.request.Request(
-                  check_url,
-                  headers={"Accept": "application/json", "X-Requested-With": "XMLHttpRequest"},
-              ))
-          except Exception as exc:
-              report["live_check_error"] = type(exc).__name__
-              print(json.dumps(report, sort_keys=True))
-              raise SystemExit(0)
-          report["live_check_http_status"] = status
-          report["live_check_succeeded"] = bool(isinstance(check, dict) and check.get("ok") and check.get("status") == "ok")
-          if not report["live_check_succeeded"]:
-              print(json.dumps(report, sort_keys=True))
-              raise SystemExit(0)
-
-          report["token_request_attempted"] = True
-          token_request = urllib.request.Request(
-              "https://publicvpnlist.com/get_token.php",
-              data=urllib.parse.urlencode({"id": numeric_id}).encode("ascii"),
-              headers={
-                  "Accept": "application/json",
-                  "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-                  "X-Requested-With": "XMLHttpRequest",
-              },
-              method="POST",
-          )
-          try:
-              token_status, token_headers, token_payload = read_json_request(token_request)
-          except Exception as exc:
-              report["token_error"] = type(exc).__name__
-              print(json.dumps(report, sort_keys=True))
-              raise SystemExit(0)
-          report["token_http_status"] = token_status
-          returned_url = str(token_payload.get("url") or "") if isinstance(token_payload, dict) else ""
-          token_value = str(token_payload.get("token") or "") if isinstance(token_payload, dict) else ""
-          report["token_generated"] = bool(returned_url or token_value)
-          if not report["token_generated"]:
-              print(json.dumps(report, sort_keys=True))
-              raise SystemExit(0)
-
-          download_url = (
-              urllib.parse.urljoin("https://publicvpnlist.com/", returned_url)
-              if returned_url else
-              "https://publicvpnlist.com/download.php?" + urllib.parse.urlencode({"token": token_value})
-          )
-          report["profile_download_attempted"] = True
-          try:
-              download_request = urllib.request.Request(
-                  download_url,
-                  headers={"Accept": "application/x-openvpn-profile, application/octet-stream;q=0.9, */*;q=0.8"},
-              )
-              with opener.open(download_request, timeout=45) as response:
-                  body = response.read(8 * 1024 * 1024)
-                  content_type = response.headers.get("Content-Type", "").split(";", 1)[0].lower()
-                  status = int(getattr(response, "status", 200) or 200)
-          except Exception as exc:
-              report["profile_download_error"] = type(exc).__name__
-              print(json.dumps(report, sort_keys=True))
-              raise SystemExit(0)
-
-          text = body.decode("utf-8", errors="replace")
-          report.update({
-              "profile_download_http_status": status,
-              "profile_download_content_type": content_type,
-              "profile_download_bytes": len(body),
-              "profile_downloaded": bool(body),
-              "profile_looks_like_openvpn": bool(
-                  re.search(r"(?m)^\s*client\s*$", text)
-                  and re.search(r"(?m)^\s*remote\s+\S+\s+\d+(?:\s+\S+)?\s*$", text)
-              ),
-              "profile_sha256": hashlib.sha256(body).hexdigest(),
-              "api_config_sha256_present": bool(str(api_record.get("config_sha256") or "").strip()),
-              "export_config_sha256_present": bool(str(export_record.get("config_sha256") or "").strip()),
-          })
-          expected_hash = str(api_record.get("config_sha256") or export_record.get("config_sha256") or "").strip().lower()
-          report["profile_sha256_verified_against_api"] = bool(expected_hash and report["profile_sha256"] == expected_hash)
-          print(json.dumps(report, sort_keys=True))
+          report = json.loads(open(sys.argv[1], encoding="utf-8").read())
+          required = ("profiles_downloaded", "profiles_validated", "connectable_candidates")
+          missing = [name for name in required if int(report.get(name) or 0) < 1]
+          if missing:
+              raise SystemExit("live profile smoke missing: " + ", ".join(missing))
+          print("profiles_downloaded=" + str(report["profiles_downloaded"]))
+          print("profiles_validated=" + str(report["profiles_validated"]))
+          print("connectable_candidates=" + str(report["connectable_candidates"]))
+          print("openvpn_started=" + str(report.get("openvpn") == "started"))
           PY
+          test "$smoke_status" -eq 0
+
+      - name: Upload redacted live smoke report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: publicvpnlist-live-profile-smoke
+          path: artifacts/logs
+          if-no-files-found: error
+          retention-days: 14
