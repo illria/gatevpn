@@ -1,0 +1,50 @@
+name: PublicVPNList manifest bundle discovery
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect-bundle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Inspect manifest bundle metadata
+        shell: bash
+        run: |
+          set -eu
+          python3 <<'PY'
+          import json
+          import urllib.parse
+          import urllib.request
+
+          req = urllib.request.Request(
+              "https://publicvpnlist.com/exports/openvpn-manifest.json",
+              headers={"Accept": "application/json"},
+          )
+          with urllib.request.urlopen(req, timeout=20) as response:
+              payload = json.load(response)
+          bundle = payload.get("config_bundle") if isinstance(payload, dict) else None
+          if not isinstance(bundle, dict):
+              print("config_bundle=none")
+              raise SystemExit(0)
+          safe = {}
+          for key, value in bundle.items():
+              if "url" in key.lower() and isinstance(value, str):
+                  parsed = urllib.parse.urlsplit(value)
+                  safe[key] = (
+                      f"{parsed.scheme}://{parsed.netloc}{parsed.path} "
+                      f"query={'yes' if parsed.query else 'no'}"
+                      if parsed.scheme and parsed.netloc else "<non-url>"
+                  )
+              elif key in {"sha256", "status", "config_count", "bytes"}:
+                  safe[key] = value
+              else:
+                  safe[key] = "<redacted>"
+          print(json.dumps(safe, sort_keys=True))
+          PY
