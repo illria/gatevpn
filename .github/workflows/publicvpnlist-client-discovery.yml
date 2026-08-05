@@ -18,81 +18,36 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - name: Inspect official catalog data routes
+      - name: Inspect official catalog JSON route
         shell: bash
         run: |
           python3 - <<'PY'
           import json
-          import re
-          import urllib.parse
           import urllib.request
 
-          def get(url, accept):
-              request = urllib.request.Request(url, headers={"Accept": accept})
-              with urllib.request.urlopen(request, timeout=30) as response:
-                  return response.read(3 * 1024 * 1024).decode("utf-8", "replace")
-
-          html = get("https://publicvpnlist.com/", "text/html")
-          script = get(
-              "https://publicvpnlist.com/local/templates/vpn/assets/app.js",
-              "text/javascript, application/javascript",
+          request = urllib.request.Request(
+              "https://publicvpnlist.com/local/api/vpn-data.php",
+              headers={
+                  "Accept": "application/json",
+                  "X-Requested-With": "XMLHttpRequest",
+              },
           )
+          with urllib.request.urlopen(request, timeout=30) as response:
+              payload = json.loads(response.read(8 * 1024 * 1024).decode("utf-8"))
 
-          def route_shape(value):
-              parsed = urllib.parse.urlsplit(value)
-              path = parsed.path or value
-              path = re.sub(r"/[0-9]+(?=/|$)", "/<numeric>", path)
-              path = re.sub(r"/pvl_[0-9a-fA-F]+(?=/|$)", "/<public>", path)
-              return path
-
-          page_routes = sorted({
-              route_shape(item)
-              for item in re.findall(r"""(?:https?://[^"'\\s<>]+|/[^"'\\s<>]+)""", html)
-              if any(token in item.lower() for token in (".json", ".php", "api/", "servers", "dataset", "catalog"))
-          })
-
-          data_values = []
-          for name, value in re.findall(r"""(data-[a-z0-9_-]+)=(["'])(.*?)\\2""", html, re.I | re.S):
-              if any(token in name.lower() for token in ("src", "api", "json", "data", "url")):
-                  data_values.append({"name": name, "path": route_shape(value)})
-          data_values = data_values[:100]
-
-          def snippets(text, needles, limit=40):
-              result = []
-              lowered = text.lower()
-              for needle in needles:
-                  offset = 0
-                  while True:
-                      index = lowered.find(needle.lower(), offset)
-                      if index < 0:
-                          break
-                      result.append({
-                          "needle": needle,
-                          "snippet": text[max(0, index - 320):min(len(text), index + len(needle) + 900)],
-                      })
-                      offset = index + len(needle)
-                      if len(result) >= limit:
-                          return result
-              return result
-
+          rows = payload if isinstance(payload, list) else payload.get("data", [])
           print(json.dumps({
-              "html_bytes": len(html.encode("utf-8")),
-              "page_routes": page_routes,
-              "data_values": data_values,
-              "app_bytes": len(script.encode("utf-8")),
-              "app_snippets": snippets(
-                  script,
-                  (
-                      "API_BASE",
-                      "normalizeRows",
-                      "serverFromDownloadLink",
-                      "findServer",
-                      "dataset",
-                      "catalog",
-                      "loadRows",
-                      "fetchJson",
-                      "fetch(",
-                  ),
-              ),
+              "payload_type": type(payload).__name__,
+              "rows": len(rows) if isinstance(rows, list) else 0,
+              "keys": sorted(rows[0].keys()) if rows and isinstance(rows[0], dict) else [],
+              "sample": [
+                  {
+                      key: row.get(key)
+                      for key in ("id", "country", "countryName", "host", "ip", "port", "proto", "configAvailable", "downloadable")
+                      if key in row
+                  }
+                  for row in rows[:3]
+                  if isinstance(row, dict)
+              ],
           }, ensure_ascii=False))
           PY
