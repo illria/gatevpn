@@ -111,6 +111,14 @@ PUBLICVPNLIST_METADATA_EXPORT_URL = os.environ.get(
     "PUBLICVPNLIST_METADATA_EXPORT_URL",
     "https://publicvpnlist.com/exports/openvpn-latest.json",
 ).strip()
+# The official web catalog uses this JSON route to render the public list and
+# exposes the numeric website ID consumed by the normal download-page flow.
+# It is used only to correlate API endpoint metadata with that ID; API v1
+# remains the source of server metadata and no HTML is scraped.
+PUBLICVPNLIST_WEB_CATALOG_URL = os.environ.get(
+    "PUBLICVPNLIST_WEB_CATALOG_URL",
+    "https://publicvpnlist.com/local/api/vpn-data.php",
+).strip()
 PUBLICVPNLIST_ENABLED = _publicvpnlist_env_bool("PUBLICVPNLIST_ENABLED", True)
 PUBLICVPNLIST_SNAPSHOT_URL = os.environ.get("PUBLICVPNLIST_SNAPSHOT_URL", "").strip()
 PUBLICVPNLIST_SNAPSHOT_FILE = os.environ.get("PUBLICVPNLIST_SNAPSHOT_FILE", "").strip()
@@ -2544,6 +2552,10 @@ def publicvpnlist_api_cache_default() -> dict[str, Any]:
         "metadata_export_matches": 0,
         "metadata_export_status": 0,
         "metadata_export_error_code": "",
+        "web_catalog_records": 0,
+        "web_catalog_matches": 0,
+        "web_catalog_status": 0,
+        "web_catalog_error_code": "",
         "network_records_fetched": 0,
         "cached_records_considered": 0,
         "cached_records_reused": 0,
@@ -3599,8 +3611,10 @@ def _publicvpnlist_api_record_endpoint_keys(record: dict[str, Any]) -> set[str]:
 
 
 def _publicvpnlist_metadata_export_records(payload: Any) -> list[dict[str, Any]]:
-    """Extract records from the official stable metadata export."""
+    """Extract rows from the official JSON catalog or metadata export."""
 
+    if isinstance(payload, list):
+        return [dict(item) for item in payload if isinstance(item, dict)]
     if not isinstance(payload, dict):
         return []
     for key in ("records", "servers", "items", "data"):
@@ -3608,11 +3622,47 @@ def _publicvpnlist_metadata_export_records(payload: Any) -> list[dict[str, Any]]
         if isinstance(value, list):
             return [dict(item) for item in value if isinstance(item, dict)]
         if isinstance(value, dict):
-            for nested_key in ("records", "servers", "items"):
+            for nested_key in ("records", "servers", "items", "data"):
                 nested = value.get(nested_key)
                 if isinstance(nested, list):
                     return [dict(item) for item in nested if isinstance(item, dict)]
     return []
+
+
+def publicvpnlist_web_catalog_url() -> str:
+    """Return the fixed official JSON catalog route used by the web client."""
+
+    raw = str(PUBLICVPNLIST_WEB_CATALOG_URL or "").strip()
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        official = urllib.parse.urlsplit(PUBLICVPNLIST_OFFICIAL_WEB_BASE_URL)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        official_host = (official.hostname or "").lower().rstrip(".")
+        if (
+            parsed.scheme.lower() != "https"
+            or host != official_host
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or parsed.path != "/local/api/vpn-data.php"
+        ):
+            raise ValueError()
+    except (TypeError, ValueError):
+        raise PublicVPNListSnapshotError(
+            "PublicVPNList 官方 web catalog URL 不安全"
+        ) from None
+    publicvpnlist_validate_download_url(raw, require_allowlist=False)
+    return raw
+
+
+def _publicvpnlist_web_catalog_numeric_id(record: dict[str, Any]) -> str:
+    """Read the numeric ID only in the official web-catalog record context."""
+
+    value = str(record.get("id") or "").strip()
+    if re.fullmatch(r"[0-9]+", value):
+        return value
+    return publicvpnlist_web_download_id(record)
 
 
 def publicvpnlist_metadata_export_url() -> str:
@@ -3650,17 +3700,25 @@ def publicvpnlist_attach_official_web_ids(
     records: list[dict[str, Any]],
     metadata: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Attach verified website numeric IDs to API rows by endpoint identity.
+    """Attach verified website numeric IDs using the official JSON web catalog.
 
-    The API public ID is never transformed. A row is mapped only when exactly
-    one endpoint-matching record in the official metadata export exposes a
-    numeric website path.
+    API v1 remains the metadata source.  The web catalog is read only through
+    the same JSON route used by the official client to render its list; HTML
+    country pages are never scraped.  A numeric ID is accepted only when one
+    official catalog row matches the API endpoint aliases exactly.
     """
 
     rows = [record for record in records if isinstance(record, dict)]
     report = metadata if isinstance(metadata, dict) else {}
     report.update(
         {
+            "web_catalog_attempted": False,
+            "web_catalog_records": 0,
+            "web_catalog_matches": 0,
+            "web_catalog_ambiguous": 0,
+            "web_catalog_status": 0,
+            "web_catalog_error_code": "",
+            # Compatibility names retained for existing diagnostics/tests.
             "metadata_export_attempted": False,
             "metadata_export_records": 0,
             "metadata_export_matches": 0,
@@ -3677,6 +3735,7 @@ def publicvpnlist_attach_official_web_ids(
     if not missing:
         return rows
 
+    report["web_catalog_attempted"] = True
     report["metadata_export_attempted"] = True
     try:
         api_host = (
@@ -3688,38 +3747,42 @@ def publicvpnlist_attach_official_web_ids(
             or ""
         ).lower().rstrip(".")
         if api_host != official_host:
-            report["metadata_export_error_code"] = "non_official_api_origin"
+            error_code = "non_official_api_origin"
+            report["web_catalog_error_code"] = error_code
+            report["metadata_export_error_code"] = error_code
             return rows
-        export_url = publicvpnlist_metadata_export_url()
+
+        catalog_url = publicvpnlist_web_catalog_url()
         response_metadata: dict[str, Any] = {}
         opener = urllib.request.build_opener(PublicVPNListRedirectHandler())
         body = publicvpnlist_http_get(
-            export_url,
+            catalog_url,
             timeout=PUBLICVPNLIST_API_TIMEOUT_SECONDS,
             max_bytes=PUBLICVPNLIST_API_MAX_RESPONSE_BYTES,
             accept="application/json",
             opener=opener,
             metadata=response_metadata,
+            extra_headers={"X-Requested-With": "XMLHttpRequest"},
         )
         content_type = str(
             response_metadata.get("content_type") or ""
         ).split(";", 1)[0].strip().lower()
         if content_type and content_type not in {"application/json", "text/json"} and not content_type.endswith("+json"):
             raise PublicVPNListSnapshotError(
-                "PublicVPNList metadata export 响应不是 JSON"
+                "PublicVPNList web catalog 响应不是 JSON"
             )
-        payload = json.loads(body.decode("utf-8"))
-        export_records = _publicvpnlist_metadata_export_records(payload)
-        report["metadata_export_records"] = len(export_records)
-        report["metadata_export_status"] = int(
-            response_metadata.get("status") or 200
+        catalog_records = _publicvpnlist_metadata_export_records(
+            json.loads(body.decode("utf-8"))
         )
+        status = int(response_metadata.get("status") or 200)
+        report["web_catalog_records"] = len(catalog_records)
+        report["web_catalog_status"] = status
         endpoint_to_ids: dict[str, set[str]] = {}
-        for export_record in export_records:
-            numeric_id = publicvpnlist_web_download_id(export_record)
+        for catalog_record in catalog_records:
+            numeric_id = _publicvpnlist_web_catalog_numeric_id(catalog_record)
             if not numeric_id:
                 continue
-            for alias in _publicvpnlist_api_record_endpoint_keys(export_record):
+            for alias in _publicvpnlist_api_record_endpoint_keys(catalog_record):
                 endpoint_to_ids.setdefault(alias, set()).add(numeric_id)
 
         matches = 0
@@ -3734,11 +3797,18 @@ def publicvpnlist_attach_official_web_ids(
                 continue
             record["web_download_id"] = next(iter(candidate_ids))
             matches += 1
+        report["web_catalog_matches"] = matches
+        report["web_catalog_ambiguous"] = ambiguous
+        report["metadata_export_records"] = len(catalog_records)
+        report["metadata_export_status"] = status
         report["metadata_export_matches"] = matches
         report["metadata_export_ambiguous"] = ambiguous
     except Exception as exc:
-        report["metadata_export_error_code"] = type(exc).__name__
+        error_code = type(exc).__name__
+        report["web_catalog_error_code"] = error_code
+        report["metadata_export_error_code"] = error_code
     return rows
+
 
 def _publicvpnlist_api_record_preference_key(record: dict[str, Any]) -> tuple[Any, ...]:
     """Rank duplicate API metadata without performing network work."""
@@ -4592,6 +4662,10 @@ def fetch_publicvpnlist_api_snapshot(
         "metadata_export_matches",
         "metadata_export_status",
         "metadata_export_error_code",
+        "web_catalog_records",
+        "web_catalog_matches",
+        "web_catalog_status",
+        "web_catalog_error_code",
     ):
         working[key] = metadata_export_meta.get(key, working.get(key, 0))
     all_cached_records = publicvpnlist_api_cached_records(working)
@@ -4638,6 +4712,10 @@ def fetch_publicvpnlist_api_snapshot(
             "profile_retry_count": len(working.get("profile_retry_entries") or []),
             "metadata_export_records": int(working.get("metadata_export_records") or 0),
             "metadata_export_matches": int(working.get("metadata_export_matches") or 0),
+            "web_catalog_records": int(working.get("web_catalog_records") or 0),
+            "web_catalog_matches": int(working.get("web_catalog_matches") or 0),
+            "web_catalog_status": int(working.get("web_catalog_status") or 0),
+            "web_catalog_error_code": str(working.get("web_catalog_error_code") or ""),
             "metadata_export_status": int(working.get("metadata_export_status") or 0),
             "metadata_export_error_code": str(working.get("metadata_export_error_code") or ""),
             "error_code": str(working.get("last_error_code") or (errors[0] if errors else "")),
