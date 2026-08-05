@@ -86,6 +86,11 @@ def _redacted_error(exc: BaseException) -> dict[str, Any]:
             "token_content_type",
             "token_body_kind",
             "validation_stage",
+            "expected_endpoint",
+            "config_remotes",
+            "hash_expected_present",
+            "hash_response_present",
+            "hash_matches",
         ):
             if key in flow and flow.get(key) not in (None, ""):
                 flow_summary[key] = flow.get(key)
@@ -231,6 +236,11 @@ _FLOW_DIAGNOSTIC_KEYS = (
     "check_body_kind",
     "token_content_type",
     "token_body_kind",
+    "expected_endpoint",
+    "config_remotes",
+    "hash_expected_present",
+    "hash_response_present",
+    "hash_matches",
 )
 
 
@@ -275,6 +285,26 @@ def _download_one(manager, raw: dict[str, Any], timeout: int) -> dict[str, Any]:
     try:
         actual_hash = str(metadata.get("response_sha256") or "").strip().lower()
         expected_hash = str(row.get("config_sha256") or "").strip().lower()
+        metadata["hash_expected_present"] = bool(expected_hash)
+        metadata["hash_response_present"] = bool(actual_hash)
+        metadata["hash_matches"] = bool(expected_hash and actual_hash == expected_hash) if expected_hash else True
+        metadata["expected_endpoint"] = {
+            "host": str(row.get("host") or row.get("ip") or ""),
+            "port": int(row.get("port") or row.get("remote_port") or 0),
+            "proto": str(row.get("proto") or row.get("transport") or ""),
+        }
+        try:
+            remotes, global_proto = manager.parse_publicvpnlist_openvpn_remotes(config_text)
+            metadata["config_remotes"] = [
+                {
+                    "host": str(remote.get("host") or ""),
+                    "port": int(remote.get("port") or 0),
+                    "proto": str(remote.get("proto") or global_proto or ""),
+                }
+                for remote in remotes
+            ]
+        except Exception:
+            metadata["config_remotes"] = []
         if expected_hash and actual_hash != expected_hash:
             raise ValueError("config_sha256_mismatch")
         node = manager.publicvpnlist_row_to_node(row, config_text)
