@@ -2504,6 +2504,15 @@ def publicvpnlist_http_get(
             chunks.append(chunk)
         body = b"".join(chunks)
     stripped = body.lstrip().lower()
+    if metadata is not None:
+        if any(stripped.startswith(marker) for marker in (b"<!doctype", b"<html", b"<head", b"<body")):
+            metadata["body_kind"] = "html"
+        elif stripped.startswith((b"{", b"[")):
+            metadata["body_kind"] = "json"
+        elif stripped.startswith((b"client", b"proto ", b"dev ")):
+            metadata["body_kind"] = "openvpn"
+        else:
+            metadata["body_kind"] = "other"
     if not allow_html and any(stripped.startswith(marker) for marker in (b"<!doctype", b"<html", b"<head", b"<body")):
         raise PublicVPNListSnapshotError("服务返回 HTML challenge 或页面，而不是 JSON")
     return body
@@ -5176,6 +5185,8 @@ def fetch_publicvpnlist_official_config(
         raise
     flow_metadata["download_page_loaded"] = True
     flow_metadata["download_page_status"] = int(page_metadata.get("status") or 200)
+    flow_metadata["download_page_content_type"] = str(page_metadata.get("content_type") or "").split(";", 1)[0].lower()
+    flow_metadata["download_page_body_kind"] = str(page_metadata.get("body_kind") or "")
     check_metadata: dict[str, Any] = {}
     try:
         _publicvpnlist_live_flow_check_deadline(deadline, flow_metadata)
@@ -5203,6 +5214,8 @@ def fetch_publicvpnlist_official_config(
             metadata.update(check_metadata)
         raise
     flow_metadata.update(check_metadata)
+    flow_metadata["check_content_type"] = str(check_metadata.get("content_type") or "").split(";", 1)[0].lower()
+    flow_metadata["check_body_kind"] = str(check_metadata.get("body_kind") or "")
     check_payload = _publicvpnlist_json_response(check_body, check_metadata, "实时检查")
     flow_metadata["check_response_keys"] = sorted(
         str(key) for key in check_payload.keys()
@@ -5252,6 +5265,8 @@ def fetch_publicvpnlist_official_config(
         flow_metadata.update(token_metadata)
         raise
     flow_metadata.update(token_metadata)
+    flow_metadata["token_content_type"] = str(token_metadata.get("content_type") or "").split(";", 1)[0].lower()
+    flow_metadata["token_body_kind"] = str(token_metadata.get("body_kind") or "")
     token_payload = _publicvpnlist_json_response(token_response, token_metadata, "临时令牌")
     flow_metadata["token_response_keys"] = sorted(
         str(key) for key in token_payload.keys()
