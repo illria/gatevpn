@@ -162,7 +162,7 @@ jobs:
 
           ready_ms=""
           for _ in $(seq 1 80); do
-            if curl -fsS --max-time 0.25 \
+            if curl -sS --max-time 0.25 \
               -o /dev/null http://127.0.0.1:18787/; then
               ready_ms=$(date +%s%3N)
               break
