@@ -1,6 +1,9 @@
 name: PublicVPNList official client discovery
 
 on:
+  pull_request:
+    branches:
+      - main
   push:
     branches:
       - feat/publicvpnlist-live-download
