@@ -5153,19 +5153,27 @@ def fetch_publicvpnlist_official_config(
     )
     publicvpnlist_validate_download_url(download_page_url)
     page_metadata: dict[str, Any] = {}
-    publicvpnlist_http_get(
-        download_page_url,
-        timeout=_publicvpnlist_live_flow_timeout(
-            PUBLICVPNLIST_CONFIG_TIMEOUT_SECONDS,
-            deadline,
-            flow_metadata,
-        ),
-        max_bytes=min(PUBLICVPNLIST_MAX_RESPONSE_BYTES, 512 * 1024),
-        accept="text/html",
-        opener=live_opener,
-        metadata=page_metadata,
-        allow_html=True,
-    )
+    try:
+        publicvpnlist_http_get(
+            download_page_url,
+            timeout=_publicvpnlist_live_flow_timeout(
+                PUBLICVPNLIST_CONFIG_TIMEOUT_SECONDS,
+                deadline,
+                flow_metadata,
+            ),
+            max_bytes=min(PUBLICVPNLIST_MAX_RESPONSE_BYTES, 512 * 1024),
+            accept="text/html",
+            opener=live_opener,
+            metadata=page_metadata,
+            allow_html=True,
+        )
+    except urllib.error.HTTPError as exc:
+        _publicvpnlist_capture_http_error(page_metadata, exc)
+        flow_metadata.update(page_metadata)
+        raise
+    except (PublicVPNListSnapshotError, OSError, UnicodeError, ValueError):
+        flow_metadata.update(page_metadata)
+        raise
     flow_metadata["download_page_loaded"] = True
     flow_metadata["download_page_status"] = int(page_metadata.get("status") or 200)
     check_metadata: dict[str, Any] = {}
@@ -5238,6 +5246,9 @@ def fetch_publicvpnlist_official_config(
         _publicvpnlist_live_flow_check_deadline(deadline, flow_metadata)
     except urllib.error.HTTPError as exc:
         _publicvpnlist_capture_http_error(token_metadata, exc)
+        flow_metadata.update(token_metadata)
+        raise
+    except (PublicVPNListSnapshotError, OSError, UnicodeError, ValueError):
         flow_metadata.update(token_metadata)
         raise
     flow_metadata.update(token_metadata)
