@@ -1736,8 +1736,12 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
                 set(),
             )
 
-        self.assertEqual({node["country_short"] for node in result}, {"FR"})
         stats = vpngate_manager.load_publicvpnlist_cache()["last_refresh_stats"]
+        self.assertEqual(
+            {node["country_short"] for node in result},
+            {"FR"},
+            stats,
+        )
         self.assertEqual(stats["attempts_by_country"]["PH"], 1)
         self.assertEqual(stats["attempts_by_country"]["FR"], 1)
         self.assertTrue(stats["failed_candidates_by_country"]["PH"])
