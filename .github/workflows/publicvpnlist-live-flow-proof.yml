@@ -42,72 +42,33 @@ jobs:
           report = json.loads(open(sys.argv[1], encoding="utf-8").read())
           required = ("profiles_downloaded", "profiles_validated", "connectable_candidates")
           missing = [name for name in required if int(report.get(name) or 0) < 1]
-          fixed_countries = ("US", "FR", "GB", "ID", "FI", "DE", "TW", "AU", "NL", "PH")
+          import importlib.util
+          from pathlib import Path
 
-          def missing_countries(field):
-              values = report.get(field) or {}
-              return [
-                  country for country in fixed_countries
-                  if int(values.get(country) or 0) < 1
-              ]
+          smoke_spec = importlib.util.spec_from_file_location(
+              "publicvpnlist_smoke_coverage",
+              Path("tools/publicvpnlist-smoke.py"),
+          )
+          publicvpnlist_smoke = importlib.util.module_from_spec(smoke_spec)
+          smoke_spec.loader.exec_module(publicvpnlist_smoke)
+          coverage = publicvpnlist_smoke.evaluate_live_coverage(report)
 
-          metadata_missing = missing_countries("metadata_records_by_country")
+          fixed_countries = coverage["fixed_countries"]
+          required_countries = coverage["required_countries"]
+          metadata_missing = coverage["metadata_missing"]
           attempts = report.get("attempts_by_country") or {}
           downloaded = report.get("downloaded_by_country") or {}
           validated = report.get("validated_by_country") or {}
           eligible = report.get("eligible_candidates_by_country") or {}
           skipped = report.get("skipped_by_country") or {}
           failed = report.get("failed_candidates_by_country") or {}
-          # A country may have metadata but no safe candidate that can enter
-          # the official flow.  Such a country is exempt from the attempt
-          # requirement only when every candidate was rejected by an explicit
-          # pre-flow safety rule; operational backoff/deadline failures are
-          # never treated as coverage.
-          safety_skip_reasons = {
-              "endpoint_duplicate",
-              "mapping_missing",
-              "web_download_id_missing",
-              "us_nonresidential",
-              "us_unclassified",
-          }
-          first_round_safety_skips = {}
-          attempts_missing = []
-          for country in fixed_countries:
-              if int(attempts.get(country) or 0) >= 1:
-                  continue
-              reasons = skipped.get(country) or {}
-              reason_names = set(reasons)
-              if (
-                  int(eligible.get(country) or 0) == 0
-                  and reason_names
-                  and reason_names <= safety_skip_reasons
-              ):
-                  first_round_safety_skips[country] = reasons
-              else:
-                  attempts_missing.append(country)
-          attempts_over_limit = [
-              country for country in fixed_countries
-              if int(attempts.get(country) or 0) > 2
-          ]
-          unvalidated_countries = [
-              country for country in fixed_countries
-              if int(validated.get(country) or 0) < 1
-          ]
-          unvalidated_details = {
-              country: {
-                  "eligible": int(eligible.get(country) or 0),
-                  "attempts": int(attempts.get(country) or 0),
-                  "downloaded": int(downloaded.get(country) or 0),
-                  "validated": int(validated.get(country) or 0),
-                  "skipped": skipped.get(country) or {},
-                  "failed": failed.get(country) or {},
-              }
-              for country in unvalidated_countries
-          }
-          validated_country_count = sum(
-              1 for country in fixed_countries
-              if int(validated.get(country) or 0) >= 1
-          )
+          first_round_safety_skips = coverage["first_round_safety_skips"]
+          attempts_missing = coverage["attempts_missing"]
+          attempts_over_limit = coverage["attempts_over_limit"]
+          unvalidated_countries = coverage["unvalidated_countries"]
+          optional_degraded = coverage["optional_degraded_countries"]
+          validated_country_count = coverage["validated_country_count"]
+          required_validated_country_count = coverage["required_validated_country_count"]
 
           print("profiles_downloaded=" + str(report.get("profiles_downloaded", 0)))
           print("profiles_validated=" + str(report.get("profiles_validated", 0)))
@@ -130,27 +91,17 @@ jobs:
           print("first_round_safety_skips=" + json.dumps(first_round_safety_skips, sort_keys=True))
           print("unvalidated_countries=" + json.dumps(unvalidated_details, sort_keys=True))
           print("validated_country_count=" + str(validated_country_count))
+          print("required_validated_country_count=" + str(required_validated_country_count))
+          print("optional_country_degraded=" + json.dumps(optional_degraded, sort_keys=True))
           print("openvpn_started=" + str(report.get("openvpn") == "started"))
 
-          coverage_errors = []
-          if missing:
-              coverage_errors.append("overall=" + ",".join(missing))
-          if metadata_missing:
-              coverage_errors.append("metadata=" + ",".join(metadata_missing))
-          if attempts_missing:
-              coverage_errors.append("first_round_attempts=" + ",".join(attempts_missing))
-          if attempts_over_limit:
-              coverage_errors.append("attempts_over_limit=" + ",".join(attempts_over_limit))
-          if int(validated.get("PH") or 0) < 1:
-              coverage_errors.append("PH_validation_missing")
-          if validated_country_count < 8:
-              coverage_errors.append("validated_countries=" + str(validated_country_count) + "<8")
-          if report.get("openvpn") == "started":
-              coverage_errors.append("openvpn_started")
+          coverage_errors = list(coverage["coverage_errors"])
+          print("coverage_errors=" + json.dumps(coverage_errors, sort_keys=True))
           if coverage_errors:
-              raise SystemExit("live profile smoke coverage incomplete: " + "; ".join(coverage_errors))
-          PY
-          coverage_status=$?
+              raise SystemExit(
+                  "live profile smoke coverage incomplete: "
+                  + "; ".join(coverage_errors)
+              )
           test "$smoke_status" -eq 0
           test "$coverage_status" -eq 0
 
