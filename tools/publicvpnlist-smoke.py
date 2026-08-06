@@ -765,7 +765,6 @@ def run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                 report,
             )
             flow_deadline = started + max(1, int(args.timeout))
-            flow_deadline = started + max(1, int(args.timeout))
             for raw in candidates[: max(1, int(args.max_profiles))]:
                 row = manager.normalize_publicvpnlist_row(raw)
                 country = str(row.get("country_short") or "").upper() if row else ""
