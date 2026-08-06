@@ -183,10 +183,15 @@ PUBLICVPNLIST_MAX_REDIRECTS = _publicvpnlist_env_int("PUBLICVPNLIST_MAX_REDIRECT
 # candidates per country therefore needs 20 live-flow attempts to complete
 # round one for every country and round two for every country.  Operators may
 # lower the total explicitly, but doing so necessarily skips part of round two.
-PUBLICVPNLIST_LIVE_FLOW_ATTEMPTS_PER_COUNTRY = _publicvpnlist_env_int(
-    "PUBLICVPNLIST_LIVE_FLOW_ATTEMPTS_PER_COUNTRY",
+# This is a strict policy, not just a default: no country can consume
+# more than its best two ranked candidates in one refresh.
+PUBLICVPNLIST_LIVE_FLOW_ATTEMPTS_PER_COUNTRY = min(
     2,
-    1,
+    _publicvpnlist_env_int(
+        "PUBLICVPNLIST_LIVE_FLOW_ATTEMPTS_PER_COUNTRY",
+        2,
+        1,
+    ),
 )
 PUBLICVPNLIST_LIVE_FLOW_MAX_ATTEMPTS = _publicvpnlist_env_int(
     "PUBLICVPNLIST_LIVE_FLOW_MAX_ATTEMPTS",
