@@ -28,6 +28,34 @@ class PublicVPNListRuntimeTests(unittest.TestCase):
         self.assertEqual(len(vpngate_manager.PUBLICVPNLIST_ALLOWED_COUNTRY_ORDER), 10)
         self.assertLessEqual(vpngate_manager.PUBLICVPNLIST_API_MAX_REQUESTS_PER_REFRESH, 30)
 
+    def test_smoke_selection_caps_two_candidates_per_country(self):
+        import vpngate_manager
+
+        smoke = load_smoke_module()
+        records = []
+        for country in ("PH", "FR"):
+            for index in range(3):
+                records.append(
+                    {
+                        "id": f"{country.lower()}-{index}",
+                        "country_code": country,
+                        "hostname": f"{country.lower()}-{index}.fixture.invalid",
+                        "ip": f"198.51.100.{20 + index + (0 if country == 'PH' else 10)}",
+                        "protocol": "openvpn",
+                        "transport": "tcp",
+                        "port": 443,
+                        "technical_quality_score": 100 - index,
+                    }
+                )
+
+        selected = smoke._select_records(vpngate_manager, records, ["PH", "FR"], 20)
+        selected_counts = {}
+        for raw in selected:
+            country = vpngate_manager.normalize_publicvpnlist_row(raw)["country_short"]
+            selected_counts[country] = selected_counts.get(country, 0) + 1
+
+        self.assertEqual(selected_counts, {"PH": 2, "FR": 2})
+
     def test_smoke_classifies_metadata_without_verified_mapping(self):
         smoke = load_smoke_module()
         records = [{"id": "pvl_" + "a" * 24}]
