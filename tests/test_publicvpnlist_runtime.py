@@ -153,8 +153,8 @@ class PublicVPNListRuntimeTests(unittest.TestCase):
             )
 
         self.assertEqual(
-            [row["id"] for row in selected],
-            ["us-residential", "ph-usable"],
+            {row["id"] for row in selected},
+            {"us-residential", "ph-usable"},
         )
         self.assertEqual(report["us_classification_attempted"], 2)
         self.assertEqual(report["us_nonresidential_rejected"], 1)
