@@ -1706,9 +1706,9 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
                     "PH live check unavailable"
                 )
             config = (
-                "client\\nproto tcp\\n"
-                f"remote {row['hostname']} 443\\n"
-                "<ca>\\nCERT\\n</ca>\\n"
+                "client\nproto tcp\n"
+                f"remote {row['hostname']} 443\n"
+                "<ca>\nCERT\n</ca>\n"
             )
             metadata.update({
                 "official_flow": True,
