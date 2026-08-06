@@ -62,16 +62,19 @@ jobs:
           print("validated_by_country=" + json.dumps(report.get("validated_by_country", {}), sort_keys=True))
           print("skipped_by_country=" + json.dumps(report.get("skipped_by_country", {}), sort_keys=True))
           print("openvpn_started=" + str(report.get("openvpn") == "started"))
+          coverage_errors = []
           if missing:
-              raise SystemExit("live profile smoke missing: " + ", ".join(missing))
+              coverage_errors.append("overall=" + ",".join(missing))
           if metadata_missing:
-              raise SystemExit("live profile smoke missing metadata: " + ", ".join(metadata_missing))
+              coverage_errors.append("metadata=" + ",".join(metadata_missing))
           if attempts_missing:
-              raise SystemExit("live profile smoke missing first-round attempts: " + ", ".join(attempts_missing))
+              coverage_errors.append("first_round_attempts=" + ",".join(attempts_missing))
           if downloaded_missing:
-              raise SystemExit("live profile smoke missing downloads: " + ", ".join(downloaded_missing))
+              coverage_errors.append("downloads=" + ",".join(downloaded_missing))
           if validated_missing:
-              raise SystemExit("live profile smoke missing validated profiles: " + ", ".join(validated_missing))
+              coverage_errors.append("validated=" + ",".join(validated_missing))
+          if coverage_errors:
+              raise SystemExit("live profile smoke coverage incomplete: " + "; ".join(coverage_errors))
           PY
           coverage_status=$?
           test "$smoke_status" -eq 0
