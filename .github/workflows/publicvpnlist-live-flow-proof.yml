@@ -6,7 +6,7 @@ on:
       - main
   push:
     branches:
-      - feat/publicvpnlist-live-download
+      - fix/publicvpnlist-country-rounds
   workflow_dispatch:
 
 permissions:
@@ -55,11 +55,36 @@ jobs:
           attempts = report.get("attempts_by_country") or {}
           downloaded = report.get("downloaded_by_country") or {}
           validated = report.get("validated_by_country") or {}
+          eligible = report.get("eligible_candidates_by_country") or {}
           skipped = report.get("skipped_by_country") or {}
-          attempts_missing = [
-              country for country in fixed_countries
-              if int(attempts.get(country) or 0) < 1
-          ]
+          failed = report.get("failed_candidates_by_country") or {}
+          # A country may have metadata but no safe candidate that can enter
+          # the official flow.  Such a country is exempt from the attempt
+          # requirement only when every candidate was rejected by an explicit
+          # pre-flow safety rule; operational backoff/deadline failures are
+          # never treated as coverage.
+          safety_skip_reasons = {
+              "endpoint_duplicate",
+              "mapping_missing",
+              "web_download_id_missing",
+              "us_nonresidential",
+              "us_unclassified",
+          }
+          first_round_safety_skips = {}
+          attempts_missing = []
+          for country in fixed_countries:
+              if int(attempts.get(country) or 0) >= 1:
+                  continue
+              reasons = skipped.get(country) or {}
+              reason_names = set(reasons)
+              if (
+                  int(eligible.get(country) or 0) == 0
+                  and reason_names
+                  and reason_names <= safety_skip_reasons
+              ):
+                  first_round_safety_skips[country] = reasons
+              else:
+                  attempts_missing.append(country)
           attempts_over_limit = [
               country for country in fixed_countries
               if int(attempts.get(country) or 0) > 2
@@ -70,9 +95,12 @@ jobs:
           ]
           unvalidated_details = {
               country: {
+                  "eligible": int(eligible.get(country) or 0),
+                  "attempts": int(attempts.get(country) or 0),
                   "downloaded": int(downloaded.get(country) or 0),
                   "validated": int(validated.get(country) or 0),
-                  "reasons": skipped.get(country) or {},
+                  "skipped": skipped.get(country) or {},
+                  "failed": failed.get(country) or {},
               }
               for country in unvalidated_countries
           }
@@ -85,10 +113,21 @@ jobs:
           print("profiles_validated=" + str(report.get("profiles_validated", 0)))
           print("connectable_candidates=" + str(report.get("connectable_candidates", 0)))
           print("metadata_records_by_country=" + json.dumps(report.get("metadata_records_by_country", {}), sort_keys=True))
+          print("mapped_records_by_country=" + json.dumps(report.get("mapped_records_by_country", {}), sort_keys=True))
+          print("eligible_candidates_by_country=" + json.dumps(eligible, sort_keys=True))
           print("attempts_by_country=" + json.dumps(attempts, sort_keys=True))
+          print("live_check_succeeded_by_country=" + json.dumps(report.get("live_check_succeeded_by_country", {}), sort_keys=True))
+          print("token_generated_by_country=" + json.dumps(report.get("token_generated_by_country", {}), sort_keys=True))
           print("downloaded_by_country=" + json.dumps(downloaded, sort_keys=True))
           print("validated_by_country=" + json.dumps(validated, sort_keys=True))
+          print("connectable_by_country=" + json.dumps(report.get("connectable_by_country", {}), sort_keys=True))
           print("skipped_by_country=" + json.dumps(skipped, sort_keys=True))
+          print("failed_candidates_by_country=" + json.dumps(failed, sort_keys=True))
+          print("us_classification_attempted=" + str(report.get("us_classification_attempted", 0)))
+          print("us_residential_accepted=" + str(report.get("us_residential_accepted", 0)))
+          print("us_nonresidential_rejected=" + str(report.get("us_nonresidential_rejected", 0)))
+          print("us_unclassified_rejected=" + str(report.get("us_unclassified_rejected", 0)))
+          print("first_round_safety_skips=" + json.dumps(first_round_safety_skips, sort_keys=True))
           print("unvalidated_countries=" + json.dumps(unvalidated_details, sort_keys=True))
           print("validated_country_count=" + str(validated_country_count))
           print("openvpn_started=" + str(report.get("openvpn") == "started"))
@@ -106,6 +145,8 @@ jobs:
               coverage_errors.append("PH_validation_missing")
           if validated_country_count < 8:
               coverage_errors.append("validated_countries=" + str(validated_country_count) + "<8")
+          if report.get("openvpn") == "started":
+              coverage_errors.append("openvpn_started")
           if coverage_errors:
               raise SystemExit("live profile smoke coverage incomplete: " + "; ".join(coverage_errors))
           PY
