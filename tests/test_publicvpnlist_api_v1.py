@@ -1884,6 +1884,48 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
 
         self.assertEqual(calls, ["/download/111208/", "/test_server.php", "/get_token.php", "/download.php"])
 
+    def test_country_diagnostics_separate_metadata_and_mapped_records(self):
+        unmapped = self.record("ph-unmapped", with_config=False)
+        mapped = self.record("ph-mapped", with_config=False)
+        mapped["web_download_id"] = "111209"
+        mapped["config_sha256"] = ""
+        config = (
+            "client\nproto tcp\nremote ph-mapped.fixture.invalid 443\n"
+            "<ca>\nCERT\n</ca>\n"
+        )
+
+        def fake_live_flow(_row, metadata=None, **_kwargs):
+            metadata.update(
+                {
+                    "official_flow": True,
+                    "live_check_succeeded": True,
+                    "token_request_attempted": 1,
+                    "token_generated": True,
+                    "profile_download_attempted": 1,
+                    "profile_downloaded": 1,
+                    "response_sha256": hashlib.sha256(config.encode()).hexdigest(),
+                }
+            )
+            return config
+
+        with mock.patch.object(
+            vpngate_manager,
+            "fetch_publicvpnlist_snapshot",
+            return_value={"data": [unmapped, mapped]},
+        ), mock.patch.object(
+            vpngate_manager,
+            "fetch_publicvpnlist_official_config",
+            side_effect=fake_live_flow,
+        ), mock.patch.object(vpngate_manager, "log_to_json"):
+            result = vpngate_manager.fetch_publicvpnlist_candidates(["PH"], set())
+
+        self.assertEqual(len(result), 1)
+        stats = vpngate_manager.load_publicvpnlist_cache()["last_refresh_stats"]
+        self.assertEqual(stats["metadata_records_by_country"]["PH"], 2)
+        self.assertEqual(stats["mapped_records_by_country"]["PH"], 1)
+        self.assertEqual(stats["attempts_by_country"]["PH"], 1)
+        self.assertEqual(stats["validated_by_country"]["PH"], 1)
+
     def test_live_flow_country_cap_stops_a_third_profile(self):
         rows = [self.record(f"budget-{index}", with_config=False) for index in range(4)]
         for index, row in enumerate(rows):
@@ -1954,6 +1996,10 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
         self.assertEqual(stats["profile_downloaded"], 1)
         self.assertEqual(stats["profile_validation_failed"], 1)
         self.assertEqual(vpngate_manager.load_publicvpnlist_api_cache()["live_flow_failure_streak"], 1)
+        self.assertEqual(
+            stats["failed_candidates_by_country"]["PH"]["endpoint_mismatch"],
+            1,
+        )
 
     def test_persisted_live_flow_failure_streak_opens_circuit_on_next_refresh(self):
         api_cache = vpngate_manager.publicvpnlist_api_cache_default()
