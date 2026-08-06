@@ -6822,6 +6822,15 @@ def refresh_publicvpnlist_cache(
         nonlocal api_retry_state_changed
         if not window:
             return False
+        if source_kind == "api":
+            for _key, candidate_row, _metadata_keys in window:
+                if (
+                    not str(candidate_row.get("temporary_ovpn_url") or "").strip()
+                    and publicvpnlist_web_download_id(candidate_row)
+                ):
+                    candidate_country = country_for_stats(candidate_row)
+                    if candidate_country:
+                        live_flow_available_countries.add(candidate_country)
         classifications: dict[str, dict[str, Any]] = {}
         rows_to_classify: list[tuple[str, dict[str, Any]]] = []
         for key, row, _metadata_keys in window:
