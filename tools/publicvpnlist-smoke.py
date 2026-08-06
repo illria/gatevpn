@@ -23,6 +23,9 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+FIXED_COUNTRY_ORDER = ("US", "FR", "GB", "ID", "FI", "DE", "TW", "AU", "NL", "PH")
+OPTIONAL_DEGRADED_COUNTRIES = frozenset({"PH"})
+
 
 def _load_manager():
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -269,6 +272,182 @@ def _record_country_reason(
     bucket = report[field][country]
     if isinstance(bucket, dict):
         bucket[reason] = int(bucket.get(reason) or 0) + 1
+
+
+
+def evaluate_live_coverage(report: dict[str, Any]) -> dict[str, Any]:
+    """Evaluate the live gate while allowing PH to degrade independently.
+
+    PH remains part of the fixed source/country diagnostics, but its live
+    availability is optional because the upstream API can temporarily return
+    no PH metadata or fail the protected download flow. Required countries
+    retain the first-round and validation guarantees, and every country still
+    obeys the two-attempt cap.
+    """
+
+    requested = {
+        str(country or "").strip().upper()
+        for country in (report.get("countries") or FIXED_COUNTRY_ORDER)
+        if str(country or "").strip()
+    }
+    fixed_countries = tuple(
+        country for country in FIXED_COUNTRY_ORDER
+        if country in requested
+    )
+    if not fixed_countries:
+        fixed_countries = FIXED_COUNTRY_ORDER
+    optional_countries = tuple(
+        country for country in fixed_countries
+        if country in OPTIONAL_DEGRADED_COUNTRIES
+    )
+    required_countries = tuple(
+        country for country in fixed_countries
+        if country not in OPTIONAL_DEGRADED_COUNTRIES
+    )
+
+    def mapping(name: str) -> dict[str, Any]:
+        value = report.get(name)
+        return value if isinstance(value, dict) else {}
+
+    def count(name: str, country: str) -> int:
+        try:
+            return int(mapping(name).get(country) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def reason_names(name: str, country: str) -> set[str]:
+        value = mapping(name).get(country)
+        return set(value) if isinstance(value, dict) else set()
+
+    metadata_missing = [
+        country for country in required_countries
+        if count("metadata_records_by_country", country) < 1
+    ]
+    attempts = mapping("attempts_by_country")
+    eligible = mapping("eligible_candidates_by_country")
+    skipped = mapping("skipped_by_country")
+    failed = mapping("failed_candidates_by_country")
+    first_round_safety_reasons = {
+        "endpoint_duplicate",
+        "mapping_missing",
+        "web_download_id_missing",
+        "us_nonresidential",
+        "us_unclassified",
+    }
+    first_round_safety_skips: dict[str, Any] = {}
+    attempts_missing: list[str] = []
+    for country in required_countries:
+        if count("attempts_by_country", country) >= 1:
+            continue
+        reasons = reason_names("skipped_by_country", country)
+        if (
+            count("eligible_candidates_by_country", country) == 0
+            and reasons
+            and reasons <= first_round_safety_reasons
+        ):
+            first_round_safety_skips[country] = skipped.get(country) or {}
+        else:
+            attempts_missing.append(country)
+
+    attempts_over_limit = [
+        country for country in fixed_countries
+        if count("attempts_by_country", country) > 2
+    ]
+    unvalidated_countries = [
+        country for country in fixed_countries
+        if count("validated_by_country", country) < 1
+    ]
+    unvalidated_required_countries = [
+        country for country in required_countries
+        if count("validated_by_country", country) < 1
+    ]
+    optional_country_errors = mapping("optional_country_errors")
+    optional_degraded: dict[str, dict[str, Any]] = {}
+    optional_available: list[str] = []
+    for country in optional_countries:
+        if count("validated_by_country", country) >= 1:
+            optional_available.append(country)
+            continue
+        endpoint_reasons = reason_names("optional_country_errors", country)
+        if endpoint_reasons:
+            reason = "api_endpoint_error:" + ",".join(sorted(endpoint_reasons))
+        elif count("metadata_records_by_country", country) == 0:
+            reason = "metadata_missing"
+        elif count("eligible_candidates_by_country", country) == 0:
+            skipped_reasons = reason_names("skipped_by_country", country)
+            reason = (
+                "safety_skipped:" + ",".join(sorted(skipped_reasons))
+                if skipped_reasons
+                else "no_eligible_candidate"
+            )
+        elif count("attempts_by_country", country) == 0:
+            reason = "not_attempted"
+        elif reason_names("failed_candidates_by_country", country):
+            reason = "live_flow_failed:" + ",".join(
+                sorted(reason_names("failed_candidates_by_country", country))
+            )
+        else:
+            reason = "not_validated"
+        optional_degraded[country] = {
+            "metadata": count("metadata_records_by_country", country),
+            "eligible": count("eligible_candidates_by_country", country),
+            "attempts": count("attempts_by_country", country),
+            "validated": count("validated_by_country", country),
+            "reason": reason,
+        }
+
+    overall_missing = [
+        name for name in ("profiles_downloaded", "profiles_validated", "connectable_candidates")
+        if int(report.get(name) or 0) < 1
+    ]
+    validated_country_count = sum(
+        1 for country in fixed_countries
+        if count("validated_by_country", country) >= 1
+    )
+    required_validated_country_count = sum(
+        1 for country in required_countries
+        if count("validated_by_country", country) >= 1
+    )
+    minimum_required_validated = min(8, len(required_countries))
+    coverage_errors: list[str] = []
+    if overall_missing:
+        coverage_errors.append("overall=" + ",".join(overall_missing))
+    if metadata_missing:
+        coverage_errors.append("metadata=" + ",".join(metadata_missing))
+    if attempts_missing:
+        coverage_errors.append("first_round_attempts=" + ",".join(attempts_missing))
+    if attempts_over_limit:
+        coverage_errors.append(
+            "attempts_over_limit=" + ",".join(attempts_over_limit)
+        )
+    if required_validated_country_count < minimum_required_validated:
+        coverage_errors.append(
+            "validated_required_countries="
+            + str(required_validated_country_count)
+            + "<"
+            + str(minimum_required_validated)
+        )
+    if report.get("openvpn") == "started":
+        coverage_errors.append("openvpn_started")
+
+    return {
+        "fixed_countries": list(fixed_countries),
+        "required_countries": list(required_countries),
+        "optional_countries": list(optional_countries),
+        "metadata_missing": metadata_missing,
+        "attempts_missing": attempts_missing,
+        "attempts_over_limit": attempts_over_limit,
+        "first_round_safety_skips": first_round_safety_skips,
+        "unvalidated_countries": unvalidated_countries,
+        "unvalidated_required_countries": unvalidated_required_countries,
+        "optional_degraded_countries": optional_degraded,
+        "optional_available_countries": optional_available,
+        "validated_country_count": validated_country_count,
+        "required_validated_country_count": required_validated_country_count,
+        "minimum_required_validated": minimum_required_validated,
+        "overall_missing": overall_missing,
+        "coverage_errors": coverage_errors,
+    }
 
 
 def _prepare_candidates(
@@ -634,6 +813,12 @@ def run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         "download_results": [],
         "api_endpoints": [],
         "errors": [],
+        "optional_country_errors": {
+            country: {}
+            for country in countries
+            if country in OPTIONAL_DEGRADED_COUNTRIES
+        },
+        "blocking_api_errors": [],
         "openvpn": "not_started",
         "redacted": True,
     }
@@ -674,7 +859,22 @@ def run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     except Exception as exc:
         endpoint_errors.append(_redacted_error(exc))
 
+    blocking_endpoint_errors: list[dict[str, Any]] = []
+    for error in endpoint_errors:
+        endpoint = str(error.get("endpoint") or "")
+        country = endpoint.rsplit("/", 1)[-1].strip().upper() if endpoint.startswith("servers/") else ""
+        if country in OPTIONAL_DEGRADED_COUNTRIES:
+            reason = str(error.get("reason") or error.get("category") or "endpoint_error")
+            _record_country_reason(
+                report,
+                "optional_country_errors",
+                country,
+                reason,
+            )
+            continue
+        blocking_endpoint_errors.append(error)
     report["errors"] = endpoint_errors
+    report["blocking_api_errors"] = blocking_endpoint_errors
     report["metadata_records"] = len(all_records)
     web_catalog_meta: dict[str, Any] = {}
     all_records = manager.publicvpnlist_attach_official_web_ids(
@@ -727,11 +927,11 @@ def run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         for country in countries
     )
 
-    if endpoint_errors:
+    if blocking_endpoint_errors:
         report["status"] = classify_api_result(
             all_records,
             [raw for raw in all_records if _row_mapping(manager, raw)],
-            endpoint_errors,
+            blocking_endpoint_errors,
         )
         report["elapsed_seconds"] = round(time.monotonic() - started, 3)
         return 1, report
