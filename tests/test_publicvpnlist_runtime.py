@@ -18,11 +18,14 @@ def load_smoke_module():
 
 
 class PublicVPNListRuntimeTests(unittest.TestCase):
-    def test_live_flow_defaults_are_bounded(self):
+    def test_live_flow_defaults_cover_two_rounds_for_all_fixed_countries(self):
         import vpngate_manager
 
-        self.assertLessEqual(vpngate_manager.PUBLICVPNLIST_LIVE_FLOW_MAX_ATTEMPTS, 3)
-        self.assertLessEqual(vpngate_manager.PUBLICVPNLIST_LIVE_FLOW_MAX_SECONDS, 30)
+        self.assertEqual(vpngate_manager.PUBLICVPNLIST_LIVE_FLOW_ATTEMPTS_PER_COUNTRY, 2)
+        self.assertEqual(vpngate_manager.PUBLICVPNLIST_LIVE_FLOW_MAX_ATTEMPTS, 20)
+        self.assertEqual(vpngate_manager.PUBLICVPNLIST_LIVE_FLOW_MAX_SECONDS, 180.0)
+        self.assertEqual(vpngate_manager.PUBLICVPNLIST_LIVE_FLOW_MAX_FAILURES, 9)
+        self.assertEqual(len(vpngate_manager.PUBLICVPNLIST_ALLOWED_COUNTRY_ORDER), 10)
         self.assertLessEqual(vpngate_manager.PUBLICVPNLIST_API_MAX_REQUESTS_PER_REFRESH, 30)
 
     def test_smoke_classifies_metadata_without_verified_mapping(self):
