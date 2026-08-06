@@ -132,6 +132,40 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
 
         self.assertEqual([row["id"] for row in ordered], ["ph-high", "fr-best", "ph-low"])
 
+    def test_api_candidate_order_completes_two_country_rounds(self):
+        records = []
+        expected_ids = []
+        country_order = tuple(vpngate_manager.PUBLICVPNLIST_ALLOWED_COUNTRY_ORDER)
+        for country in country_order:
+            best_id = f"{country.lower()}-best"
+            second_id = f"{country.lower()}-second"
+            best = self.record(best_id, country=country, with_config=False)
+            second = self.record(second_id, country=country, with_config=False)
+            best["technical_quality_score"] = 100
+            second["technical_quality_score"] = 90
+            records.extend((second, best))
+            expected_ids.extend((best_id, second_id))
+
+        ordered = vpngate_manager.publicvpnlist_order_api_candidate_records(records)
+
+        self.assertEqual(
+            [row["id"] for row in ordered],
+            [
+                item
+                for round_index in range(2)
+                for country in country_order
+                for item in (
+                    f"{country.lower()}-best",
+                    f"{country.lower()}-second",
+                )[round_index : round_index + 1]
+            ],
+        )
+        self.assertEqual([row["id"] for row in ordered], [
+            f"{country.lower()}-best" for country in country_order
+        ] + [
+            f"{country.lower()}-second" for country in country_order
+        ])
+
     def test_api_fetches_each_country_with_bounded_query_and_maps_known_fields(self):
         calls = []
 
