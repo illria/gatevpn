@@ -56,6 +56,110 @@ class PublicVPNListRuntimeTests(unittest.TestCase):
 
         self.assertEqual(selected_counts, {"PH": 2, "FR": 2})
 
+    def test_smoke_selection_is_two_interleaved_rounds_not_three(self):
+        import vpngate_manager
+
+        smoke = load_smoke_module()
+        records = []
+        for country in ("PH", "FR"):
+            for index in range(3):
+                records.append(
+                    {
+                        "id": f"{country.lower()}-{index}",
+                        "country_code": country,
+                        "hostname": f"{country.lower()}-{index}.fixture.invalid",
+                        "ip": f"198.51.100.{40 + index + (0 if country == 'PH' else 10)}",
+                        "protocol": "openvpn",
+                        "transport": "tcp",
+                        "port": 443,
+                        "technical_quality_score": 100 - index,
+                        "web_download_id": str(112000 + index),
+                    }
+                )
+
+        selected = smoke._select_records(vpngate_manager, records, ["PH", "FR"], 20)
+
+        self.assertEqual(
+            [row["id"] for row in selected],
+            ["ph-0", "fr-0", "ph-1", "fr-1"],
+        )
+
+    def test_smoke_filters_us_before_live_flow_and_preserves_safety_reason(self):
+        import vpngate_manager
+
+        smoke = load_smoke_module()
+        records = [
+            {
+                "id": "us-hosting",
+                "country_code": "US",
+                "hostname": "us-hosting.fixture.invalid",
+                "ip": "198.51.100.51",
+                "protocol": "openvpn",
+                "transport": "tcp",
+                "port": 443,
+                "web_download_id": "112051",
+            },
+            {
+                "id": "us-residential",
+                "country_code": "US",
+                "hostname": "us-residential.fixture.invalid",
+                "ip": "198.51.100.52",
+                "protocol": "openvpn",
+                "transport": "tcp",
+                "port": 443,
+                "web_download_id": "112052",
+            },
+            {
+                "id": "ph-usable",
+                "country_code": "PH",
+                "hostname": "ph-usable.fixture.invalid",
+                "ip": "198.51.100.53",
+                "protocol": "openvpn",
+                "transport": "tcp",
+                "port": 443,
+                "web_download_id": "112053",
+            },
+        ]
+        report = {
+            "eligible_candidates_by_country": {"US": 0, "PH": 0},
+            "skipped_by_country": {"US": {}, "PH": {}},
+            "us_classification_attempted": 0,
+            "us_residential_accepted": 0,
+            "us_nonresidential_rejected": 0,
+            "us_unclassified_rejected": 0,
+            "attempts_by_country": {"US": 0, "PH": 0},
+            "failed_candidates_by_country": {"US": {}, "PH": {}},
+            "available_countries": [],
+        }
+        classifications = {
+            "us-hosting": {"ip_type": "hosting", "risk_sources": ["ipinfo"]},
+            "us-residential": {"ip_type": "residential", "risk_sources": ["ipinfo"]},
+        }
+        with patch.object(
+            vpngate_manager,
+            "load_publicvpnlist_api_cache",
+            return_value={},
+        ), patch.object(
+            vpngate_manager,
+            "publicvpnlist_enrich_us_rows",
+            return_value=(classifications, False),
+        ):
+            selected = smoke._prepare_candidates(
+                vpngate_manager,
+                records,
+                ["US", "PH"],
+                20,
+                report,
+            )
+
+        self.assertEqual(
+            [row["id"] for row in selected],
+            ["us-residential", "ph-usable"],
+        )
+        self.assertEqual(report["us_classification_attempted"], 2)
+        self.assertEqual(report["us_nonresidential_rejected"], 1)
+        self.assertEqual(report["skipped_by_country"]["US"]["us_nonresidential"], 1)
+
     def test_smoke_classifies_metadata_without_verified_mapping(self):
         smoke = load_smoke_module()
         records = [{"id": "pvl_" + "a" * 24}]
