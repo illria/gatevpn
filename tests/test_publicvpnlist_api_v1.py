@@ -1770,7 +1770,7 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
         ), mock.patch.object(
             vpngate_manager,
             "fetch_publicvpnlist_official_config",
-            return_value=config,
+            side_effect=fake_live_flow,
         ) as live_flow:
             refreshed_stale = vpngate_manager.refresh_publicvpnlist_cache(cache=stale_cache)
 
@@ -1836,6 +1836,20 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
         changed_row = dict(raw_row)
         changed_row["config_updated_at"] = "v2"
         changed_row["config_sha256"] = hashlib.sha256(config.encode("utf-8")).hexdigest()
+
+        def fake_live_flow(_row, metadata=None, **_kwargs):
+            metadata.update(
+                {
+                    "official_flow": True,
+                    "live_check_succeeded": True,
+                    "token_request_attempted": 1,
+                    "token_generated": True,
+                    "profile_download_attempted": 1,
+                    "profile_downloaded": 1,
+                    "response_sha256": hashlib.sha256(config.encode("utf-8")).hexdigest(),
+                }
+            )
+            return config
 
         with mock.patch.object(vpngate_manager, "publicvpnlist_refresh_needed", return_value=True), mock.patch.object(
             vpngate_manager,
@@ -1997,7 +2011,7 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
         self.assertEqual(stats["profile_validation_failed"], 1)
         self.assertEqual(vpngate_manager.load_publicvpnlist_api_cache()["live_flow_failure_streak"], 1)
         self.assertEqual(
-            stats["failed_candidates_by_country"]["PH"]["protocol_mismatch"],
+            stats["failed_candidates_by_country"]["PH"]["config_sha256_mismatch"],
             1,
         )
 
