@@ -6837,6 +6837,9 @@ def refresh_publicvpnlist_cache(
     connectable_by_country = {
         country: 0 for country in PUBLICVPNLIST_ALLOWED_COUNTRY_ORDER
     }
+    metadata_records_by_country = {
+        country: 0 for country in PUBLICVPNLIST_ALLOWED_COUNTRY_ORDER
+    }
     mapped_records_by_country = {
         country: 0 for country in PUBLICVPNLIST_ALLOWED_COUNTRY_ORDER
     }
@@ -7304,6 +7307,8 @@ def refresh_publicvpnlist_cache(
         if not key:
             continue
         country_for_row = country_for_stats(row)
+        if country_for_row in metadata_records_by_country:
+            metadata_records_by_country[country_for_row] += 1
         metadata_keys = publicvpnlist_endpoint_aliases(row, endpoint_dns_cache)
         if metadata_keys & priority_endpoint_keys:
             priority_duplicate_skipped += 1
@@ -7371,7 +7376,7 @@ def refresh_publicvpnlist_cache(
                 "live_flow_deadline_exceeded": live_flow_deadline_exceeded,
                 "live_flow_circuit_open": live_flow_circuit_open,
                 "live_flow_backoff_skipped": live_flow_backoff_skipped,
-                "metadata_records_by_country": dict(mapped_records_by_country),
+                "metadata_records_by_country": dict(metadata_records_by_country),
                 "mapped_records_by_country": dict(mapped_records_by_country),
                 "eligible_candidates_by_country": dict(eligible_candidates_by_country),
                 "attempts_by_country": dict(live_flow_attempts_by_country),
