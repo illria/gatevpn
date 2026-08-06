@@ -1770,7 +1770,7 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
         ), mock.patch.object(
             vpngate_manager,
             "fetch_publicvpnlist_official_config",
-            side_effect=fake_live_flow,
+            return_value=config,
         ) as live_flow:
             refreshed_stale = vpngate_manager.refresh_publicvpnlist_cache(cache=stale_cache)
 
@@ -1858,7 +1858,7 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
         ), mock.patch.object(
             vpngate_manager,
             "fetch_publicvpnlist_official_config",
-            return_value=config,
+            side_effect=fake_live_flow,
         ) as live_flow:
             refreshed = vpngate_manager.refresh_publicvpnlist_cache(cache=cache)
 
