@@ -786,6 +786,7 @@ def run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                     report["config_downloads"] += 1
                     report["profiles_downloaded"] += 1
                     report["profiles_validated"] += 1
+                    report["validated_by_country"][country] += 1
                     report["connectable_by_country"][country] += 1
                     report["connectable_candidates"] += 1
                     report["download_results"].append(result)
