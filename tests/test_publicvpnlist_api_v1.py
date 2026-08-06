@@ -1707,7 +1707,7 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
                 )
             config = (
                 "client\nproto tcp\n"
-                f"remote {row['hostname']} 443\n"
+                f"remote {row['host']} 443\n"
                 "<ca>\nCERT\n</ca>\n"
             )
             metadata.update({
