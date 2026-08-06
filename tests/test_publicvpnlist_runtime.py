@@ -28,6 +28,84 @@ class PublicVPNListRuntimeTests(unittest.TestCase):
         self.assertEqual(len(vpngate_manager.PUBLICVPNLIST_ALLOWED_COUNTRY_ORDER), 10)
         self.assertLessEqual(vpngate_manager.PUBLICVPNLIST_API_MAX_REQUESTS_PER_REFRESH, 30)
 
+    def test_ph_missing_metadata_is_optional_degradation(self):
+        smoke = load_smoke_module()
+        countries = list(smoke.FIXED_COUNTRY_ORDER)
+        report = {
+            "countries": countries,
+            "profiles_downloaded": 9,
+            "profiles_validated": 9,
+            "connectable_candidates": 9,
+            "metadata_records_by_country": {
+                country: 0 if country == "PH" else 1
+                for country in countries
+            },
+            "eligible_candidates_by_country": {
+                country: 0 if country == "PH" else 1
+                for country in countries
+            },
+            "attempts_by_country": {
+                country: 0 if country == "PH" else 1
+                for country in countries
+            },
+            "validated_by_country": {
+                country: 0 if country == "PH" else 1
+                for country in countries
+            },
+            "skipped_by_country": {country: {} for country in countries},
+            "failed_candidates_by_country": {country: {} for country in countries},
+            "optional_country_errors": {"PH": {}},
+            "openvpn": "not_started",
+        }
+
+        coverage = smoke.evaluate_live_coverage(report)
+
+        self.assertEqual(coverage["coverage_errors"], [])
+        self.assertNotIn("PH", coverage["metadata_missing"])
+        self.assertEqual(coverage["required_validated_country_count"], 9)
+        self.assertEqual(
+            coverage["optional_degraded_countries"]["PH"]["reason"],
+            "metadata_missing",
+        )
+
+    def test_ph_endpoint_failure_is_optional_degradation(self):
+        smoke = load_smoke_module()
+        countries = list(smoke.FIXED_COUNTRY_ORDER)
+        report = {
+            "countries": countries,
+            "profiles_downloaded": 9,
+            "profiles_validated": 9,
+            "connectable_candidates": 9,
+            "metadata_records_by_country": {
+                country: 0 if country == "PH" else 1
+                for country in countries
+            },
+            "eligible_candidates_by_country": {
+                country: 0 if country == "PH" else 1
+                for country in countries
+            },
+            "attempts_by_country": {
+                country: 0 if country == "PH" else 1
+                for country in countries
+            },
+            "validated_by_country": {
+                country: 0 if country == "PH" else 1
+                for country in countries
+            },
+            "skipped_by_country": {country: {} for country in countries},
+            "failed_candidates_by_country": {country: {} for country in countries},
+            "optional_country_errors": {"PH": {"network_error": 1}},
+            "openvpn": "not_started",
+        }
+
+        coverage = smoke.evaluate_live_coverage(report)
+
+        self.assertEqual(coverage["coverage_errors"], [])
+        self.assertEqual(
+            coverage["optional_degraded_countries"]["PH"]["reason"],
+            "api_endpoint_error:network_error",
+        )
+
     def test_smoke_selection_caps_two_candidates_per_country(self):
         import vpngate_manager
 
