@@ -179,9 +179,18 @@ PUBLICVPNLIST_MAX_RESPONSE_BYTES = _publicvpnlist_env_int("PUBLICVPNLIST_MAX_RES
 # explicitly opt into retries only for a separately verified reusable URL.
 PUBLICVPNLIST_MAX_RETRIES = _publicvpnlist_env_int("PUBLICVPNLIST_MAX_RETRIES", 1, 1)
 PUBLICVPNLIST_MAX_REDIRECTS = _publicvpnlist_env_int("PUBLICVPNLIST_MAX_REDIRECTS", 5)
+# The fixed source set has ten countries.  A default of two ranked
+# candidates per country therefore needs 20 live-flow attempts to complete
+# round one for every country and round two for every country.  Operators may
+# lower the total explicitly, but doing so necessarily skips part of round two.
+PUBLICVPNLIST_LIVE_FLOW_ATTEMPTS_PER_COUNTRY = _publicvpnlist_env_int(
+    "PUBLICVPNLIST_LIVE_FLOW_ATTEMPTS_PER_COUNTRY",
+    2,
+    1,
+)
 PUBLICVPNLIST_LIVE_FLOW_MAX_ATTEMPTS = _publicvpnlist_env_int(
     "PUBLICVPNLIST_LIVE_FLOW_MAX_ATTEMPTS",
-    3,
+    PUBLICVPNLIST_LIVE_FLOW_ATTEMPTS_PER_COUNTRY * 10,
     0,
 )
 PUBLICVPNLIST_LIVE_FLOW_DELAY_SECONDS = _publicvpnlist_env_float(
@@ -190,12 +199,12 @@ PUBLICVPNLIST_LIVE_FLOW_DELAY_SECONDS = _publicvpnlist_env_float(
 )
 PUBLICVPNLIST_LIVE_FLOW_MAX_FAILURES = _publicvpnlist_env_int(
     "PUBLICVPNLIST_LIVE_FLOW_MAX_FAILURES",
-    3,
+    9,
     0,
 )
 PUBLICVPNLIST_LIVE_FLOW_MAX_SECONDS = _publicvpnlist_env_float(
     "PUBLICVPNLIST_LIVE_FLOW_MAX_SECONDS",
-    30.0,
+    180.0,
 )
 PUBLICVPNLIST_PROFILE_RETRY_MAX_ENTRIES = _publicvpnlist_env_int(
     "PUBLICVPNLIST_PROFILE_RETRY_MAX_ENTRIES",
