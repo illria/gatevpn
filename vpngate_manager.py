@@ -6861,18 +6861,6 @@ def refresh_publicvpnlist_cache(
     accepted_endpoint_keys: set[str] = set()
     priority_endpoint_keys = set(blocked_endpoint_keys or ())
     live_flow_available_countries: set[str] = set()
-    if source_kind == "api":
-        for raw_record in records:
-            row = normalize_publicvpnlist_row(raw_record)
-            if not row or not publicvpnlist_country_allowed(row):
-                continue
-            country = str(row.get("country_short") or "").upper()
-            if (
-                not str(row.get("temporary_ovpn_url") or "").strip()
-                and str(row.get("id") or row.get("public_id") or "").strip()
-                and publicvpnlist_web_download_id(row)
-            ):
-                live_flow_available_countries.add(country)
 
     def country_for_stats(row: dict[str, Any]) -> str:
         country = str(row.get("country_short") or "").strip().upper()
@@ -6938,15 +6926,6 @@ def refresh_publicvpnlist_cache(
         nonlocal api_retry_state_changed
         if not window:
             return False
-        if source_kind == "api":
-            for _key, candidate_row, _metadata_keys in window:
-                if (
-                    not str(candidate_row.get("temporary_ovpn_url") or "").strip()
-                    and publicvpnlist_web_download_id(candidate_row)
-                ):
-                    candidate_country = country_for_stats(candidate_row)
-                    if candidate_country:
-                        live_flow_available_countries.add(candidate_country)
         classifications: dict[str, dict[str, Any]] = {}
         rows_to_classify: list[tuple[str, dict[str, Any]]] = []
         for key, row, _metadata_keys in window:
