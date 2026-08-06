@@ -198,15 +198,29 @@ def _row_mapping(manager, raw: dict[str, Any]) -> bool:
     )
 
 
-def _select_records(manager, records: list[dict[str, Any]], countries: list[str], limit: int) -> list[dict[str, Any]]:
+def _select_records(
+    manager,
+    records: list[dict[str, Any]],
+    countries: list[str],
+    limit: int,
+) -> list[dict[str, Any]]:
     allowed = {str(item).strip().upper() for item in countries if str(item).strip()}
+    per_country_limit = min(
+        2,
+        max(1, int(getattr(manager, "PUBLICVPNLIST_LIVE_FLOW_ATTEMPTS_PER_COUNTRY", 2))),
+    )
     ordered = manager.publicvpnlist_order_api_candidate_records(records)
     selected: list[dict[str, Any]] = []
+    selected_by_country: dict[str, int] = {}
     for raw in ordered:
         row = manager.normalize_publicvpnlist_row(raw)
-        if not row or row.get("country_short") not in allowed:
+        country = str(row.get("country_short") or "").upper() if row else ""
+        if not row or country not in allowed:
+            continue
+        if selected_by_country.get(country, 0) >= per_country_limit:
             continue
         selected.append(dict(raw))
+        selected_by_country[country] = selected_by_country.get(country, 0) + 1
         if len(selected) >= max(1, int(limit)):
             break
     return selected
@@ -409,7 +423,10 @@ def run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     started = time.monotonic()
     countries = [
         str(item).strip().upper()
-        for item in str(args.countries or "PH,FR,US").split(",")
+        for item in str(
+            args.countries
+            or "US,FR,GB,ID,FI,DE,TW,AU,NL,PH"
+        ).split(",")
         if str(item).strip()
     ]
     base_url = manager.publicvpnlist_api_base_url()
@@ -422,10 +439,18 @@ def run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         "web_catalog_records": 0,
         "web_catalog_matches": 0,
         "metadata_only_skipped": 0,
+        "metadata_records_by_country": {country: 0 for country in countries},
+        "mapped_records_by_country": {country: 0 for country in countries},
+        "available_countries": [],
+        "attempts_by_country": {country: 0 for country in countries},
+        "downloaded_by_country": {country: 0 for country in countries},
+        "validated_by_country": {country: 0 for country in countries},
+        "skipped_by_country": {country: {} for country in countries},
         "connectable_candidates": 0,
         "config_downloads": 0,
         "profiles_downloaded": 0,
         "profiles_validated": 0,
+        "download_results": [],
         "api_endpoints": [],
         "errors": [],
         "openvpn": "not_started",
@@ -494,12 +519,31 @@ def run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         for record in all_records
     ]
     normalized_rows = [row for row in normalized_rows if row and row.get("country_short") in set(countries)]
+    for raw in all_records:
+        row = manager.normalize_publicvpnlist_row(raw)
+        if not row:
+            continue
+        country = str(row.get("country_short") or "").upper()
+        if country not in report["metadata_records_by_country"]:
+            continue
+        report["metadata_records_by_country"][country] += 1
+        if _row_mapping(manager, raw):
+            report["mapped_records_by_country"][country] += 1
+        else:
+            report["skipped_by_country"][country]["metadata_only"] = (
+                report["skipped_by_country"][country].get("metadata_only", 0) + 1
+            )
+    report["available_countries"] = [
+        country
+        for country in countries
+        if report["metadata_records_by_country"].get(country, 0) > 0
+    ]
     report["metadata_with_download_path"] = sum(
-        1 for raw in all_records if _row_mapping(manager, raw)
+        report["mapped_records_by_country"].values()
     )
-    report["metadata_only_skipped"] = max(
-        0,
-        len(normalized_rows) - report["metadata_with_download_path"],
+    report["metadata_only_skipped"] = sum(
+        report["skipped_by_country"][country].get("metadata_only", 0)
+        for country in countries
     )
 
     if endpoint_errors:
@@ -518,6 +562,8 @@ def run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     report["status"] = classify_api_result(all_records, mapped_records)
     if args.download and mapped_records:
         # Detail enrichment is bounded by the manager's API request budget.
+        # Candidate selection is also bounded to the first two ranked rows per
+        # country, so the smoke exercises the same two-round policy as refresh.
         detail_meta = {"request_count": 0}
         try:
             ranked = manager.publicvpnlist_order_api_candidate_records(all_records)
@@ -526,16 +572,40 @@ def run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                 detail_meta,
             )
             candidates = _select_records(manager, enriched, countries, args.max_profiles)
+            flow_deadline = started + max(1, int(args.timeout))
             for raw in candidates[: max(1, int(args.max_profiles))]:
+                row = manager.normalize_publicvpnlist_row(raw)
+                country = str(row.get("country_short") or "").upper() if row else ""
+                if country not in report["attempts_by_country"]:
+                    continue
+                remaining = flow_deadline - time.monotonic()
+                if remaining <= 0:
+                    bucket = report["skipped_by_country"][country]
+                    bucket["deadline"] = bucket.get("deadline", 0) + 1
+                    continue
+                report["attempts_by_country"][country] += 1
                 try:
-                    result = _download_one(manager, raw, args.timeout)
+                    result = _download_one(
+                        manager,
+                        raw,
+                        max(1, min(int(args.timeout), int(remaining))),
+                    )
                     report["config_downloads"] += 1
                     report["profiles_downloaded"] += 1
                     report["profiles_validated"] += 1
+                    report["downloaded_by_country"][country] += 1
+                    report["validated_by_country"][country] += 1
                     report["connectable_candidates"] += 1
-                    report["download_result"] = result
-                    break
+                    report["download_results"].append(result)
+                    report.setdefault("download_result", result)
                 except Exception as exc:
+                    flow = getattr(exc, "_pvl_flow", {})
+                    if isinstance(flow, dict) and flow.get("profile_downloaded"):
+                        report["profiles_downloaded"] += 1
+                        report["downloaded_by_country"][country] += 1
+                    reason = _safe_reason_code(exc)
+                    bucket = report["skipped_by_country"][country]
+                    bucket[reason] = bucket.get(reason, 0) + 1
                     report["errors"].append(_redacted_error(exc))
             report["detail_requests"] = int(detail_meta.get("detail_requests") or 0)
             report["detail_successes"] = int(detail_meta.get("detail_successes") or 0)
@@ -561,9 +631,9 @@ def run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="PublicVPNList API/config smoke check")
     parser.add_argument("--api", action="store_true", help="validate API v1 (default)")
-    parser.add_argument("--countries", default="PH,FR,US")
-    parser.add_argument("--max-profiles", type=int, default=1)
-    parser.add_argument("--timeout", type=int, default=60)
+    parser.add_argument("--countries", default="US,FR,GB,ID,FI,DE,TW,AU,NL,PH")
+    parser.add_argument("--max-profiles", type=int, default=20)
+    parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--redact", action="store_true", help="keep all report fields redacted")
     parser.add_argument("--download", action="store_true", help="run at most max-profiles bounded config flow")
     parser.add_argument("--json-report", default="")
