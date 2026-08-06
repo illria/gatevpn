@@ -6737,11 +6737,54 @@ def refresh_publicvpnlist_cache(
     live_flow_circuit_open = False
     live_flow_backoff_skipped = 0
     live_flow_mapping_missing = 0
+    live_flow_attempts_by_country = {
+        country: 0 for country in PUBLICVPNLIST_ALLOWED_COUNTRY_ORDER
+    }
+    profiles_downloaded_by_country = {
+        country: 0 for country in PUBLICVPNLIST_ALLOWED_COUNTRY_ORDER
+    }
+    profiles_validated_by_country = {
+        country: 0 for country in PUBLICVPNLIST_ALLOWED_COUNTRY_ORDER
+    }
+    skipped_by_country = {
+        country: {} for country in PUBLICVPNLIST_ALLOWED_COUNTRY_ORDER
+    }
     us_residential_accepted = 0
     endpoint_dns_cache: dict[str, str | None] = {}
     metadata_seen_endpoint_keys: set[str] = set()
     accepted_endpoint_keys: set[str] = set()
     priority_endpoint_keys = set(blocked_endpoint_keys or ())
+    live_flow_available_countries: set[str] = set()
+    if source_kind == "api":
+        for raw_record in records:
+            row = normalize_publicvpnlist_row(raw_record)
+            if not row or not publicvpnlist_country_allowed(row):
+                continue
+            if (
+                not str(row.get("temporary_ovpn_url") or "").strip()
+                and str(row.get("id") or row.get("public_id") or "").strip()
+                and publicvpnlist_web_download_id(row)
+            ):
+                live_flow_available_countries.add(str(row.get("country_short")).upper())
+
+    def country_for_stats(row: dict[str, Any]) -> str:
+        country = str(row.get("country_short") or "").strip().upper()
+        return country if country in PUBLICVPNLIST_ALLOWED_COUNTRIES else ""
+
+    def record_country_skip(row: dict[str, Any], reason: str) -> None:
+        country = country_for_stats(row)
+        if not country:
+            return
+        reasons = skipped_by_country.setdefault(country, {})
+        reasons[reason] = int(reasons.get(reason) or 0) + 1
+
+    def live_flow_first_round_complete() -> bool:
+        attempted = {
+            country
+            for country, count in live_flow_attempts_by_country.items()
+            if count > 0
+        }
+        return live_flow_available_countries.issubset(attempted)
 
     def account_flow_metadata(flow_metadata: dict[str, Any]) -> None:
         """Copy non-secret request counters from one live/direct flow once."""
@@ -6799,6 +6842,7 @@ def refresh_publicvpnlist_cache(
             # URL so that representation-only duplicates still cost no token.
             if metadata_keys & (priority_endpoint_keys | accepted_endpoint_keys):
                 actual_duplicate_skipped += 1
+                record_country_skip(row, "endpoint_duplicate")
                 continue
             effective_row = dict(row)
             if row.get("country_short") == "US":
@@ -6812,6 +6856,7 @@ def refresh_publicvpnlist_cache(
                         if isinstance(old_profiles.get(key), dict):
                             old_profiles[key].update(classification)
                     us_rejected += 1
+                    record_country_skip(row, "us_policy")
                     continue
                 effective_row.update(classification or {})
                 us_residential_accepted += 1
@@ -6823,6 +6868,7 @@ def refresh_publicvpnlist_cache(
                     actual_keys = normalize_endpoint_keys(node, endpoint_dns_cache)
                     if actual_keys & (priority_endpoint_keys | accepted_endpoint_keys):
                         actual_duplicate_skipped += 1
+                        record_country_skip(row, "endpoint_duplicate")
                         continue
                     profile = publicvpnlist_cache_profile(
                         effective_row,
@@ -6847,12 +6893,14 @@ def refresh_publicvpnlist_cache(
             official_flow = source_kind == "api" and not config_url
             if not config_url and not official_flow:
                 metadata_only_skipped += 1
+                record_country_skip(effective_row, "metadata_only")
                 if api_retry_cache is not None and not effective_row.get("_pvl_api_not_modified"):
                     publicvpnlist_api_clear_profile_retry(api_retry_cache, effective_row)
                     api_retry_state_changed = True
                 continue
             if official_flow and not str(effective_row.get("id") or "").strip():
                 metadata_only_skipped += 1
+                record_country_skip(effective_row, "missing_public_id")
                 if api_retry_cache is not None and not effective_row.get("_pvl_api_not_modified"):
                     publicvpnlist_api_clear_profile_retry(api_retry_cache, effective_row)
                     api_retry_state_changed = True
@@ -6863,6 +6911,7 @@ def refresh_publicvpnlist_cache(
                 # do not call undocumented live endpoints with a guessed ID.
                 metadata_only_skipped += 1
                 live_flow_mapping_missing += 1
+                record_country_skip(effective_row, "mapping_missing")
                 if api_retry_cache is not None and not effective_row.get("_pvl_api_not_modified"):
                     publicvpnlist_api_clear_profile_retry(api_retry_cache, effective_row)
                     api_retry_state_changed = True
@@ -6881,12 +6930,22 @@ def refresh_publicvpnlist_cache(
             # bounded by scan/max-node limits but are never retried with the
             # same short-lived link.
             live_flow_enabled = official_flow
+            country_for_flow = country_for_stats(effective_row)
+            if (
+                live_flow_enabled
+                and country_for_flow
+                and live_flow_attempts_by_country[country_for_flow]
+                >= PUBLICVPNLIST_LIVE_FLOW_ATTEMPTS_PER_COUNTRY
+            ):
+                record_country_skip(effective_row, "country_attempt_limit")
+                continue
             if live_flow_enabled:
                 if (
                     live_flow_attempts >= PUBLICVPNLIST_LIVE_FLOW_MAX_ATTEMPTS
                     or (
                         PUBLICVPNLIST_LIVE_FLOW_MAX_FAILURES > 0
                         and live_flow_failures >= PUBLICVPNLIST_LIVE_FLOW_MAX_FAILURES
+                        and live_flow_first_round_complete()
                     )
                 ):
                     live_flow_budget_exhausted = live_flow_attempts >= PUBLICVPNLIST_LIVE_FLOW_MAX_ATTEMPTS
@@ -6920,6 +6979,8 @@ def refresh_publicvpnlist_cache(
                         )
                     )
                 live_flow_attempts += 1
+                if official_flow and country_for_flow:
+                    live_flow_attempts_by_country[country_for_flow] += 1
                 if official_flow:
                     live_check_attempted += 1
             try:
@@ -6960,6 +7021,9 @@ def refresh_publicvpnlist_cache(
                 )
                 candidate_profiles[key] = profile
                 candidate_order.append(key)
+                if country_for_flow:
+                    profiles_downloaded_by_country[country_for_flow] += 1
+                    profiles_validated_by_country[country_for_flow] += 1
                 config_downloaded += 1
                 if api_retry_cache is not None:
                     publicvpnlist_api_clear_profile_retry(api_retry_cache, effective_row)
@@ -6985,6 +7049,8 @@ def refresh_publicvpnlist_cache(
             except Exception as exc:
                 if flow_metadata.get("profile_downloaded"):
                     flow_metadata["profile_validation_failed"] = True
+                    if country_for_flow:
+                        profiles_downloaded_by_country[country_for_flow] += 1
                 if flow_metadata.get("live_flow_deadline_exceeded"):
                     live_flow_deadline_exceeded = True
                     live_flow_budget_exhausted = True
@@ -7040,6 +7106,7 @@ def refresh_publicvpnlist_cache(
                     live_flow_enabled
                     and PUBLICVPNLIST_LIVE_FLOW_MAX_FAILURES > 0
                     and live_flow_failures >= PUBLICVPNLIST_LIVE_FLOW_MAX_FAILURES
+                    and live_flow_first_round_complete()
                 ):
                     live_flow_circuit_open = True
                     return True
@@ -7127,6 +7194,13 @@ def refresh_publicvpnlist_cache(
                 "live_flow_deadline_exceeded": live_flow_deadline_exceeded,
                 "live_flow_circuit_open": live_flow_circuit_open,
                 "live_flow_backoff_skipped": live_flow_backoff_skipped,
+                "attempts_by_country": dict(live_flow_attempts_by_country),
+                "downloaded_by_country": dict(profiles_downloaded_by_country),
+                "validated_by_country": dict(profiles_validated_by_country),
+                "skipped_by_country": {
+                    country: dict(reasons)
+                    for country, reasons in skipped_by_country.items()
+                },
                 "connectable_candidates": len(candidate_profiles),
                 "last_refresh_connectable_candidates": len(candidate_profiles),
                 "usable_cached_profiles": 0,
@@ -7226,6 +7300,10 @@ def refresh_publicvpnlist_cache(
         f"live flow deadline exceeded={live_flow_deadline_exceeded}，"
         f"live flow circuit open={live_flow_circuit_open}，"
         f"live flow backoff skipped={live_flow_backoff_skipped}，"
+        f"attempts_by_country={json.dumps(live_flow_attempts_by_country, sort_keys=True)}，"
+        f"downloaded_by_country={json.dumps(profiles_downloaded_by_country, sort_keys=True)}，"
+        f"validated_by_country={json.dumps(profiles_validated_by_country, sort_keys=True)}，"
+        f"skipped_by_country={json.dumps(skipped_by_country, sort_keys=True)}，"
         f"US residential accepted={us_residential_accepted}，US rejected={us_rejected}，"
         f"raw scan={raw_scanned}/{PUBLICVPNLIST_MAX_RAW_ROWS}，"
         f"eligible={eligible_scanned}/{PUBLICVPNLIST_MAX_SCAN_ROWS}，"
