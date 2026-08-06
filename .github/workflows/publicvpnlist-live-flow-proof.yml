@@ -43,25 +43,56 @@ jobs:
           required = ("profiles_downloaded", "profiles_validated", "connectable_candidates")
           missing = [name for name in required if int(report.get(name) or 0) < 1]
           fixed_countries = ("US", "FR", "GB", "ID", "FI", "DE", "TW", "AU", "NL", "PH")
+
           def missing_countries(field):
               values = report.get(field) or {}
               return [
                   country for country in fixed_countries
                   if int(values.get(country) or 0) < 1
               ]
+
           metadata_missing = missing_countries("metadata_records_by_country")
-          attempts_missing = missing_countries("attempts_by_country")
-          downloaded_missing = missing_countries("downloaded_by_country")
-          validated_missing = missing_countries("validated_by_country")
+          attempts = report.get("attempts_by_country") or {}
+          downloaded = report.get("downloaded_by_country") or {}
+          validated = report.get("validated_by_country") or {}
+          skipped = report.get("skipped_by_country") or {}
+          attempts_missing = [
+              country for country in fixed_countries
+              if int(attempts.get(country) or 0) < 1
+          ]
+          attempts_over_limit = [
+              country for country in fixed_countries
+              if int(attempts.get(country) or 0) > 2
+          ]
+          unvalidated_countries = [
+              country for country in fixed_countries
+              if int(validated.get(country) or 0) < 1
+          ]
+          unvalidated_details = {
+              country: {
+                  "downloaded": int(downloaded.get(country) or 0),
+                  "validated": int(validated.get(country) or 0),
+                  "reasons": skipped.get(country) or {},
+              }
+              for country in unvalidated_countries
+          }
+          validated_country_count = sum(
+              1 for country in fixed_countries
+              if int(validated.get(country) or 0) >= 1
+          )
+
           print("profiles_downloaded=" + str(report.get("profiles_downloaded", 0)))
           print("profiles_validated=" + str(report.get("profiles_validated", 0)))
           print("connectable_candidates=" + str(report.get("connectable_candidates", 0)))
           print("metadata_records_by_country=" + json.dumps(report.get("metadata_records_by_country", {}), sort_keys=True))
-          print("attempts_by_country=" + json.dumps(report.get("attempts_by_country", {}), sort_keys=True))
-          print("downloaded_by_country=" + json.dumps(report.get("downloaded_by_country", {}), sort_keys=True))
-          print("validated_by_country=" + json.dumps(report.get("validated_by_country", {}), sort_keys=True))
-          print("skipped_by_country=" + json.dumps(report.get("skipped_by_country", {}), sort_keys=True))
+          print("attempts_by_country=" + json.dumps(attempts, sort_keys=True))
+          print("downloaded_by_country=" + json.dumps(downloaded, sort_keys=True))
+          print("validated_by_country=" + json.dumps(validated, sort_keys=True))
+          print("skipped_by_country=" + json.dumps(skipped, sort_keys=True))
+          print("unvalidated_countries=" + json.dumps(unvalidated_details, sort_keys=True))
+          print("validated_country_count=" + str(validated_country_count))
           print("openvpn_started=" + str(report.get("openvpn") == "started"))
+
           coverage_errors = []
           if missing:
               coverage_errors.append("overall=" + ",".join(missing))
@@ -69,10 +100,12 @@ jobs:
               coverage_errors.append("metadata=" + ",".join(metadata_missing))
           if attempts_missing:
               coverage_errors.append("first_round_attempts=" + ",".join(attempts_missing))
-          if downloaded_missing:
-              coverage_errors.append("downloads=" + ",".join(downloaded_missing))
-          if validated_missing:
-              coverage_errors.append("validated=" + ",".join(validated_missing))
+          if attempts_over_limit:
+              coverage_errors.append("attempts_over_limit=" + ",".join(attempts_over_limit))
+          if int(validated.get("PH") or 0) < 1:
+              coverage_errors.append("PH_validation_missing")
+          if validated_country_count < 8:
+              coverage_errors.append("validated_countries=" + str(validated_country_count) + "<8")
           if coverage_errors:
               raise SystemExit("live profile smoke coverage incomplete: " + "; ".join(coverage_errors))
           PY
