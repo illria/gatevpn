@@ -1884,7 +1884,7 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
 
         self.assertEqual(calls, ["/download/111208/", "/test_server.php", "/get_token.php", "/download.php"])
 
-    def test_live_flow_budget_and_circuit_breaker_stop_additional_profiles(self):
+    def test_live_flow_country_cap_stops_a_third_profile(self):
         rows = [self.record(f"budget-{index}", with_config=False) for index in range(4)]
         for index, row in enumerate(rows):
             row["web_download_id"] = str(111210 + index)
@@ -1910,7 +1910,11 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
         self.assertEqual(live_flow.call_count, 2)
         stats = vpngate_manager.load_publicvpnlist_cache()["last_refresh_stats"]
         self.assertEqual(stats["live_flow_attempts"], 2)
-        self.assertTrue(stats["live_flow_budget_exhausted"])
+        self.assertFalse(stats["live_flow_budget_exhausted"])
+        self.assertEqual(
+            stats["skipped_by_country"]["PH"]["country_attempt_limit"],
+            2,
+        )
 
     def test_downloaded_but_invalid_profile_counts_validation_failure_and_keeps_streak(self):
         row = self.record("validation-after-download", with_config=False)
@@ -1977,7 +1981,7 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
             vpngate_manager.refresh_publicvpnlist_cache()
 
         stats = vpngate_manager.load_publicvpnlist_cache()["last_refresh_stats"]
-        self.assertEqual(stats["live_flow_attempts"], 0)
+        self.assertEqual(stats["live_flow_attempts"], 1)
         self.assertTrue(stats["live_flow_circuit_open"])
 
     def test_retry_entries_for_profiles_missing_from_complete_metadata_are_pruned(self):
