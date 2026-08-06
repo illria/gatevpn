@@ -1997,7 +1997,7 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
         self.assertEqual(stats["profile_validation_failed"], 1)
         self.assertEqual(vpngate_manager.load_publicvpnlist_api_cache()["live_flow_failure_streak"], 1)
         self.assertEqual(
-            stats["failed_candidates_by_country"]["PH"]["endpoint_mismatch"],
+            stats["failed_candidates_by_country"]["PH"]["protocol_mismatch"],
             1,
         )
 
