@@ -7170,6 +7170,14 @@ def refresh_publicvpnlist_cache(
                     snapshot_checked_at=now,
                     config_validated_at=now,
                 )
+                # Preserve the provider's current profile-version metadata on
+                # the newly validated record.  This makes a config_updated_at
+                # or config_sha256 change observable even when the stable
+                # public-id/endpoint cache key is unchanged.
+                for metadata_field in ("config_updated_at", "config_sha256"):
+                    metadata_value = effective_row.get(metadata_field)
+                    if metadata_value not in (None, ""):
+                        profile[metadata_field] = metadata_value
                 candidate_profiles[key] = profile
                 candidate_order.append(key)
                 if country_for_flow:
