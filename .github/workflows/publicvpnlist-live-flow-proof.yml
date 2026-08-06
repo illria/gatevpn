@@ -31,7 +31,7 @@ jobs:
         run: |
           mkdir -p artifacts/logs
           set +e
-          python3 tools/publicvpnlist-smoke.py             --api             --countries PH,FR             --max-profiles 3             --timeout 60             --redact             --download             --json-report artifacts/logs/publicvpnlist-live-smoke.json             > artifacts/logs/publicvpnlist-live-smoke.log 2>&1
+          python3 tools/publicvpnlist-smoke.py             --api             --countries US,FR,GB,ID,FI,DE,TW,AU,NL,PH             --max-profiles 20             --timeout 180             --redact             --download             --json-report artifacts/logs/publicvpnlist-live-smoke.json             > artifacts/logs/publicvpnlist-live-smoke.log 2>&1
           smoke_status=$?
           cat artifacts/logs/publicvpnlist-live-smoke.json || true
           tail -n 20 artifacts/logs/publicvpnlist-live-smoke.log || true
@@ -44,9 +44,33 @@ jobs:
           missing = [name for name in required if int(report.get(name) or 0) < 1]
           if missing:
               raise SystemExit("live profile smoke missing: " + ", ".join(missing))
+          fixed_countries = ("US", "FR", "GB", "ID", "FI", "DE", "TW", "AU", "NL", "PH")
+          def missing_countries(field):
+              values = report.get(field) or {}
+              return [
+                  country for country in fixed_countries
+                  if int(values.get(country) or 0) < 1
+              ]
+          metadata_missing = missing_countries("metadata_records_by_country")
+          attempts_missing = missing_countries("attempts_by_country")
+          downloaded_missing = missing_countries("downloaded_by_country")
+          validated_missing = missing_countries("validated_by_country")
+          if metadata_missing:
+              raise SystemExit("live profile smoke missing metadata: " + ", ".join(metadata_missing))
+          if attempts_missing:
+              raise SystemExit("live profile smoke missing first-round attempts: " + ", ".join(attempts_missing))
+          if downloaded_missing:
+              raise SystemExit("live profile smoke missing downloads: " + ", ".join(downloaded_missing))
+          if validated_missing:
+              raise SystemExit("live profile smoke missing validated profiles: " + ", ".join(validated_missing))
           print("profiles_downloaded=" + str(report["profiles_downloaded"]))
           print("profiles_validated=" + str(report["profiles_validated"]))
           print("connectable_candidates=" + str(report["connectable_candidates"]))
+          print("metadata_records_by_country=" + json.dumps(report.get("metadata_records_by_country", {}), sort_keys=True))
+          print("attempts_by_country=" + json.dumps(report.get("attempts_by_country", {}), sort_keys=True))
+          print("downloaded_by_country=" + json.dumps(report.get("downloaded_by_country", {}), sort_keys=True))
+          print("validated_by_country=" + json.dumps(report.get("validated_by_country", {}), sort_keys=True))
+          print("skipped_by_country=" + json.dumps(report.get("skipped_by_country", {}), sort_keys=True))
           print("openvpn_started=" + str(report.get("openvpn") == "started"))
           PY
           test "$smoke_status" -eq 0
