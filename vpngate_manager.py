@@ -7495,7 +7495,6 @@ def refresh_publicvpnlist_cache(
         f"US residential accepted={us_residential_accepted}，"
         f"US nonresidential rejected={us_nonresidential_rejected}，"
         f"US unclassified rejected={us_unclassified_rejected}，"
-        f"US residential accepted={us_residential_accepted}，US rejected={us_rejected}，"
         f"raw scan={raw_scanned}/{PUBLICVPNLIST_MAX_RAW_ROWS}，"
         f"eligible={eligible_scanned}/{PUBLICVPNLIST_MAX_SCAN_ROWS}，"
         f"固定国家过滤={fixed_country_filtered}，raw_limit_hit={raw_limit_hit}，"
