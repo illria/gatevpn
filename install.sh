@@ -595,6 +595,8 @@ def publicvpnlist_api_cache_summary(values=None):
         "backoff_seconds": max(0, int(backoff_value - time.time())) if backoff_value else 0,
         "request_count": safe_int(cache.get("request_count")),
         "etag_cache_hits": safe_int(cache.get("last_etag_cache_hits")),
+        "live_flow_failure_streak": safe_int(cache.get("live_flow_failure_streak")),
+        "live_flow_last_status": safe_int(cache.get("live_flow_last_status")),
         "refresh_failed": str(cache.get("refresh_failed") or "").strip().lower() not in {"", "0", "false", "no", "off"},
     }
 
@@ -697,8 +699,27 @@ def publicvpnlist_state(values=None):
         "usable_cached_profiles": usable,
         "current_returned_candidates": current_returned_candidates,
         "metadata_only_skipped": stat_int(refresh_stats.get("metadata_only_skipped")),
+        "config_url_available": stat_int(refresh_stats.get("config_url_available")),
         "matched_existing_nodes": matched_existing_nodes,
         "profiles_downloaded": profiles_downloaded,
+        "cache_reused": stat_int(refresh_stats.get("cache_reused")),
+        "config_downloaded": stat_int(refresh_stats.get("config_downloaded")),
+        "live_check_attempted": stat_int(refresh_stats.get("live_check_attempted")),
+        "live_check_succeeded": stat_int(refresh_stats.get("live_check_succeeded")),
+        "live_check_failed": stat_int(refresh_stats.get("live_check_failed")),
+        "token_request_attempted": stat_int(refresh_stats.get("token_request_attempted")),
+        "token_generated": stat_int(refresh_stats.get("token_generated")),
+        "profile_download_attempted": stat_int(refresh_stats.get("profile_download_attempted")),
+        "profile_downloaded": stat_int(refresh_stats.get("profile_downloaded")),
+        "profile_validation_failed": stat_int(refresh_stats.get("profile_validation_failed")),
+        "live_flow_mapping_missing": stat_int(refresh_stats.get("live_flow_mapping_missing")),
+        "live_flow_attempts": stat_int(refresh_stats.get("live_flow_attempts")),
+        "live_flow_budget_exhausted": bool(refresh_stats.get("live_flow_budget_exhausted")),
+        "live_flow_deadline_exceeded": bool(refresh_stats.get("live_flow_deadline_exceeded")),
+        "live_flow_circuit_open": bool(refresh_stats.get("live_flow_circuit_open")),
+        "live_flow_backoff_skipped": stat_int(refresh_stats.get("live_flow_backoff_skipped")),
+        "live_flow_failure_streak": stat_int(api_summary.get("live_flow_failure_streak")),
+        "live_flow_last_status": stat_int(api_summary.get("live_flow_last_status")),
         "etag_cache_hits": api_summary.get("etag_cache_hits", 0),
         "cache_stale": cache_stale,
         "refresh_failed": refresh_failed,
@@ -722,7 +743,9 @@ def print_publicvpnlist_status():
     print("  mode: " + state["mode"])
     if state["mode"] in ("api", "cache_fallback"):
         print("  API: " + redacted_snapshot_url(values.get("PUBLICVPNLIST_API_BASE_URL") or PUBLICVPNLIST_API_BASE_URL_DEFAULT))
-        print(f"  network records fetched: {state['network_records_fetched']}；cached records considered: {state['cached_records_considered']}；cached records reused: {state['cached_records_reused']}；metadata records returned: {state['metadata_records_returned']}；connectable candidates: {state['connectable_candidates']}；usable cached profiles: {state['usable_cached_profiles']}；current returned candidates: {state['current_returned_candidates']}；metadata-only skipped: {state['metadata_only_skipped']}；matched existing nodes: {state['matched_existing_nodes']}；profiles downloaded: {state['profiles_downloaded']}；dataset: {state['dataset_version'] or 'unknown'}；last API update: {state['last_success_at'] or 'never'}")
+        print(f"  network records fetched: {state['network_records_fetched']}；cached records considered: {state['cached_records_considered']}；cached records reused: {state['cached_records_reused']}；metadata records returned: {state['metadata_records_returned']}；connectable candidates: {state['connectable_candidates']}；usable cached profiles: {state['usable_cached_profiles']}；current returned candidates: {state['current_returned_candidates']}；metadata-only skipped: {state['metadata_only_skipped']}；config URL available: {state['config_url_available']}；matched existing nodes: {state['matched_existing_nodes']}；profiles downloaded: {state['profiles_downloaded']}；dataset: {state['dataset_version'] or 'unknown'}；last API update: {state['last_success_at'] or 'never'}")
+        print(f"  live check: attempted={state['live_check_attempted']} succeeded={state['live_check_succeeded']} failed={state['live_check_failed']}；token: attempted={state['token_request_attempted']} generated={state['token_generated']}；profile download: attempted={state['profile_download_attempted']} downloaded={state['profile_downloaded']} validation_failed={state['profile_validation_failed']}")
+        print(f"  live flow: mapping_missing={state['live_flow_mapping_missing']} attempts={state['live_flow_attempts']} budget_exhausted={str(state['live_flow_budget_exhausted']).lower()} deadline_exceeded={str(state['live_flow_deadline_exceeded']).lower()} circuit_open={str(state['live_flow_circuit_open']).lower()} backoff_skipped={state['live_flow_backoff_skipped']} persisted_failure_streak={state['live_flow_failure_streak']} last_status={state['live_flow_last_status']}")
         print(f"  API status: {state['api_status'] or 'not requested'}；etag_cache_hits={state['etag_cache_hits']}；rate_limited={str(state['rate_limited']).lower()}；backoff={state['backoff_seconds']}s")
     print("  快照 URL: " + redacted_snapshot_url(values.get("PUBLICVPNLIST_SNAPSHOT_URL")))
     print("  本地快照文件: " + ("已设置" if values.get("PUBLICVPNLIST_SNAPSHOT_FILE") else "未设置"))

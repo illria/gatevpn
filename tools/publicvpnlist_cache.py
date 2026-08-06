@@ -6,6 +6,7 @@ This module deliberately has no network, service, proxy, or thread side effects.
 from __future__ import annotations
 
 import math
+import os
 import re
 import time
 from pathlib import Path
@@ -19,14 +20,17 @@ DEFAULT_STALE_PROFILE_SECONDS = 7 * 24 * 3600
 def resolve_vpngate_data_dir(raw_value: Any, install_dir: Any) -> Path:
     """Resolve the data directory with one rule for the manager and ``en``."""
 
-    install_path = Path(install_dir).expanduser().resolve()
+    # Use lexical absolute normalization rather than resolving system
+    # symlinks: on macOS /var is /private/var, while the configured absolute
+    # path must remain the path the administrator supplied.
+    install_path = Path(os.path.abspath(os.path.expanduser(str(install_dir))))
     raw = str(raw_value or "").strip()
     if not raw:
-        return (install_path / "vpngate_data").resolve()
+        return Path(os.path.abspath(str(install_path / "vpngate_data")))
     path = Path(raw).expanduser()
     if not path.is_absolute():
         path = install_path / path
-    return path.resolve()
+    return Path(os.path.abspath(str(path)))
 
 
 def stale_profile_seconds(value: Any, default: int = DEFAULT_STALE_PROFILE_SECONDS) -> int:

@@ -132,7 +132,7 @@ class PublicVPNListSourceTests(unittest.TestCase):
             if row.get("download_page_url"):
                 pages[row["download_page_url"]] = b"<html><body>server page</body></html>"
 
-        def fixture_http_get(url, timeout=15, max_bytes=None, accept=None, opener=None, metadata=None):
+        def fixture_http_get(url, timeout=15, max_bytes=None, accept=None, opener=None, metadata=None, **_kwargs):
             if http_get is not None:
                 return http_get(
                     url,
@@ -925,7 +925,10 @@ class PublicVPNListSourceTests(unittest.TestCase):
         ) as config_builder, mock.patch.object(vpngate_manager, "log_to_json") as log_mock:
             result = vpngate_manager.fetch_publicvpnlist_candidates(["PH"], set())
         self.assertEqual(result, [])
-        config_builder.assert_called_once_with(row["temporary_ovpn_url"])
+        config_builder.assert_called_once_with(
+            row["temporary_ovpn_url"],
+            metadata=mock.ANY,
+        )
         messages = " ".join(str(call.args[2]) for call in log_mock.call_args_list if len(call.args) >= 3)
         self.assertIn("temporary_ovpn_url", messages)
         self.assertIn("重新生成", messages)
@@ -1081,6 +1084,21 @@ class PublicVPNListSourceTests(unittest.TestCase):
         self.assertEqual(remotes, [{"host": row["host"], "port": row["port"], "proto": ""}])
         self.assertEqual(proto, "tcp")
         self.assertNotIn("remote-random", node["config_text"])
+
+    def test_same_host_alternate_ports_are_reduced_to_selected_endpoint(self):
+        row = self.row("alternate-ports", "PH", "198.51.100.62", port=80, proto="tcp")
+        config = (
+            "client\nproto tcp\n"
+            "remote 198.51.100.62 80\n"
+            "remote 198.51.100.62 1194\n"
+            "remote 198.51.100.62 53 tcp-client\n"
+            "<ca>\nCERT\n</ca>\n"
+        )
+        node = vpngate_manager.publicvpnlist_row_to_node(row, config)
+        self.assertIsNotNone(node)
+        remotes, proto = vpngate_manager.parse_publicvpnlist_openvpn_remotes(node["config_text"])
+        self.assertEqual(remotes, [{"host": "198.51.100.62", "port": 80, "proto": ""}])
+        self.assertEqual(proto, "tcp")
 
     def test_per_remote_proto_conflicting_with_global_proto_is_rejected(self):
         row = self.row("proto-conflict", "PH", "198.51.100.62", port=443, proto="tcp")

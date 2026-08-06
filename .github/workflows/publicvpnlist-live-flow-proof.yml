@@ -1,0 +1,61 @@
+name: PublicVPNList live profile smoke
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - feat/publicvpnlist-live-download
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  real-live-profile:
+    name: Real PublicVPNList profile smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: API to validated profile without OpenVPN
+        shell: bash
+        run: |
+          mkdir -p artifacts/logs
+          set +e
+          python3 tools/publicvpnlist-smoke.py             --api             --countries PH,FR             --max-profiles 3             --timeout 60             --redact             --download             --json-report artifacts/logs/publicvpnlist-live-smoke.json             > artifacts/logs/publicvpnlist-live-smoke.log 2>&1
+          smoke_status=$?
+          cat artifacts/logs/publicvpnlist-live-smoke.json || true
+          tail -n 20 artifacts/logs/publicvpnlist-live-smoke.log || true
+          python3 - artifacts/logs/publicvpnlist-live-smoke.json <<'PY'
+          import json
+          import sys
+
+          report = json.loads(open(sys.argv[1], encoding="utf-8").read())
+          required = ("profiles_downloaded", "profiles_validated", "connectable_candidates")
+          missing = [name for name in required if int(report.get(name) or 0) < 1]
+          if missing:
+              raise SystemExit("live profile smoke missing: " + ", ".join(missing))
+          print("profiles_downloaded=" + str(report["profiles_downloaded"]))
+          print("profiles_validated=" + str(report["profiles_validated"]))
+          print("connectable_candidates=" + str(report["connectable_candidates"]))
+          print("openvpn_started=" + str(report.get("openvpn") == "started"))
+          PY
+          test "$smoke_status" -eq 0
+
+      - name: Upload redacted live smoke report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: publicvpnlist-live-profile-smoke
+          path: artifacts/logs
+          if-no-files-found: error
+          retention-days: 14

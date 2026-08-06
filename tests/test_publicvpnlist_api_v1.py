@@ -1,4 +1,5 @@
 import io
+import hashlib
 import json
 import tempfile
 import time
@@ -118,6 +119,18 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
         with mock.patch.object(vpngate_manager, "PUBLICVPNLIST_ENABLED", False):
             self.assertEqual(vpngate_manager.publicvpnlist_source(), ("", ""))
             self.assertNotIn("publicvpnlist", vpngate_manager.get_node_sources())
+
+    def test_api_candidate_selection_ranks_quality_and_interleaves_countries(self):
+        ph_low = self.record("ph-low", country="PH", with_config=False)
+        ph_low.update({"technical_quality_score": 20, "speed_mbps": 5, "latency_ms": 120})
+        ph_high = self.record("ph-high", country="PH", with_config=False)
+        ph_high.update({"technical_quality_score": 99, "speed_mbps": 80, "latency_ms": 10})
+        fr = self.record("fr-best", country="FR", with_config=False)
+        fr.update({"technical_quality_score": 80, "speed_mbps": 40, "latency_ms": 20})
+
+        ordered = vpngate_manager.publicvpnlist_order_api_candidate_records([ph_low, ph_high, fr])
+
+        self.assertEqual([row["id"] for row in ordered], ["ph-high", "fr-best", "ph-low"])
 
     def test_api_fetches_each_country_with_bounded_query_and_maps_known_fields(self):
         calls = []
@@ -1558,15 +1571,507 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
         )
         sleep.assert_not_called()
 
-    def test_metadata_only_record_is_not_treated_as_connectable(self):
+    def test_metadata_without_public_id_is_not_treated_as_connectable(self):
         row = self.record(with_config=False)
+        row["id"] = ""
         with mock.patch.object(
             vpngate_manager, "fetch_publicvpnlist_snapshot", return_value={"data": [row]}
         ), mock.patch.object(
             vpngate_manager, "fetch_publicvpnlist_config", side_effect=AssertionError("metadata-only must not download")
+        ), mock.patch.object(
+            vpngate_manager, "fetch_publicvpnlist_official_config", side_effect=AssertionError("missing id must not run live check")
         ), mock.patch.object(vpngate_manager, "log_to_json"):
             result = vpngate_manager.fetch_publicvpnlist_candidates(["PH"], set())
         self.assertEqual(result, [])
+
+    def test_public_id_is_not_sent_to_private_flow_without_verified_web_mapping(self):
+        row = self.record("pvl_0123456789abcdef0123456789", with_config=False)
+        metadata = {}
+        with mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_http_get",
+            side_effect=AssertionError("private flow must not run without web ID mapping"),
+        ):
+            with self.assertRaises(vpngate_manager.PublicVPNListSnapshotError):
+                vpngate_manager.fetch_publicvpnlist_official_config(row, metadata=metadata)
+        self.assertTrue(metadata["live_flow_mapping_missing"])
+
+    def test_official_server_page_numeric_id_is_explicitly_mapped(self):
+        row = self.record("pvl_0123456789abcdef0123456789", with_config=False)
+        row["server_page_url"] = "https://publicvpnlist.com/server/111206/"
+        normalized = vpngate_manager.normalize_publicvpnlist_row(row)
+        self.assertEqual(vpngate_manager.publicvpnlist_web_download_id(row), "111206")
+        self.assertEqual(normalized["web_download_id"], "111206")
+
+    def test_api_metadata_runs_official_live_check_token_and_profile_download(self):
+        row = self.record("live-ph", with_config=False)
+        row["web_download_id"] = "111206"
+        row["config_sha256"] = ""
+        calls = []
+        config = (
+            "client\nproto tcp\nremote live-ph.fixture.invalid 443\n"
+            "<ca>\nCERT\n</ca>\n"
+        )
+
+        def http_get(url, metadata=None, accept=None, extra_headers=None, data=None, method=None, **_kwargs):
+            parsed = urlsplit(url)
+            calls.append(
+                {
+                    "url": url,
+                    "path": parsed.path,
+                    "query": parse_qs(parsed.query),
+                    "accept": accept,
+                    "headers": dict(extra_headers or {}),
+                    "data": data,
+                    "method": method,
+                }
+            )
+            if parsed.path.startswith("/download/"):
+                metadata.update({"status": 200, "content_type": "text/html"})
+                return b"<html><body>fixture download page</body></html>"
+            if parsed.path == "/test_server.php":
+                metadata.update({"status": 200, "content_type": "application/json"})
+                return json.dumps({"ok": True, "status": "ok"}).encode()
+            if parsed.path == "/get_token.php":
+                metadata.update({"status": 200, "content_type": "text/html"})
+                return json.dumps({"ok": True, "token": "fixture-one-time-token"}).encode()
+            if parsed.path == "/download.php":
+                metadata.update({"status": 200, "content_type": "application/x-openvpn-profile"})
+                return config.encode()
+            raise AssertionError(f"unexpected PublicVPNList URL path: {parsed.path}")
+
+        with mock.patch.object(
+            vpngate_manager, "fetch_publicvpnlist_snapshot", return_value={"data": [row]}
+        ), mock.patch.object(
+            vpngate_manager, "publicvpnlist_download_host_addresses", return_value=("93.184.216.34",)
+        ), mock.patch.object(
+            vpngate_manager, "publicvpnlist_http_get", side_effect=http_get
+        ), mock.patch.object(vpngate_manager, "log_to_json"):
+            result = vpngate_manager.fetch_publicvpnlist_candidates(["PH"], set())
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual([call["path"] for call in calls], ["/download/111206/", "/test_server.php", "/get_token.php", "/download.php"])
+        self.assertEqual(calls[1]["query"]["id"], ["111206"])
+        self.assertEqual(calls[1]["accept"], "application/json")
+        self.assertEqual(calls[1]["headers"]["X-Requested-With"], "XMLHttpRequest")
+        self.assertEqual(calls[2]["method"], "POST")
+        self.assertEqual(calls[2]["data"], b"id=111206")
+        self.assertEqual(calls[2]["headers"]["Content-Type"], "application/x-www-form-urlencoded;charset=UTF-8")
+        self.assertEqual(calls[3]["accept"], "application/x-openvpn-profile,text/plain")
+        cache_text = self.profile_cache_file.read_text(encoding="utf-8")
+        self.assertNotIn("fixture-one-time-token", cache_text)
+        self.assertNotIn("download.php", cache_text)
+        stats = vpngate_manager.load_publicvpnlist_cache()["last_refresh_stats"]
+        self.assertEqual(stats["live_check_attempted"], 1)
+        self.assertEqual(stats["live_check_succeeded"], 1)
+        self.assertEqual(stats["token_generated"], 1)
+
+    def test_live_check_failure_is_fail_closed_without_token_request(self):
+        row = self.record("live-failed", with_config=False)
+        row["web_download_id"] = "111207"
+        calls = []
+
+        def http_get(url, metadata=None, **_kwargs):
+            path = urlsplit(url).path
+            calls.append(path)
+            if path.startswith("/download/"):
+                metadata.update({"status": 200, "content_type": "text/html"})
+                return b"<html><body>fixture download page</body></html>"
+            metadata.update({"status": 200, "content_type": "application/json"})
+            return json.dumps({"ok": False, "status": "fail"}).encode()
+
+        with mock.patch.object(
+            vpngate_manager, "fetch_publicvpnlist_snapshot", return_value={"data": [row]}
+        ), mock.patch.object(
+            vpngate_manager, "publicvpnlist_download_host_addresses", return_value=("93.184.216.34",)
+        ), mock.patch.object(
+            vpngate_manager, "publicvpnlist_http_get", side_effect=http_get
+        ), mock.patch.object(vpngate_manager, "log_to_json"):
+            result = vpngate_manager.fetch_publicvpnlist_candidates(["PH"], set())
+
+        self.assertEqual(result, [])
+        self.assertEqual(calls, ["/download/111207/", "/test_server.php"])
+        stats = vpngate_manager.load_publicvpnlist_cache()["last_refresh_stats"]
+        self.assertEqual(stats["live_check_attempted"], 1)
+        self.assertEqual(stats["live_check_succeeded"], 0)
+        self.assertEqual(stats["token_generated"], 0)
+
+    def test_cached_profile_is_reused_only_while_fresh_and_metadata_matches(self):
+        raw_row = self.record("reuse-profile", with_config=False)
+        raw_row["web_download_id"] = "111230"
+        raw_row["config_sha256"] = ""
+        row = vpngate_manager.normalize_publicvpnlist_row(raw_row)
+        config = (
+            "client\nproto tcp\nremote reuse-profile.fixture.invalid 443\n"
+            "<ca>\nCERT\n</ca>\n"
+        )
+        now = time.time()
+        cache = vpngate_manager.publicvpnlist_cache_default(
+            vpngate_manager.publicvpnlist_source_hash()
+        )
+        fresh_profile = vpngate_manager.publicvpnlist_cache_profile(
+            row,
+            config,
+            now=now - 10,
+            config_validated_at=now - 10,
+        )
+        key = vpngate_manager.publicvpnlist_profile_key(row)
+        cache["profiles"] = {key: fresh_profile}
+        cache["profile_order"] = [key]
+
+        with mock.patch.object(vpngate_manager, "publicvpnlist_refresh_needed", return_value=True), mock.patch.object(
+            vpngate_manager,
+            "fetch_publicvpnlist_snapshot",
+            return_value={"data": [raw_row]},
+        ), mock.patch.object(
+            vpngate_manager,
+            "fetch_publicvpnlist_official_config",
+            side_effect=AssertionError("fresh profile must be reused"),
+        ):
+            refreshed = vpngate_manager.refresh_publicvpnlist_cache(cache=cache)
+
+        self.assertEqual(refreshed["profiles"][key]["config_validated_at"], now - 10)
+
+        stale_cache = vpngate_manager.publicvpnlist_cache_default(
+            vpngate_manager.publicvpnlist_source_hash()
+        )
+        stale_profile = vpngate_manager.publicvpnlist_cache_profile(
+            row,
+            config,
+            now=now - vpngate_manager.PUBLICVPNLIST_STALE_PROFILE_SECONDS - 10,
+            config_validated_at=now - vpngate_manager.PUBLICVPNLIST_STALE_PROFILE_SECONDS - 10,
+        )
+        stale_cache["profiles"] = {key: stale_profile}
+        stale_cache["profile_order"] = [key]
+        with mock.patch.object(vpngate_manager, "publicvpnlist_refresh_needed", return_value=True), mock.patch.object(
+            vpngate_manager,
+            "fetch_publicvpnlist_snapshot",
+            return_value={"data": [raw_row]},
+        ), mock.patch.object(
+            vpngate_manager,
+            "fetch_publicvpnlist_official_config",
+            return_value=config,
+        ) as live_flow:
+            refreshed_stale = vpngate_manager.refresh_publicvpnlist_cache(cache=stale_cache)
+
+        live_flow.assert_called_once()
+        self.assertGreater(
+            refreshed_stale["profiles"][key]["config_validated_at"],
+            stale_profile["config_validated_at"],
+        )
+
+    def test_expired_cached_profile_is_not_returned_without_a_new_validation(self):
+        raw_row = self.record("expired-profile", with_config=False)
+        row = vpngate_manager.normalize_publicvpnlist_row(raw_row)
+        config = (
+            "client\nproto tcp\nremote expired-profile.fixture.invalid 443\n"
+            "<ca>\nCERT\n</ca>\n"
+        )
+        old = time.time() - vpngate_manager.PUBLICVPNLIST_STALE_PROFILE_SECONDS - 10
+        profile = vpngate_manager.publicvpnlist_cache_profile(
+            row,
+            config,
+            now=old,
+            config_validated_at=old,
+        )
+        key = vpngate_manager.publicvpnlist_profile_key(row)
+        cache = vpngate_manager.publicvpnlist_cache_default(
+            vpngate_manager.publicvpnlist_source_hash()
+        )
+        cache["profiles"] = {key: profile}
+        cache["profile_order"] = [key]
+        vpngate_manager.save_publicvpnlist_cache(cache)
+
+        with mock.patch.object(vpngate_manager, "publicvpnlist_refresh_needed", return_value=False), mock.patch.object(
+            vpngate_manager,
+            "fetch_publicvpnlist_snapshot",
+            side_effect=AssertionError("stale cache candidate must not trigger an unrelated fetch"),
+        ):
+            result = vpngate_manager.fetch_publicvpnlist_candidates(["PH"], set())
+
+        self.assertEqual(result, [])
+
+    def test_profile_metadata_change_forces_a_new_live_download(self):
+        raw_row = self.record("metadata-changed", with_config=False)
+        raw_row["web_download_id"] = "111231"
+        raw_row.update({"config_sha256": "", "config_updated_at": "v1"})
+        row = vpngate_manager.normalize_publicvpnlist_row(raw_row)
+        config = (
+            "client\nproto tcp\nremote metadata-changed.fixture.invalid 443\n"
+            "<ca>\nCERT\n</ca>\n"
+        )
+        now = time.time()
+        profile = vpngate_manager.publicvpnlist_cache_profile(
+            row,
+            config,
+            now=now,
+            config_validated_at=now,
+        )
+        key = vpngate_manager.publicvpnlist_profile_key(row)
+        cache = vpngate_manager.publicvpnlist_cache_default(
+            vpngate_manager.publicvpnlist_source_hash()
+        )
+        cache["profiles"] = {key: profile}
+        cache["profile_order"] = [key]
+        changed_row = dict(raw_row)
+        changed_row["config_updated_at"] = "v2"
+        changed_row["config_sha256"] = hashlib.sha256(config.encode("utf-8")).hexdigest()
+
+        with mock.patch.object(vpngate_manager, "publicvpnlist_refresh_needed", return_value=True), mock.patch.object(
+            vpngate_manager,
+            "fetch_publicvpnlist_snapshot",
+            return_value={"data": [changed_row]},
+        ), mock.patch.object(
+            vpngate_manager,
+            "fetch_publicvpnlist_official_config",
+            return_value=config,
+        ) as live_flow:
+            refreshed = vpngate_manager.refresh_publicvpnlist_cache(cache=cache)
+
+        live_flow.assert_called_once()
+        self.assertEqual(refreshed["profiles"][key]["config_updated_at"], "v2")
+
+    def test_official_flow_does_not_retry_a_one_time_download_token(self):
+        row = self.record("one-time-failure", with_config=False)
+        row["web_download_id"] = "111208"
+        calls = []
+
+        def http_get(url, metadata=None, **_kwargs):
+            path = urlsplit(url).path
+            calls.append(path)
+            if path.startswith("/download/"):
+                metadata.update({"status": 200, "content_type": "text/html"})
+                return b"<html><body>fixture download page</body></html>"
+            if path == "/test_server.php":
+                metadata.update({"status": 200, "content_type": "application/json"})
+                return json.dumps({"ok": True, "status": "ok"}).encode()
+            if path == "/get_token.php":
+                metadata.update({"status": 200, "content_type": "application/json"})
+                return json.dumps({"ok": True, "token": "one-time-fixture"}).encode()
+            raise urllib.error.URLError("download failed")
+
+        with mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_download_host_addresses",
+            return_value=("93.184.216.34",),
+        ), mock.patch.object(
+            vpngate_manager,
+            "PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS",
+            frozenset({"download.fixture.invalid"}),
+        ), mock.patch.object(vpngate_manager, "publicvpnlist_http_get", side_effect=http_get):
+            with self.assertRaises(vpngate_manager.PublicVPNListSnapshotError):
+                vpngate_manager.fetch_publicvpnlist_official_config(row, metadata={})
+
+        self.assertEqual(calls, ["/download/111208/", "/test_server.php", "/get_token.php", "/download.php"])
+
+    def test_live_flow_budget_and_circuit_breaker_stop_additional_profiles(self):
+        rows = [self.record(f"budget-{index}", with_config=False) for index in range(4)]
+        for index, row in enumerate(rows):
+            row["web_download_id"] = str(111210 + index)
+        with mock.patch.object(
+            vpngate_manager,
+            "fetch_publicvpnlist_snapshot",
+            return_value={"data": rows},
+        ), mock.patch.object(
+            vpngate_manager,
+            "fetch_publicvpnlist_official_config",
+            side_effect=vpngate_manager.PublicVPNListSnapshotError("live flow unavailable"),
+        ) as live_flow, mock.patch.object(
+            vpngate_manager,
+            "PUBLICVPNLIST_LIVE_FLOW_MAX_ATTEMPTS",
+            2,
+        ), mock.patch.object(
+            vpngate_manager,
+            "PUBLICVPNLIST_LIVE_FLOW_MAX_FAILURES",
+            99,
+        ), mock.patch.object(vpngate_manager, "PUBLICVPNLIST_LIVE_FLOW_DELAY_SECONDS", 0):
+            vpngate_manager.refresh_publicvpnlist_cache()
+
+        self.assertEqual(live_flow.call_count, 2)
+        stats = vpngate_manager.load_publicvpnlist_cache()["last_refresh_stats"]
+        self.assertEqual(stats["live_flow_attempts"], 2)
+        self.assertTrue(stats["live_flow_budget_exhausted"])
+
+    def test_downloaded_but_invalid_profile_counts_validation_failure_and_keeps_streak(self):
+        row = self.record("validation-after-download", with_config=False)
+        row["web_download_id"] = "111240"
+        config = (
+            "client\nproto tcp\nremote another-endpoint.fixture.invalid 443\n"
+            "<ca>\nCERT\n</ca>\n"
+        )
+
+        def fake_live_flow(_row, metadata=None, **_kwargs):
+            metadata.update(
+                {
+                    "official_flow": True,
+                    "live_check_succeeded": True,
+                    "token_request_attempted": 1,
+                    "token_generated": True,
+                    "profile_download_attempted": 1,
+                    "profile_downloaded": 1,
+                    "response_sha256": hashlib.sha256(config.encode()).hexdigest(),
+                }
+            )
+            return config
+
+        with mock.patch.object(
+            vpngate_manager,
+            "fetch_publicvpnlist_snapshot",
+            return_value={"data": [row]},
+        ), mock.patch.object(
+            vpngate_manager,
+            "fetch_publicvpnlist_official_config",
+            side_effect=fake_live_flow,
+        ), mock.patch.object(vpngate_manager, "log_to_json"):
+            result = vpngate_manager.fetch_publicvpnlist_candidates(["PH"], set())
+
+        self.assertEqual(result, [])
+        stats = vpngate_manager.load_publicvpnlist_cache()["last_refresh_stats"]
+        self.assertEqual(stats["profile_downloaded"], 1)
+        self.assertEqual(stats["profile_validation_failed"], 1)
+        self.assertEqual(vpngate_manager.load_publicvpnlist_api_cache()["live_flow_failure_streak"], 1)
+
+    def test_persisted_live_flow_failure_streak_opens_circuit_on_next_refresh(self):
+        api_cache = vpngate_manager.publicvpnlist_api_cache_default()
+        api_cache["live_flow_failure_streak"] = 2
+        vpngate_manager.save_publicvpnlist_api_cache(api_cache)
+        row = self.record("persisted-circuit", with_config=False)
+        row["web_download_id"] = "111241"
+        with mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_refresh_needed",
+            return_value=True,
+        ), mock.patch.object(
+            vpngate_manager,
+            "fetch_publicvpnlist_snapshot",
+            return_value={"data": [row]},
+        ), mock.patch.object(
+            vpngate_manager,
+            "fetch_publicvpnlist_official_config",
+            side_effect=AssertionError("persisted circuit must stop before the next live flow"),
+        ), mock.patch.object(
+            vpngate_manager,
+            "PUBLICVPNLIST_LIVE_FLOW_MAX_FAILURES",
+            2,
+        ):
+            vpngate_manager.refresh_publicvpnlist_cache()
+
+        stats = vpngate_manager.load_publicvpnlist_cache()["last_refresh_stats"]
+        self.assertEqual(stats["live_flow_attempts"], 0)
+        self.assertTrue(stats["live_flow_circuit_open"])
+
+    def test_retry_entries_for_profiles_missing_from_complete_metadata_are_pruned(self):
+        cache = vpngate_manager.publicvpnlist_api_cache_default()
+        old_row = vpngate_manager.normalize_publicvpnlist_row(self.record("gone-retry", with_config=False))
+        current_row = vpngate_manager.normalize_publicvpnlist_row(self.record("current-retry", with_config=False))
+        now = time.time()
+        vpngate_manager.publicvpnlist_api_record_profile_retry(cache, old_row, now=now)
+        vpngate_manager.publicvpnlist_api_record_profile_retry(cache, current_row, now=now)
+        changed = vpngate_manager.publicvpnlist_api_prune_profile_retries(
+            cache,
+            [self.record("current-retry", with_config=False)],
+            now=now + 1,
+        )
+        self.assertTrue(changed)
+        self.assertEqual(
+            [entry["public_id"] for entry in cache["profile_retry_entries"]],
+            ["current-retry"],
+        )
+
+    def test_live_flow_deadline_stops_before_private_flow(self):
+        row = self.record("deadline", with_config=False)
+        row["web_download_id"] = "111242"
+        with mock.patch.object(
+            vpngate_manager,
+            "fetch_publicvpnlist_snapshot",
+            return_value={"data": [row]},
+        ), mock.patch.object(
+            vpngate_manager,
+            "fetch_publicvpnlist_official_config",
+            side_effect=AssertionError("deadline must stop before live flow"),
+        ), mock.patch.object(
+            vpngate_manager,
+            "PUBLICVPNLIST_LIVE_FLOW_MAX_SECONDS",
+            0.5,
+        ), mock.patch.object(
+            vpngate_manager.time,
+            "monotonic",
+            side_effect=[100.0, 101.0],
+        ):
+            vpngate_manager.refresh_publicvpnlist_cache()
+
+        stats = vpngate_manager.load_publicvpnlist_cache()["last_refresh_stats"]
+        self.assertTrue(stats["live_flow_deadline_exceeded"])
+        self.assertTrue(stats["live_flow_budget_exhausted"])
+
+    def test_live_flow_429_persists_bounded_retry_after_and_global_backoff(self):
+        row = self.record("live-429", with_config=False)
+        row["web_download_id"] = "111220"
+        row["config_sha256"] = ""
+        headers = Message()
+        headers["Retry-After"] = "120"
+
+        def http_get(url, **_kwargs):
+            raise urllib.error.HTTPError(
+                url,
+                429,
+                "rate limited",
+                headers,
+                io.BytesIO(),
+            )
+
+        with mock.patch.object(
+            vpngate_manager,
+            "fetch_publicvpnlist_snapshot",
+            return_value={"data": [row]},
+        ), mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_http_get",
+            side_effect=http_get,
+        ), mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_download_host_addresses",
+            return_value=("93.184.216.34",),
+        ), mock.patch.object(vpngate_manager, "PUBLICVPNLIST_LIVE_FLOW_DELAY_SECONDS", 0):
+            vpngate_manager.refresh_publicvpnlist_cache()
+
+        now = time.time()
+        api_cache = vpngate_manager.load_publicvpnlist_api_cache()
+        self.assertEqual(api_cache["live_flow_last_status"], 429)
+        self.assertGreaterEqual(api_cache["live_flow_backoff_until"], now + 118)
+        self.assertGreaterEqual(api_cache["profile_retry_entries"][0]["retry_after"], now + 118)
+
+    def test_config_hash_is_calculated_from_original_response_bytes(self):
+        body = (
+            b"client\nproto tcp\nremote raw-hash.fixture.invalid 443\n"
+            b"<ca>\nCERT\n</ca>\n\xff\n"
+        )
+
+        def http_get(_url, metadata=None, **_kwargs):
+            metadata.update({"status": 200, "content_type": "application/x-openvpn-profile"})
+            return body
+
+        metadata = {}
+        with mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_download_host_addresses",
+            return_value=("93.184.216.34",),
+        ), mock.patch.object(
+            vpngate_manager,
+            "PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS",
+            frozenset({"download.fixture.invalid"}),
+        ), mock.patch.object(vpngate_manager, "publicvpnlist_http_get", side_effect=http_get):
+            config_text = vpngate_manager.fetch_publicvpnlist_config(
+                "https://download.fixture.invalid/raw-hash.ovpn",
+                metadata=metadata,
+            )
+
+        self.assertIn("raw-hash.fixture.invalid", config_text)
+        self.assertEqual(metadata["response_sha256"], hashlib.sha256(body).hexdigest())
+        self.assertNotEqual(
+            metadata["response_sha256"],
+            hashlib.sha256(config_text.encode("utf-8")).hexdigest(),
+        )
 
     def test_source_url_is_direct_only_when_redistribution_is_allowed(self):
         row = self.record(with_config=False)
@@ -1766,6 +2271,180 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
         self.assertEqual(node["ping"], 31)
         self.assertEqual(node["latency_ms"], 31)
         self.assertNotIn("publicvpnlist", node["verification_sources"])
+
+
+    def test_direct_temporary_profile_url_is_not_retried_with_same_one_time_url(self):
+        row = self.record("direct-one-time", with_config=True)
+        calls = []
+
+        def fail_download(*_args, **_kwargs):
+            calls.append(True)
+            raise urllib.error.URLError("expired one-time link")
+
+        with mock.patch.object(
+            vpngate_manager,
+            "PUBLICVPNLIST_SNAPSHOT_URL",
+            "https://snapshot.fixture.invalid/export.json?signature=redacted",
+        ), mock.patch.object(
+            vpngate_manager,
+            "PUBLICVPNLIST_SNAPSHOT_FILE",
+            "",
+        ), mock.patch.object(
+            vpngate_manager,
+            "PUBLICVPNLIST_API_URL",
+            "",
+        ), mock.patch.object(
+            vpngate_manager,
+            "PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS",
+            frozenset({"download.fixture.invalid"}),
+        ), mock.patch.object(
+            vpngate_manager,
+            "fetch_publicvpnlist_snapshot",
+            return_value={"data": [row]},
+        ), mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_download_host_addresses",
+            return_value=("93.184.216.34",),
+        ), mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_http_get",
+            side_effect=fail_download,
+        ), mock.patch.object(vpngate_manager, "log_to_json"):
+            vpngate_manager.refresh_publicvpnlist_cache()
+
+        self.assertEqual(len(calls), 1)
+        stats = vpngate_manager.load_publicvpnlist_cache()["last_refresh_stats"]
+        self.assertEqual(stats["profile_download_attempted"], 1)
+        self.assertEqual(stats["config_download_failed"], 1)
+
+    def test_cache_candidate_reclassifies_us_instead_of_reusing_profile_risk(self):
+        raw_row = self.record("risk-refresh", country="US", with_config=False)
+        row = vpngate_manager.normalize_publicvpnlist_row(raw_row)
+        config = (
+            "client\nproto tcp\nremote risk-refresh.fixture.invalid 443\n"
+            "<ca>\nCERT\n</ca>\n"
+        )
+        now = time.time()
+        row.update(
+            {
+                "ip_type": "residential",
+                "risk_sources": ["ipwho.is"],
+                "quality": "clean_residential",
+                "risk_level": "clean",
+                "ip_clean": True,
+            }
+        )
+        key = vpngate_manager.publicvpnlist_profile_key(row)
+        cache = vpngate_manager.publicvpnlist_cache_default(
+            vpngate_manager.publicvpnlist_source_hash()
+        )
+        cache["profiles"] = {
+            key: vpngate_manager.publicvpnlist_cache_profile(
+                row,
+                config,
+                now=now,
+                config_validated_at=now,
+            )
+        }
+        cache["profile_order"] = [key]
+        vpngate_manager.save_publicvpnlist_cache(cache)
+
+        def classify_as_hosting(batch):
+            for item in batch:
+                item.update(vpngate_manager.publicvpnlist_classification_defaults())
+                item.update(
+                    {
+                        "ip_type": "hosting",
+                        "risk_sources": ["ipwho.is"],
+                        "quality": "datacenter",
+                        "risk_level": "high",
+                        "ip_clean": False,
+                    }
+                )
+
+        with mock.patch.object(
+            vpngate_manager.vpn_utils,
+            "enrich_ip_info",
+            side_effect=classify_as_hosting,
+        ) as enrich, mock.patch.object(vpngate_manager, "log_to_json"):
+            result = vpngate_manager.fetch_publicvpnlist_candidates(
+                ["US"],
+                set(),
+                allow_network=False,
+            )
+
+        self.assertEqual(result, [])
+        enrich.assert_called_once()
+        refreshed_profile = vpngate_manager.load_publicvpnlist_cache()["profiles"][key]
+        self.assertEqual(refreshed_profile["ip_type"], "hosting")
+        self.assertEqual(refreshed_profile["risk_sources"], ["ipwho.is"])
+
+
+    def test_official_metadata_export_maps_api_endpoint_to_web_id(self):
+        api_row = self.record("ph-map", country="PH", with_config=False)
+        export_row = dict(api_row)
+        export_row["server_page_url"] = (
+            "https://publicvpnlist.com/download/1448228/"
+        )
+        export_payload = json.dumps({"records": [export_row]}).encode("utf-8")
+        metadata = {}
+        with mock.patch.object(
+            vpngate_manager,
+            "PUBLICVPNLIST_API_BASE_URL",
+            "https://publicvpnlist.com/api/v1",
+        ), mock.patch.object(
+            vpngate_manager,
+            "PUBLICVPNLIST_API_URL",
+            "https://publicvpnlist.com/api/v1/servers",
+        ), mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_validate_download_url",
+            return_value="publicvpnlist.com",
+        ), mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_http_get",
+            return_value=export_payload,
+        ) as http_get:
+            mapped = vpngate_manager.publicvpnlist_attach_official_web_ids(
+                [api_row],
+                metadata,
+            )
+
+        self.assertEqual(mapped[0]["web_download_id"], "1448228")
+        self.assertEqual(metadata["metadata_export_matches"], 1)
+        http_get.assert_called_once()
+
+    def test_persisted_live_flow_backoff_skips_new_official_flow(self):
+        api_cache = vpngate_manager.publicvpnlist_api_cache_default()
+        api_cache.update(
+            {
+                "live_flow_failure_streak": 1,
+                "live_flow_backoff_until": time.time() + 120,
+            }
+        )
+        vpngate_manager.save_publicvpnlist_api_cache(api_cache)
+        row = self.record("global-backoff", with_config=False)
+        row["web_download_id"] = "111299"
+
+        with mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_refresh_needed",
+            return_value=True,
+        ), mock.patch.object(
+            vpngate_manager,
+            "fetch_publicvpnlist_snapshot",
+            return_value={"data": [row]},
+        ), mock.patch.object(
+            vpngate_manager,
+            "fetch_publicvpnlist_official_config",
+            side_effect=AssertionError("global live-flow backoff must stop the request"),
+        ), mock.patch.object(vpngate_manager, "log_to_json"):
+            vpngate_manager.refresh_publicvpnlist_cache()
+
+        stats = vpngate_manager.load_publicvpnlist_cache()["last_refresh_stats"]
+        self.assertEqual(stats["live_flow_attempts"], 0)
+        self.assertEqual(stats["live_flow_backoff_skipped"], 1)
+        self.assertTrue(stats["live_flow_circuit_open"])
 
 
 if __name__ == "__main__":
