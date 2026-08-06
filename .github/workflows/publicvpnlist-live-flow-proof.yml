@@ -69,6 +69,17 @@ jobs:
           optional_degraded = coverage["optional_degraded_countries"]
           validated_country_count = coverage["validated_country_count"]
           required_validated_country_count = coverage["required_validated_country_count"]
+          unvalidated_details = {
+              country: {
+                  "eligible": int(eligible.get(country) or 0),
+                  "attempts": int(attempts.get(country) or 0),
+                  "downloaded": int(downloaded.get(country) or 0),
+                  "validated": int(validated.get(country) or 0),
+                  "skipped": skipped.get(country) or {},
+                  "failed": failed.get(country) or {},
+              }
+              for country in unvalidated_countries
+          }
 
           print("profiles_downloaded=" + str(report.get("profiles_downloaded", 0)))
           print("profiles_validated=" + str(report.get("profiles_validated", 0)))
@@ -102,6 +113,8 @@ jobs:
                   "live profile smoke coverage incomplete: "
                   + "; ".join(coverage_errors)
               )
+          PY
+          coverage_status=$?
           test "$smoke_status" -eq 0
           test "$coverage_status" -eq 0
 
