@@ -779,6 +779,39 @@ class PublicVPNListSourceTests(unittest.TestCase):
         self.assertEqual([node["country_short"] for node in result], ["PH"])
         self.assertNotIn(us["ip"], {node["ip"] for node in result})
 
+    def test_validated_profiles_are_merged_into_nodes_after_api_refresh(self):
+        row = self.row("background-merge", "PH", "198.51.100.58")
+        first, _ = self.fetch_rows([row], target=["PH"])
+        self.assertEqual(len(first), 1)
+
+        nodes_file = Path(self.temp_dir.name) / "nodes.json"
+        existing = [self.candidate("vpngate_scraper", "198.51.100.59")]
+        with mock.patch.object(vpngate_manager, "NODES_FILE", nodes_file), mock.patch.object(
+            vpngate_manager, "PUBLICVPNLIST_SNAPSHOT_URL", ""
+        ), mock.patch.object(
+            vpngate_manager,
+            "PUBLICVPNLIST_API_URL",
+            "https://publicvpnlist.com/api/v1/servers",
+        ), mock.patch.object(
+            vpngate_manager,
+            "fetch_publicvpnlist_snapshot",
+            side_effect=AssertionError("cache merge must not refresh the API"),
+        ), mock.patch.object(
+            vpngate_manager,
+            "fetch_publicvpnlist_config",
+            side_effect=AssertionError("cache merge must not download a profile"),
+        ):
+            vpngate_manager.write_json(nodes_file, existing)
+            added = vpngate_manager.restore_cached_publicvpnlist_nodes()
+            merged = vpngate_manager.read_json(nodes_file, [])
+
+        self.assertEqual(added, 1)
+        self.assertEqual(
+            [node.get("source") for node in merged],
+            ["vpngate_scraper", "publicvpnlist"],
+        )
+        self.assertEqual(merged[-1]["ip"], row["ip"])
+
     def test_cached_us_risk_within_vpn_utils_ttl_does_not_query_network(self):
         row = self.row("cache-fresh-us", "US", "198.51.100.55")
         cached_profile = {

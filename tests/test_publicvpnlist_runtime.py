@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -18,6 +19,36 @@ def load_smoke_module():
 
 
 class PublicVPNListRuntimeTests(unittest.TestCase):
+    def test_background_api_refresh_reconciles_validated_profiles_into_nodes(self):
+        import vpngate_manager
+
+        refresh_started = threading.Event()
+        release_refresh = threading.Event()
+
+        def refresh_fixture(*_args, **_kwargs):
+            refresh_started.set()
+            self.assertTrue(release_refresh.wait(timeout=2))
+            return {}
+
+        with patch.object(vpngate_manager, "publicvpnlist_is_enabled", return_value=True), patch.object(
+            vpngate_manager,
+            "publicvpnlist_source",
+            return_value=("api", "https://publicvpnlist.com/api/v1/servers"),
+        ), patch.object(vpngate_manager, "load_publicvpnlist_cache", return_value={}), patch.object(
+            vpngate_manager, "refresh_publicvpnlist_cache", side_effect=refresh_fixture
+        ), patch.object(
+            vpngate_manager, "restore_cached_publicvpnlist_nodes", return_value=3
+        ) as restore, patch.object(vpngate_manager, "log_to_json"):
+            self.assertTrue(vpngate_manager.schedule_publicvpnlist_api_refresh(target_countries=["PH"]))
+            self.assertTrue(refresh_started.wait(timeout=2))
+            refresh_thread = vpngate_manager.publicvpnlist_api_refresh_thread
+            self.assertIsInstance(refresh_thread, threading.Thread)
+            release_refresh.set()
+            refresh_thread.join(timeout=2)
+            self.assertFalse(refresh_thread.is_alive())
+
+        restore.assert_called_once_with()
+
     def test_live_flow_defaults_cover_two_rounds_for_all_fixed_countries(self):
         import vpngate_manager
 
