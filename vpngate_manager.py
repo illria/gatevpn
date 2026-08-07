@@ -348,8 +348,15 @@ if (
 AUTO_SWITCH_DRAIN_SECONDS = max(0, int(os.environ.get("AUTO_SWITCH_DRAIN_SECONDS", "45")))
 # 代理健康检查保护：OpenVPN 刚建立后，tun0/策略路由/本地代理有短暂稳定期。
 # 在保护期内或连续失败次数未达到阈值时，不会把当前节点判死并强制断开，避免“已连接 -> 立即清理 -> 反复重连”。
-PROXY_FAIL_GRACE_SECONDS = int(os.environ.get("PROXY_FAIL_GRACE_SECONDS", "75"))
+# 默认保护期缩短为 30 秒，仍保留连续 3 次失败防抖，减少故障节点造成的无谓断链时间。
+PROXY_FAIL_GRACE_SECONDS = max(0, int(os.environ.get("PROXY_FAIL_GRACE_SECONDS", "30")))
 PROXY_FAIL_AUTO_SWITCH_THRESHOLD = max(1, int(os.environ.get("PROXY_FAIL_AUTO_SWITCH_THRESHOLD", "3")))
+# 代理健康检查间隔。此前固定 sleep(30) 会让连续失败累计过慢；默认 10 秒，单次检测超时仍受
+# check_proxy_health() 自身的 curl/subprocess 超时限制，避免检测线程高频占用 CPU。
+PROXY_HEALTH_CHECK_INTERVAL_SECONDS = max(
+    5,
+    int(os.environ.get("PROXY_HEALTH_CHECK_INTERVAL_SECONDS", "10")),
+)
 AUTO_SWITCH_RETRY_COOLDOWN_SECONDS = max(10, int(os.environ.get("AUTO_SWITCH_RETRY_COOLDOWN_SECONDS", "45")))
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
@@ -1563,6 +1570,7 @@ def get_state() -> dict[str, Any]:
     state.setdefault("last_auto_switch_attempt_at", 0)
     state["proxy_fail_grace_seconds"] = PROXY_FAIL_GRACE_SECONDS
     state["proxy_fail_auto_switch_threshold"] = PROXY_FAIL_AUTO_SWITCH_THRESHOLD
+    state["proxy_health_check_interval_seconds"] = PROXY_HEALTH_CHECK_INTERVAL_SECONDS
     state["auto_switch_retry_cooldown_seconds"] = AUTO_SWITCH_RETRY_COOLDOWN_SECONDS
     
     return state
@@ -11658,21 +11666,21 @@ INDEX_HTML = r"""<!doctype html>
           </div>
 
           <div class="form-group" style="margin-bottom: 12px;">
-            <label class="form-label" for="settings_auto_switch_tunnel_mode">主动切换通道模式</label>
+            <label class="form-label" for="settings_auto_switch_tunnel_mode">发现更优节点时的切换方式</label>
             <select id="settings_auto_switch_tunnel_mode" class="input-field">
-              <option value="single">单通道（默认，兼容现有流程）</option>
-              <option value="dual">双通道辅助切换（保留旧隧道排空）</option>
+              <option value="single">单通道：停旧启新</option>
+              <option value="dual">双通道：验证新节点后切换</option>
             </select>
-            <div style="font-size: 12px; color: var(--text-secondary); margin-top: 6px; line-height: 1.4;">单通道保持原有停旧启新流程；双通道用于健康连接主动优选，先验证备用隧道再切路由，失败时保留当前出口。</div>
+            <div style="font-size: 12px; color: var(--text-secondary); margin-top: 6px; line-height: 1.4;">双通道会先验证新节点，成功后再切换；两种方式互不影响故障切换设置。</div>
           </div>
 
           <div class="form-group" style="margin-bottom: 12px;">
-            <label class="form-label" for="settings_auto_failover_tunnel_mode">故障自动切换通道模式</label>
+            <label class="form-label" for="settings_auto_failover_tunnel_mode">节点故障时的切换方式</label>
             <select id="settings_auto_failover_tunnel_mode" class="input-field">
-              <option value="single">单通道（默认，停旧启新）</option>
-              <option value="dual">双通道故障切换（先验证后切换）</option>
+              <option value="single">单通道：停旧启新</option>
+              <option value="dual">双通道：验证备用后切换</option>
             </select>
-            <div style="font-size: 12px; color: var(--text-secondary); margin-top: 6px; line-height: 1.4;">双通道会在代理连续失败后先启动备用隧道并验证出口，成功后切换路由并排空旧隧道；备用隧道失败时自动回退单通道恢复。此设置独立于上面的主动优选模式。</div>
+            <div style="font-size: 12px; color: var(--text-secondary); margin-top: 6px; line-height: 1.4;">双通道会先验证备用节点，成功后再切换；失败时回退单通道恢复。</div>
           </div>
 
           <div class="form-group" style="margin-bottom: 12px;">
@@ -12846,10 +12854,10 @@ def background_proxy_checker() -> None:
     while True:
         try:
             if is_connecting:
-                time.sleep(5)
+                time.sleep(min(5, PROXY_HEALTH_CHECK_INTERVAL_SECONDS))
                 continue
             if not active_openvpn_node_id or not active_openvpn_running():
-                time.sleep(30)
+                time.sleep(PROXY_HEALTH_CHECK_INTERVAL_SECONDS)
                 continue
 
             res = check_proxy_health()
@@ -12884,7 +12892,7 @@ def background_proxy_checker() -> None:
 
                 # OpenVPN 刚连上时，代理出口可能还在稳定；连续失败达到阈值后才触发故障转移。
                 if in_grace or fail_count < PROXY_FAIL_AUTO_SWITCH_THRESHOLD:
-                    time.sleep(30)
+                    time.sleep(PROXY_HEALTH_CHECK_INTERVAL_SECONDS)
                     continue
 
                 with lock:
@@ -12899,7 +12907,7 @@ def background_proxy_checker() -> None:
         except Exception as e:
             print(f"[错误] 代理后台检测发生异常: {e}", flush=True)
             log_to_json("ERROR", "Proxy", f"检测守护线程发生异常: {e}")
-        time.sleep(30)
+        time.sleep(PROXY_HEALTH_CHECK_INTERVAL_SECONDS)
 
 def active_node_pinger() -> None:
     global active_openvpn_node_id, is_connecting
