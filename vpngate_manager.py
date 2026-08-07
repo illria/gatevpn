@@ -325,6 +325,21 @@ AUTO_SWITCH_MIN_LATENCY_DELTA_MS = int(os.environ.get("AUTO_SWITCH_MIN_LATENCY_D
 # 非中断检测：定时检测只更新节点池和风控信息；当前出口正常时，不因为发现更优节点而主动断开重连。
 # 如果想恢复“检测到更优节点就主动跳转”，可设置 AUTO_SELECT_ALLOW_ACTIVE_SWITCH=1。
 AUTO_SELECT_ALLOW_ACTIVE_SWITCH = os.environ.get("AUTO_SELECT_ALLOW_ACTIVE_SWITCH", "0").strip().lower() in {"1", "true", "yes", "on"}
+# 主动优选的隧道切换模式。默认 single，确保现有安装继续使用原来的停旧启新流程。
+# dual 只辅助“当前连接健康且发现明显更优节点”的主动切换；故障转移和手动连接仍使用单通道。
+AUTO_SWITCH_TUNNEL_MODE_ENV = os.environ.get("AUTO_SWITCH_TUNNEL_MODE")
+AUTO_SWITCH_TUNNEL_MODE = (AUTO_SWITCH_TUNNEL_MODE_ENV or "single").strip().lower()
+if AUTO_SWITCH_TUNNEL_MODE not in {"single", "dual"}:
+    AUTO_SWITCH_TUNNEL_MODE = "single"
+AUTO_SWITCH_DUAL_INTERFACE = (os.environ.get("AUTO_SWITCH_DUAL_INTERFACE") or "tun1").strip()
+if (
+    not AUTO_SWITCH_DUAL_INTERFACE
+    or len(AUTO_SWITCH_DUAL_INTERFACE) > 15
+    or not re.fullmatch(r"[A-Za-z0-9_.-]+", AUTO_SWITCH_DUAL_INTERFACE)
+    or AUTO_SWITCH_DUAL_INTERFACE == "tun0"
+):
+    AUTO_SWITCH_DUAL_INTERFACE = "tun1"
+AUTO_SWITCH_DRAIN_SECONDS = max(0, int(os.environ.get("AUTO_SWITCH_DRAIN_SECONDS", "45")))
 # 代理健康检查保护：OpenVPN 刚建立后，tun0/策略路由/本地代理有短暂稳定期。
 # 在保护期内或连续失败次数未达到阈值时，不会把当前节点判死并强制断开，避免“已连接 -> 立即清理 -> 反复重连”。
 PROXY_FAIL_GRACE_SECONDS = int(os.environ.get("PROXY_FAIL_GRACE_SECONDS", "75"))
@@ -346,6 +361,9 @@ publicvpnlist_api_refresh_thread: threading.Thread | None = None
 active_sessions: dict[str, float] = {}
 active_openvpn_process: subprocess.Popen[str] | None = None
 active_openvpn_node_id = ""
+active_openvpn_interface = "tun0"
+draining_openvpn_processes: list[dict[str, Any]] = []
+draining_openvpn_lock = threading.RLock()
 is_connecting = True
 last_active_ping_time = 0.0
 last_active_latency = 0
@@ -510,7 +528,8 @@ def load_ui_config() -> dict[str, Any]:
             "target_ip_types": TARGET_IP_TYPES_ENV or "residential",
             "auto_select_best_node": AUTO_SELECT_BEST_NODE,
             "node_sources": NODE_SOURCES_ENV or DEFAULT_NODE_SOURCES,
-            "auto_select_allow_active_switch": AUTO_SELECT_ALLOW_ACTIVE_SWITCH
+            "auto_select_allow_active_switch": AUTO_SELECT_ALLOW_ACTIVE_SWITCH,
+            "auto_switch_tunnel_mode": AUTO_SWITCH_TUNNEL_MODE,
         }
         updated = False
         if auth_file.exists():
@@ -529,6 +548,8 @@ def load_ui_config() -> dict[str, Any]:
             config["target_ip_types"] = TARGET_IP_TYPES_ENV
         if AUTO_SELECT_BEST_NODE_ENV is not None and AUTO_SELECT_BEST_NODE_ENV.strip():
             config["auto_select_best_node"] = AUTO_SELECT_BEST_NODE
+        if AUTO_SWITCH_TUNNEL_MODE_ENV is not None and AUTO_SWITCH_TUNNEL_MODE_ENV.strip():
+            config["auto_switch_tunnel_mode"] = AUTO_SWITCH_TUNNEL_MODE
         if NODE_SOURCES_ENV:
             config["node_sources"] = NODE_SOURCES_ENV
         
@@ -874,6 +895,19 @@ def get_auto_select_best_node() -> bool:
 def get_auto_select_allow_active_switch() -> bool:
     cfg = load_ui_config()
     return parse_bool_setting(cfg.get("auto_select_allow_active_switch"), AUTO_SELECT_ALLOW_ACTIVE_SWITCH)
+
+
+def get_auto_switch_tunnel_mode() -> str:
+    if AUTO_SWITCH_TUNNEL_MODE_ENV is not None and AUTO_SWITCH_TUNNEL_MODE_ENV.strip():
+        return AUTO_SWITCH_TUNNEL_MODE
+    cfg = load_ui_config()
+    mode = str(cfg.get("auto_switch_tunnel_mode") or AUTO_SWITCH_TUNNEL_MODE).strip().lower()
+    return mode if mode in {"single", "dual"} else "single"
+
+
+def auto_switch_tunnel_mode_display(mode: str | None = None) -> str:
+    value = mode or get_auto_switch_tunnel_mode()
+    return "双通道辅助切换" if value == "dual" else "单通道"
 
 def active_connection_looks_healthy(active_node: dict[str, Any] | None = None) -> bool:
     if not active_openvpn_running():
@@ -1324,6 +1358,25 @@ def optimize_active_node_after_tests(reason: str = "") -> str:
         f"自动优选：从全部已检测节点中选择 {best_node.get('id')}；"
         f"{auto_selection_key_summary(best_node)}；原因：{switch_reason}；策略：{candidate_reason}"
     )
+
+    # 双通道只用于健康连接的主动优选。故障转移、手动连接和双通道失败后的
+    # 当前连接保护仍走原有单通道流程，避免可选功能改变默认保活行为。
+    if (
+        get_auto_switch_tunnel_mode() == "dual"
+        and active_openvpn_running()
+        and active_connection_looks_healthy(active_node)
+    ):
+        dual_ok, dual_message = connect_node_dual_tunnel(
+            best_node["id"],
+            update_failover_scope=False,
+            allow_auto_risky=not clean_ok,
+        )
+        if dual_ok:
+            set_state(last_auto_select_message=msg, last_check_message=dual_message, last_auto_select_switch_at=now)
+            return dual_message
+        set_state(last_auto_select_message=dual_message, last_check_message=dual_message)
+        return dual_message
+
     print(f"[自动优选] {msg}", flush=True)
     log_to_json("INFO", "VPN", msg)
     set_state(last_auto_select_message=msg, last_check_message=msg, last_auto_select_switch_at=now)
@@ -1469,6 +1522,11 @@ def get_state() -> dict[str, Any]:
     state["openvpn_batch_test_timeout_seconds"] = OPENVPN_BATCH_TEST_TIMEOUT_SECONDS
     state["auto_select_best_node"] = get_auto_select_best_node()
     state["auto_select_allow_active_switch"] = get_auto_select_allow_active_switch()
+    state["auto_switch_tunnel_mode"] = get_auto_switch_tunnel_mode()
+    state["auto_switch_tunnel_mode_display"] = auto_switch_tunnel_mode_display(state["auto_switch_tunnel_mode"])
+    state["active_openvpn_interface"] = active_openvpn_interface
+    state["dual_tunnel_supported"] = True
+    state["auto_switch_drain_seconds"] = AUTO_SWITCH_DRAIN_SECONDS
     state["auto_select_cooldown_seconds"] = AUTO_SELECT_COOLDOWN_SECONDS
     state["auto_switch_min_fraud_delta"] = AUTO_SWITCH_MIN_FRAUD_DELTA
     state["auto_switch_min_latency_delta_ms"] = AUTO_SWITCH_MIN_LATENCY_DELTA_MS
@@ -8886,7 +8944,7 @@ def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bo
     return ok, message, process
 
 
-def setup_policy_routing(interface: str = "tun0") -> None:
+def setup_policy_routing(interface: str = "tun0") -> bool:
     try:
         subprocess.run(["ip", "rule", "del", "table", "100"], capture_output=True, timeout=2)
     except Exception:
@@ -8910,6 +8968,7 @@ def setup_policy_routing(interface: str = "tun0") -> None:
             
     if not success:
         print("[policy_routing] Failed to enable policy routing after 3 attempts", flush=True)
+    return success
 
 def cleanup_policy_routing() -> None:
     try:
@@ -8919,8 +8978,68 @@ def cleanup_policy_routing() -> None:
     except Exception:
         pass
 
+
+def _unlink_config_file(config_file: str | Path | None) -> None:
+    if not config_file:
+        return
+    try:
+        path = Path(config_file)
+        if path.exists():
+            path.unlink()
+    except Exception:
+        pass
+
+
+def _start_openvpn_drain(
+    process: subprocess.Popen[str] | None,
+    node_id: str,
+    interface: str,
+    config_file: str | Path | None,
+) -> None:
+    """Keep an old tunnel alive briefly after a successful dual switch."""
+
+    if process is None or process.poll() is not None:
+        return
+    record = {
+        "process": process,
+        "node_id": node_id,
+        "interface": interface,
+        "config_file": str(config_file or ""),
+    }
+    with draining_openvpn_lock:
+        draining_openvpn_processes.append(record)
+
+    def worker() -> None:
+        try:
+            time.sleep(AUTO_SWITCH_DRAIN_SECONDS)
+            stop_process(process)
+            with lock:
+                current_id = active_openvpn_node_id
+            # If the user switched back to this node while it was draining,
+            # leave its current configuration file untouched.
+            if current_id != node_id:
+                _unlink_config_file(config_file)
+        finally:
+            with draining_openvpn_lock:
+                try:
+                    draining_openvpn_processes.remove(record)
+                except ValueError:
+                    pass
+
+    threading.Thread(target=worker, name=f"openvpn-drain-{interface}", daemon=True).start()
+
+
+def _stop_draining_openvpn() -> None:
+    with draining_openvpn_lock:
+        records = list(draining_openvpn_processes)
+        draining_openvpn_processes.clear()
+    for record in records:
+        stop_process(record.get("process"))
+        _unlink_config_file(record.get("config_file"))
+
+
 def stop_active_openvpn() -> None:
-    global active_openvpn_process, active_openvpn_node_id
+    global active_openvpn_process, active_openvpn_node_id, active_openvpn_interface
     cleanup_policy_routing()
     config_to_delete = None
     if active_openvpn_node_id:
@@ -8929,18 +9048,17 @@ def stop_active_openvpn() -> None:
         if node:
             config_to_delete = node.get("config_file")
             
+    _stop_draining_openvpn()
     stop_process(active_openvpn_process)
     active_openvpn_process = None
     active_openvpn_node_id = ""
+    active_openvpn_interface = "tun0"
+    try:
+        proxy_server.set_tun_interface("tun0")
+    except Exception:
+        pass
     kill_existing_openvpn_processes()
-    
-    if config_to_delete:
-        try:
-            path = Path(config_to_delete)
-            if path.exists():
-                path.unlink()
-        except Exception:
-            pass
+    _unlink_config_file(config_to_delete)
 
 def active_openvpn_running() -> bool:
     return active_openvpn_process is not None and active_openvpn_process.poll() is None
@@ -9454,8 +9572,175 @@ def auto_switch_node(attempt: int = 0) -> None:
         
         threading.Thread(target=bg_fetch_and_switch, daemon=True).start()
 
+
+def _select_dual_tunnel_interface(active_interface: str) -> str | None:
+    candidates = [AUTO_SWITCH_DUAL_INTERFACE, "tun0", "tun1"]
+    with draining_openvpn_lock:
+        draining_interfaces = {
+            str(record.get("interface") or "")
+            for record in draining_openvpn_processes
+        }
+    for interface in candidates:
+        if not interface or interface == active_interface or interface in draining_interfaces:
+            continue
+        return interface
+    return None
+
+
+def connect_node_dual_tunnel(
+    node_id: str,
+    update_failover_scope: bool = False,
+    allow_auto_risky: bool = False,
+) -> tuple[bool, str]:
+    """Promote a candidate tunnel without stopping the healthy active tunnel first.
+
+    This is intentionally an opt-in helper for proactive optimization only.  The normal
+    connect/failover path remains in ``connect_node`` and keeps the existing single-tunnel
+    behavior.  A failed candidate is cleaned up and the old route/interface is restored.
+    """
+
+    global active_openvpn_process, active_openvpn_node_id, active_openvpn_interface, is_connecting
+    candidate_process: subprocess.Popen[str] | None = None
+    route_attempted = False
+    proxy_interface_switched = False
+
+    with lock:
+        if is_connecting:
+            return False, "双通道切换跳过：当前正在建立其他连接"
+        if not active_openvpn_running() or not active_openvpn_node_id:
+            return False, "双通道切换跳过：当前没有可排空的活动隧道"
+        old_process = active_openvpn_process
+        old_node_id = active_openvpn_node_id
+        old_interface = active_openvpn_interface or "tun0"
+        old_proxy_interface = proxy_server.get_tun_interface()
+        nodes = read_json(NODES_FILE, [])
+        old_node = next((item for item in nodes if item.get("id") == old_node_id), None)
+        node = next((item for item in nodes if item.get("id") == node_id), None)
+        if not node:
+            return False, f"双通道切换失败：节点不存在 {node_id}"
+        if node_id == old_node_id:
+            return False, "双通道切换跳过：候选节点就是当前节点"
+        is_connecting = True
+
+    candidate_interface = _select_dual_tunnel_interface(old_interface)
+    if not candidate_interface:
+        with lock:
+            is_connecting = False
+        return False, "双通道切换跳过：没有空闲的备用隧道接口"
+
+    config_path = Path(node["config_file"])
+    old_config_path = old_node.get("config_file") if old_node else ""
+    try:
+        if not node_is_clean_for_connect(node) and not allow_auto_risky:
+            raise RuntimeError(
+                f"候选节点未通过干净 IP 阈值：欺诈值 {node.get('fraud_score', '未知')}，"
+                f"黑名单 {node.get('blacklist_count', 0)}，风险等级 {node.get('risk_level', 'unknown')}"
+            )
+
+        set_state(
+            is_connecting=True,
+            active_node_latency="备用隧道连接",
+            last_check_message=f"正在启动备用隧道 {candidate_interface}，当前出口保持运行...",
+        )
+        CONFIG_DIR.mkdir(exist_ok=True, parents=True, mode=0o700)
+        CONFIG_DIR.chmod(0o700)
+        atomic_write_text(
+            config_path,
+            sanitize_openvpn_config_for_eianun(node.get("config_text") or ""),
+            mode=0o600,
+        )
+
+        connect_timeout = VPNBOOK_CONNECT_TIMEOUT_SECONDS if str(node.get("source") or "").lower() == "vpnbook" else None
+        ok, message, candidate_process = run_openvpn_until_ready(
+            str(config_path),
+            keep_alive=True,
+            route_nopull=True,
+            timeout=connect_timeout,
+            dev=candidate_interface,
+            auth_file=auth_file_for_node(node),
+        )
+        if not ok or candidate_process is None:
+            raise RuntimeError(message)
+
+        route_attempted = True
+        if not setup_policy_routing(candidate_interface):
+            raise RuntimeError(f"备用隧道 {candidate_interface} 策略路由配置失败")
+        proxy_server.set_tun_interface(candidate_interface)
+        proxy_interface_switched = True
+
+        health = check_proxy_health(interface=candidate_interface)
+        if not health.get("ok"):
+            raise RuntimeError(f"备用隧道出口检查失败：{health.get('error', 'unknown')}")
+
+        with lock:
+            active_openvpn_process = candidate_process
+            active_openvpn_node_id = node_id
+            active_openvpn_interface = candidate_interface
+            for item in nodes:
+                item["active"] = item.get("id") == node_id
+                if item["active"]:
+                    item["probe_message"] = f"Active node via dual tunnel: HTTP proxy: http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}"
+            write_json(NODES_FILE, nodes)
+
+        if update_failover_scope:
+            set_failover_scope_from_node(node)
+        set_state(
+            active_openvpn_node_id=node_id,
+            active_openvpn_interface=candidate_interface,
+            is_connecting=False,
+            active_connected_at=time.time(),
+            proxy_fail_count=0,
+            proxy_ok=True,
+            proxy_ip=health.get("ip", "-"),
+            proxy_latency_ms=health.get("latency_ms", 0),
+            proxy_error="",
+            last_auto_switch_attempt_at=0,
+            active_node_latency=f"{health.get('latency_ms', 0)} ms" if health.get("latency_ms") else "已连接",
+            last_check_message=f"双通道切换成功：已切到 {node_id}，旧隧道 {old_interface} 保留排空 {AUTO_SWITCH_DRAIN_SECONDS} 秒",
+        )
+        log_to_json(
+            "INFO",
+            "VPN",
+            f"双通道切换成功：{old_node_id}/{old_interface} -> {node_id}/{candidate_interface}，旧隧道进入排空",
+        )
+        _start_openvpn_drain(old_process, old_node_id, old_interface, old_config_path)
+        candidate_process = None
+        return True, f"Dual tunnel connected {node_id}"
+    except Exception as exc:
+        if proxy_interface_switched:
+            try:
+                proxy_server.set_tun_interface(old_proxy_interface)
+            except Exception:
+                pass
+        if route_attempted:
+            setup_policy_routing(old_interface)
+        stop_process(candidate_process)
+        _unlink_config_file(config_path)
+        with lock:
+            for item in nodes:
+                if item.get("id") == node_id:
+                    item["probe_status"] = "unavailable"
+                    item["probe_message"] = f"双通道备用隧道失败：{exc}"
+                    item["probed_at"] = time.time()
+                    break
+            write_json(NODES_FILE, nodes)
+        message = f"双通道切换失败，保持当前出口：{exc}"
+        set_state(
+            active_openvpn_node_id=old_node_id,
+            active_openvpn_interface=old_interface,
+            is_connecting=False,
+            last_auto_select_message=message,
+            last_check_message=message,
+        )
+        log_to_json("WARNING", "VPN", message)
+        return False, message
+    finally:
+        with lock:
+            is_connecting = False
+
+
 def connect_node(node_id: str, update_failover_scope: bool = True, allow_manual_risky: bool = False, allow_auto_risky: bool = False) -> str:
-    global active_openvpn_process, active_openvpn_node_id, is_connecting
+    global active_openvpn_process, active_openvpn_node_id, active_openvpn_interface, is_connecting
     with lock:
         if is_connecting:
             print("[连接] 正在建立其他连接中，跳过此请求", flush=True)
@@ -9524,6 +9809,8 @@ def connect_node(node_id: str, update_failover_scope: bool = True, allow_manual_
             
         active_openvpn_process = process
         active_openvpn_node_id = node_id
+        active_openvpn_interface = "tun0"
+        proxy_server.set_tun_interface("tun0")
         if update_failover_scope:
             set_failover_scope_from_node(node)
         
@@ -11321,6 +11608,15 @@ INDEX_HTML = r"""<!doctype html>
           </div>
 
           <div class="form-group" style="margin-bottom: 12px;">
+            <label class="form-label" for="settings_auto_switch_tunnel_mode">主动切换通道模式</label>
+            <select id="settings_auto_switch_tunnel_mode" class="input-field">
+              <option value="single">单通道（默认，兼容现有流程）</option>
+              <option value="dual">双通道辅助切换（保留旧隧道排空）</option>
+            </select>
+            <div style="font-size: 12px; color: var(--text-secondary); margin-top: 6px; line-height: 1.4;">单通道保持原有停旧启新流程；双通道仅用于健康连接主动优选，先验证备用隧道再切路由，失败时保留当前出口。故障转移和手动连接仍使用单通道。</div>
+          </div>
+
+          <div class="form-group" style="margin-bottom: 12px;">
             <label class="form-label" for="settings_new_username">新管理账号 (留空则不修改)</label>
             <input type="text" id="settings_new_username" class="input-field" placeholder="留空则不修改">
           </div>
@@ -12288,6 +12584,7 @@ function openSettingsModal() {
     $("settings_target_countries").value = state.target_countries || "";
     $("settings_node_sources").value = state.node_sources || "vpngate,vpnbook,ipspeed,vpngate_scraper,publicvpnlist";
     $("settings_auto_select_allow_active_switch").value = state.auto_select_allow_active_switch ? "1" : "0";
+    $("settings_auto_switch_tunnel_mode").value = state.auto_switch_tunnel_mode === "dual" ? "dual" : "single";
     const ipTypeValue = state.target_ip_types || "residential";
     const legacyIpTypeMap = {
       "residential,mobile": "residential",
@@ -12322,6 +12619,7 @@ async function saveSettings(e) {
   const targetIpTypes = $("settings_target_ip_types").value.trim();
   const autoSelectBestNode = $("settings_auto_select_best_node").value === "1";
   const autoSelectAllowActiveSwitch = $("settings_auto_select_allow_active_switch").value === "1";
+  const autoSwitchTunnelMode = $("settings_auto_switch_tunnel_mode").value === "dual" ? "dual" : "single";
   const newUsername = $("settings_new_username").value.trim();
   const newPassword = $("settings_new_password").value.trim();
   const currUsername = $("settings_curr_username").value.trim();
@@ -12354,6 +12652,7 @@ async function saveSettings(e) {
         target_ip_types: targetIpTypes,
         auto_select_best_node: autoSelectBestNode,
         auto_select_allow_active_switch: autoSelectAllowActiveSwitch,
+        auto_switch_tunnel_mode: autoSwitchTunnelMode,
         new_username: newUsername,
         new_password: newPassword,
         curr_username: currUsername,
@@ -12419,7 +12718,8 @@ setInterval(async () => {
 </script>
 </body></html>"""
 
-def check_proxy_health() -> dict[str, Any]:
+def check_proxy_health(interface: str | None = None) -> dict[str, Any]:
+    interface = interface or active_openvpn_interface or "tun0"
     # 1. 检测代理服务端口是否在监听
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(1.5)
@@ -12432,12 +12732,12 @@ def check_proxy_health() -> dict[str, Any]:
             "error": f"代理服务未运行 (端口 {LOCAL_PROXY_PORT} 连接失败，原因: {e})"
         }
 
-    # 2. 检测虚拟网卡 tun0 是否存在 (Linux 下)
-    tun_path = Path("/sys/class/net/tun0")
+    # 2. 检测当前活动虚拟网卡是否存在 (Linux 下)
+    tun_path = Path("/sys/class/net") / interface
     if sys.platform.startswith("linux") and not tun_path.exists():
         return {
             "ok": False,
-            "error": "VPN 虚拟网卡 (tun0) 未启用，请确保当前已成功连接 VPN 节点"
+            "error": f"VPN 虚拟网卡 ({interface}) 未启用，请确保当前已成功连接 VPN 节点"
         }
 
     # 3. 使用 curl 通过本地 SOCKS5 代理接口测试 IP 与实际延迟
@@ -12902,6 +13202,13 @@ class Handler(BaseHTTPRequestHandler):
                 new_target_ip_types = normalize_target_ip_types_input(payload.get("target_ip_types") or TARGET_IP_TYPES_ENV or "residential")
                 new_auto_select_best_node = parse_bool_setting(payload.get("auto_select_best_node"), True)
                 new_auto_select_allow_active_switch = parse_bool_setting(payload.get("auto_select_allow_active_switch"), False)
+                requested_tunnel_mode = payload.get("auto_switch_tunnel_mode")
+                if requested_tunnel_mode is None:
+                    requested_tunnel_mode = load_ui_config().get("auto_switch_tunnel_mode", "single")
+                new_auto_switch_tunnel_mode = str(requested_tunnel_mode or "single").strip().lower()
+                if new_auto_switch_tunnel_mode not in {"single", "dual"}:
+                    self.send_json({"ok": False, "error": "通道模式只能是 single 或 dual"}, HTTPStatus.BAD_REQUEST)
+                    return
                 new_username = str(payload.get("new_username") or "").strip()
                 new_password = str(payload.get("new_password") or "").strip()
                 
@@ -12930,6 +13237,7 @@ class Handler(BaseHTTPRequestHandler):
                 ui_cfg["target_ip_types"] = new_target_ip_types
                 ui_cfg["auto_select_best_node"] = new_auto_select_best_node
                 ui_cfg["auto_select_allow_active_switch"] = new_auto_select_allow_active_switch
+                ui_cfg["auto_switch_tunnel_mode"] = new_auto_switch_tunnel_mode
                 if new_username:
                     ui_cfg["username"] = new_username
                 if new_password:

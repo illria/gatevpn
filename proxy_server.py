@@ -15,8 +15,30 @@ from typing import Any, Callable
 
 LOG = logging.getLogger(__name__)
 TUN_INTERFACE = os.environ.get("GATEVPN_TUN_INTERFACE", "tun0")
+_TUN_INTERFACE_LOCK = threading.RLock()
 UDP_ASSOCIATE_IDLE_TIMEOUT = 120.0
 UDP_RELAY_SELECT_INTERVAL = 1.0
+
+
+def get_tun_interface() -> str:
+    with _TUN_INTERFACE_LOCK:
+        return TUN_INTERFACE
+
+
+def set_tun_interface(interface: str) -> None:
+    """Change the interface used by newly created outbound proxy sockets.
+
+    Existing TCP/UDP relays keep the interface captured when they were created.
+    That lets the manager drain the old tunnel while new connections use the
+    promoted tunnel during an optional dual-tunnel switch.
+    """
+
+    value = str(interface or "").strip()
+    if not value or len(value) > 15 or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-" for char in value):
+        raise ValueError("invalid tunnel interface name")
+    with _TUN_INTERFACE_LOCK:
+        global TUN_INTERFACE
+        TUN_INTERFACE = value
 
 
 def parse_int(value: Any) -> int:
@@ -36,7 +58,7 @@ def recv_exact(sock: socket.socket, size: int) -> bytes:
     return data
 
 
-def bind_socket_to_interface(sock: socket.socket, interface: str = TUN_INTERFACE) -> None:
+def bind_socket_to_interface(sock: socket.socket, interface: str | None = None) -> None:
     """Bind a socket to an interface, or raise without permitting fallback.
 
     SO_BINDTODEVICE is Linux-specific.  Keeping this operation in one function
@@ -44,6 +66,7 @@ def bind_socket_to_interface(sock: socket.socket, interface: str = TUN_INTERFACE
     in environments where tun0 or the capability is unavailable.
     """
 
+    interface = interface or get_tun_interface()
     bind_option = getattr(socket, "SO_BINDTODEVICE", None)
     if bind_option is None:
         raise OSError("SO_BINDTODEVICE is not available on this platform")
@@ -82,9 +105,11 @@ def resolve_dns_over_tun0(
     host: str,
     dns_server: str = "8.8.8.8",
     timeout: float = 3.0,
-    interface: str = TUN_INTERFACE,
+    interface: str | None = None,
 ) -> str | None:
     """Resolve an A record through the tunnel only; never use system DNS."""
+
+    interface = interface or get_tun_interface()
 
     try:
         return socket.inet_pton(socket.AF_INET, host) and host
@@ -144,8 +169,9 @@ def resolve_dns_over_tun0(
 def create_connection(
     address: tuple[str, int],
     timeout: float = 20,
-    interface: str = TUN_INTERFACE,
+    interface: str | None = None,
 ) -> socket.socket:
+    interface = interface or get_tun_interface()
     host, port = address
     resolved_ip = resolve_dns_over_tun0(host, interface=interface)
     if resolved_ip:
@@ -351,12 +377,14 @@ def _validate_udp_associate_endpoint(
 def udp_associate(
     client: socket.socket,
     client_address: tuple[str, int],
-    interface: str = TUN_INTERFACE,
+    interface: str | None = None,
     idle_timeout: float = UDP_ASSOCIATE_IDLE_TIMEOUT,
     requested_endpoint: tuple[str, int] | None = None,
     socket_factory: Callable[..., socket.socket] = socket.socket,
 ) -> None:
     """Run one UDP association until control disconnect, timeout, or failure."""
+
+    interface = interface or get_tun_interface()
 
     client_relay = None
     upstream = None
@@ -598,7 +626,7 @@ def start_proxy_server(host: str, port: int) -> None:
         print("HTTP proxy: TCP only", flush=True)
         print("SOCKS5 proxy: TCP CONNECT + UDP ASSOCIATE", flush=True)
         print(f"TCP control listener: {host}:{port}", flush=True)
-        print(f"UDP upstream interface: {TUN_INTERFACE}", flush=True)
+        print(f"UDP upstream interface: {get_tun_interface()}", flush=True)
         print("UDP policy: fail closed, no default-route fallback", flush=True)
     except Exception as e:
         print(f"[ERROR] Failed to start HTTP/SOCKS5 proxy on {host}:{port}: {e}", flush=True)
