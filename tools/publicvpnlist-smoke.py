@@ -23,6 +23,9 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+FIXED_COUNTRY_ORDER = ("US", "FR", "GB", "ID", "FI", "DE", "TW", "AU", "NL", "PH")
+OPTIONAL_DEGRADED_COUNTRIES = frozenset({"PH"})
+
 
 def _load_manager():
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -33,19 +36,26 @@ def _load_manager():
 
 def _safe_reason_code(exc: BaseException) -> str:
     message = str(exc or "").lower()
+    exception_name = type(exc).__name__
+    if exception_name == "PublicVPNListConfigHashMismatch" or "config_sha256_mismatch" in message or "config_sha256 不匹配" in message:
+        return "config_sha256_mismatch"
     known = (
+        ("响应缺少原始字节", "config_sha256_unavailable"),
         ("实时检查未通过", "live_check_failed"),
         ("临时检查", "live_check_failed"),
-        ("临时令牌响应缺少", "token_response_missing_url"),
-        ("临时令牌", "token_flow_failed"),
-        ("配置下载 content-type", "profile_content_type_rejected"),
+        ("临时令牌响应缺少", "token_failed"),
+        ("临时令牌", "token_failed"),
+        ("配置下载 content-type", "profile_download_failed"),
         ("下载内容不像", "profile_not_openvpn"),
-        ("下载主机 dns 解析失败", "download_host_dns_failed"),
-        ("下载主机没有可验证", "download_host_dns_empty"),
-        ("主机不在", "download_host_not_allowlisted"),
-        ("受限网络地址", "download_host_ssrf_rejected"),
-        ("重定向次数超过", "redirect_limit"),
-        ("live flow 超过", "live_flow_deadline"),
+        ("remote/port/proto", "endpoint_mismatch"),
+        ("端口", "endpoint_mismatch"),
+        ("协议", "protocol_mismatch"),
+        ("下载主机 dns 解析失败", "profile_download_failed"),
+        ("下载主机没有可验证", "profile_download_failed"),
+        ("主机不在", "profile_download_failed"),
+        ("受限网络地址", "unsafe_config"),
+        ("重定向次数超过", "profile_download_failed"),
+        ("live flow 超过", "deadline_exceeded"),
         ("响应不是 json", "json_response_invalid"),
         ("响应 json 无效", "json_response_invalid"),
     )
@@ -54,9 +64,7 @@ def _safe_reason_code(exc: BaseException) -> str:
             return code
     if re.search(r"\b(?:http|https)\b", message):
         return "http_request_failed"
-    return type(exc).__name__
-
-
+    return exception_name
 def _redacted_error(exc: BaseException) -> dict[str, Any]:
     flow = getattr(exc, "_pvl_flow", {})
     flow_summary = {}
@@ -64,6 +72,8 @@ def _redacted_error(exc: BaseException) -> dict[str, Any]:
         for key in (
             "status",
             "retry_after",
+            "official_flow",
+            "live_flow_deadline_exceeded",
             "live_check_succeeded",
             "live_check_status",
             "token_request_attempted",
@@ -198,19 +208,368 @@ def _row_mapping(manager, raw: dict[str, Any]) -> bool:
     )
 
 
-def _select_records(manager, records: list[dict[str, Any]], countries: list[str], limit: int) -> list[dict[str, Any]]:
+def _select_records(
+    manager,
+    records: list[dict[str, Any]],
+    countries: list[str],
+    limit: int,
+    retry_cache: dict[str, Any] | None = None,
+    blocked_endpoint_keys: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Return at most two stable, non-backoff candidates per country."""
+
     allowed = {str(item).strip().upper() for item in countries if str(item).strip()}
-    ordered = manager.publicvpnlist_order_api_candidate_records(records)
+    per_country_limit = min(
+        2,
+        max(1, int(getattr(manager, "PUBLICVPNLIST_LIVE_FLOW_ATTEMPTS_PER_COUNTRY", 2))),
+    )
+    ordered = manager.publicvpnlist_order_api_candidate_records(
+        records,
+        retry_cache=retry_cache,
+        now=time.time(),
+    )
     selected: list[dict[str, Any]] = []
+    selected_by_country: dict[str, int] = {}
+    selected_endpoint_keys: set[str] = set()
+    dns_cache: dict[str, str | None] = {}
+    blocked = set(blocked_endpoint_keys or ())
     for raw in ordered:
         row = manager.normalize_publicvpnlist_row(raw)
-        if not row or row.get("country_short") not in allowed:
+        country = str(row.get("country_short") or "").upper() if row else ""
+        if not row or country not in allowed:
+            continue
+        if selected_by_country.get(country, 0) >= per_country_limit:
+            continue
+        if retry_cache and manager.publicvpnlist_api_profile_retry_active(
+            retry_cache,
+            row,
+            now=time.time(),
+        ):
+            continue
+        try:
+            aliases = set(manager.publicvpnlist_endpoint_aliases(row, dns_cache))
+        except Exception:
+            aliases = set()
+        if aliases and aliases & (blocked | selected_endpoint_keys):
             continue
         selected.append(dict(raw))
+        selected_by_country[country] = selected_by_country.get(country, 0) + 1
+        selected_endpoint_keys.update(aliases)
         if len(selected) >= max(1, int(limit)):
             break
     return selected
 
+
+def _record_country_reason(
+    report: dict[str, Any],
+    field: str,
+    country: str,
+    reason: str,
+) -> None:
+    country = str(country or "").upper()
+    if country not in report.get(field, {}):
+        return
+    bucket = report[field][country]
+    if isinstance(bucket, dict):
+        bucket[reason] = int(bucket.get(reason) or 0) + 1
+
+
+
+def evaluate_live_coverage(report: dict[str, Any]) -> dict[str, Any]:
+    """Evaluate the live gate while allowing PH to degrade independently.
+
+    PH remains part of the fixed source/country diagnostics, but its live
+    availability is optional because the upstream API can temporarily return
+    no PH metadata or fail the protected download flow. Required countries
+    retain the first-round and validation guarantees, and every country still
+    obeys the two-attempt cap.
+    """
+
+    requested = {
+        str(country or "").strip().upper()
+        for country in (report.get("countries") or FIXED_COUNTRY_ORDER)
+        if str(country or "").strip()
+    }
+    fixed_countries = tuple(
+        country for country in FIXED_COUNTRY_ORDER
+        if country in requested
+    )
+    if not fixed_countries:
+        fixed_countries = FIXED_COUNTRY_ORDER
+    optional_countries = tuple(
+        country for country in fixed_countries
+        if country in OPTIONAL_DEGRADED_COUNTRIES
+    )
+    required_countries = tuple(
+        country for country in fixed_countries
+        if country not in OPTIONAL_DEGRADED_COUNTRIES
+    )
+
+    def mapping(name: str) -> dict[str, Any]:
+        value = report.get(name)
+        return value if isinstance(value, dict) else {}
+
+    def count(name: str, country: str) -> int:
+        try:
+            return int(mapping(name).get(country) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def reason_names(name: str, country: str) -> set[str]:
+        value = mapping(name).get(country)
+        return set(value) if isinstance(value, dict) else set()
+
+    metadata_missing = [
+        country for country in required_countries
+        if count("metadata_records_by_country", country) < 1
+    ]
+    attempts = mapping("attempts_by_country")
+    eligible = mapping("eligible_candidates_by_country")
+    skipped = mapping("skipped_by_country")
+    failed = mapping("failed_candidates_by_country")
+    first_round_safety_reasons = {
+        "endpoint_duplicate",
+        "mapping_missing",
+        "web_download_id_missing",
+        "us_nonresidential",
+        "us_unclassified",
+    }
+    first_round_safety_skips: dict[str, Any] = {}
+    attempts_missing: list[str] = []
+    for country in required_countries:
+        if count("attempts_by_country", country) >= 1:
+            continue
+        reasons = reason_names("skipped_by_country", country)
+        if (
+            count("eligible_candidates_by_country", country) == 0
+            and reasons
+            and reasons <= first_round_safety_reasons
+        ):
+            first_round_safety_skips[country] = skipped.get(country) or {}
+        else:
+            attempts_missing.append(country)
+
+    attempts_over_limit = [
+        country for country in fixed_countries
+        if count("attempts_by_country", country) > 2
+    ]
+    unvalidated_countries = [
+        country for country in fixed_countries
+        if count("validated_by_country", country) < 1
+    ]
+    unvalidated_required_countries = [
+        country for country in required_countries
+        if count("validated_by_country", country) < 1
+    ]
+    optional_country_errors = mapping("optional_country_errors")
+    optional_degraded: dict[str, dict[str, Any]] = {}
+    optional_available: list[str] = []
+    for country in optional_countries:
+        if count("validated_by_country", country) >= 1:
+            optional_available.append(country)
+            continue
+        endpoint_reasons = reason_names("optional_country_errors", country)
+        if endpoint_reasons:
+            reason = "api_endpoint_error:" + ",".join(sorted(endpoint_reasons))
+        elif count("metadata_records_by_country", country) == 0:
+            reason = "metadata_missing"
+        elif count("eligible_candidates_by_country", country) == 0:
+            skipped_reasons = reason_names("skipped_by_country", country)
+            reason = (
+                "safety_skipped:" + ",".join(sorted(skipped_reasons))
+                if skipped_reasons
+                else "no_eligible_candidate"
+            )
+        elif count("attempts_by_country", country) == 0:
+            reason = "not_attempted"
+        elif reason_names("failed_candidates_by_country", country):
+            reason = "live_flow_failed:" + ",".join(
+                sorted(reason_names("failed_candidates_by_country", country))
+            )
+        else:
+            reason = "not_validated"
+        optional_degraded[country] = {
+            "metadata": count("metadata_records_by_country", country),
+            "eligible": count("eligible_candidates_by_country", country),
+            "attempts": count("attempts_by_country", country),
+            "validated": count("validated_by_country", country),
+            "reason": reason,
+        }
+
+    overall_missing = [
+        name for name in ("profiles_downloaded", "profiles_validated", "connectable_candidates")
+        if int(report.get(name) or 0) < 1
+    ]
+    validated_country_count = sum(
+        1 for country in fixed_countries
+        if count("validated_by_country", country) >= 1
+    )
+    required_validated_country_count = sum(
+        1 for country in required_countries
+        if count("validated_by_country", country) >= 1
+    )
+    minimum_required_validated = min(8, len(required_countries))
+    coverage_errors: list[str] = []
+    if overall_missing:
+        coverage_errors.append("overall=" + ",".join(overall_missing))
+    if metadata_missing:
+        coverage_errors.append("metadata=" + ",".join(metadata_missing))
+    if attempts_missing:
+        coverage_errors.append("first_round_attempts=" + ",".join(attempts_missing))
+    if attempts_over_limit:
+        coverage_errors.append(
+            "attempts_over_limit=" + ",".join(attempts_over_limit)
+        )
+    if required_validated_country_count < minimum_required_validated:
+        coverage_errors.append(
+            "validated_required_countries="
+            + str(required_validated_country_count)
+            + "<"
+            + str(minimum_required_validated)
+        )
+    if report.get("openvpn") == "started":
+        coverage_errors.append("openvpn_started")
+
+    return {
+        "fixed_countries": list(fixed_countries),
+        "required_countries": list(required_countries),
+        "optional_countries": list(optional_countries),
+        "metadata_missing": metadata_missing,
+        "attempts_missing": attempts_missing,
+        "attempts_over_limit": attempts_over_limit,
+        "first_round_safety_skips": first_round_safety_skips,
+        "unvalidated_countries": unvalidated_countries,
+        "unvalidated_required_countries": unvalidated_required_countries,
+        "optional_degraded_countries": optional_degraded,
+        "optional_available_countries": optional_available,
+        "validated_country_count": validated_country_count,
+        "required_validated_country_count": required_validated_country_count,
+        "minimum_required_validated": minimum_required_validated,
+        "overall_missing": overall_missing,
+        "coverage_errors": coverage_errors,
+    }
+
+
+def _prepare_candidates(
+    manager,
+    records: list[dict[str, Any]],
+    countries: list[str],
+    limit: int,
+    report: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Apply mapping, retry, endpoint and US policy before live-flow attempts."""
+
+    allowed = {str(item).strip().upper() for item in countries if str(item).strip()}
+    per_country_limit = min(
+        2,
+        max(1, int(getattr(manager, "PUBLICVPNLIST_LIVE_FLOW_ATTEMPTS_PER_COUNTRY", 2))),
+    )
+    try:
+        retry_cache = manager.load_publicvpnlist_api_cache()
+    except Exception:
+        retry_cache = {}
+    now = time.time()
+    ordered = manager.publicvpnlist_order_api_candidate_records(
+        records,
+        retry_cache=retry_cache,
+        now=now,
+    )
+    normalized: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
+    us_rows: list[tuple[str, dict[str, Any]]] = []
+    for index, raw in enumerate(ordered):
+        row = manager.normalize_publicvpnlist_row(raw)
+        if not row:
+            continue
+        country = str(row.get("country_short") or "").upper()
+        if country not in allowed:
+            continue
+        normalized.append((index, row, dict(raw)))
+        if country == "US":
+            key = str(row.get("id") or row.get("public_id") or "").strip() or f"US:{index}"
+            us_rows.append((key, row))
+    classifications: dict[str, dict[str, Any]] = {}
+    if us_rows:
+        try:
+            classifications, batch_failed = manager.publicvpnlist_enrich_us_rows(us_rows)
+        except Exception:
+            classifications = {}
+            batch_failed = True
+        report["us_classification_attempted"] += len(us_rows)
+        if batch_failed and not classifications:
+            for key, _row in us_rows:
+                classifications[key] = manager.publicvpnlist_classification_defaults()
+    endpoint_keys: set[str] = set()
+    dns_cache: dict[str, str | None] = {}
+    selected: list[dict[str, Any]] = []
+    selected_by_country: dict[str, int] = {}
+    for index, row, raw in normalized:
+        country = str(row.get("country_short") or "").upper()
+        config_url = str(row.get("temporary_ovpn_url") or "").strip()
+        if not config_url and not manager.publicvpnlist_web_download_id(row):
+            _record_country_reason(report, "skipped_by_country", country, "web_download_id_missing")
+            continue
+        if retry_cache and manager.publicvpnlist_api_profile_retry_active(
+            retry_cache,
+            row,
+            now=now,
+        ):
+            _record_country_reason(report, "skipped_by_country", country, "profile_backoff")
+            continue
+        try:
+            aliases = set(manager.publicvpnlist_endpoint_aliases(row, dns_cache))
+        except Exception:
+            aliases = set()
+        if aliases and aliases & endpoint_keys:
+            _record_country_reason(report, "skipped_by_country", country, "endpoint_duplicate")
+            continue
+        effective_raw = dict(raw)
+        if country == "US":
+            key = str(row.get("id") or row.get("public_id") or "").strip() or f"US:{index}"
+            classification = manager.publicvpnlist_normalize_classification(
+                classifications.get(key)
+            )
+            risk_sources = {
+                str(item).strip().lower()
+                for item in (classification or {}).get("risk_sources", [])
+                if str(item).strip()
+            }
+            ip_type = manager.normalize_ip_type_token((classification or {}).get("ip_type"))
+            if not classification or ip_type in {"", "unknown"} or not risk_sources:
+                report["us_unclassified_rejected"] += 1
+                _record_country_reason(report, "skipped_by_country", country, "us_unclassified")
+                continue
+            if not manager.publicvpnlist_us_classification_allowed(classification):
+                report["us_nonresidential_rejected"] += 1
+                _record_country_reason(report, "skipped_by_country", country, "us_nonresidential")
+                continue
+            report["us_residential_accepted"] += 1
+            effective_raw.update(classification)
+        if selected_by_country.get(country, 0) >= per_country_limit:
+            _record_country_reason(report, "skipped_by_country", country, "country_attempt_limit")
+            continue
+        report["eligible_candidates_by_country"][country] += 1
+        selected.append(effective_raw)
+        selected_by_country[country] = selected_by_country.get(country, 0) + 1
+        endpoint_keys.update(aliases)
+        if len(selected) >= max(1, int(limit)):
+            break
+    report["available_countries"] = [
+        country for country in countries
+        if int(report["eligible_candidates_by_country"].get(country, 0) or 0) > 0
+    ]
+    return selected
+
+
+def _account_flow_report(report: dict[str, Any], country: str, flow: dict[str, Any]) -> None:
+    country = str(country or "").upper()
+    if country not in report.get("attempts_by_country", {}):
+        return
+    if flow.get("live_check_succeeded"):
+        report["live_check_succeeded_by_country"][country] += 1
+    if flow.get("token_generated"):
+        report["token_generated_by_country"][country] += 1
+    if flow.get("profile_downloaded"):
+        report["downloaded_by_country"][country] += 1
 
 _FLOW_DIAGNOSTIC_KEYS = (
     "status",
@@ -315,13 +674,19 @@ def _download_one(manager, raw: dict[str, Any], timeout: int) -> dict[str, Any]:
         _attach_flow_diagnostic(exc, metadata, stage)
         raise
 
+    flow_summary = {
+        key: metadata.get(key)
+        for key in _FLOW_DIAGNOSTIC_KEYS
+        if metadata.get(key) not in (None, "")
+    }
     return {
+        "_flow": flow_summary,
         "country": str(node.get("country_short") or ""),
         "host": str(node.get("remote_host") or ""),
         "port": int(node.get("remote_port") or 0),
         "proto": str(node.get("proto") or ""),
         "response_sha256_present": bool(actual_hash),
-        "config_sha256": hashlib.sha256(config_text.encode("utf-8")).hexdigest(),
+        "config_sha256": actual_hash or hashlib.sha256(config_text.encode("utf-8")).hexdigest(),
         "redirect_count": int(metadata.get("redirect_count") or 0),
         "initial_download_host": str(metadata.get("initial_download_host") or ""),
         "final_download_host": str(metadata.get("final_download_host") or ""),
@@ -409,7 +774,10 @@ def run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     started = time.monotonic()
     countries = [
         str(item).strip().upper()
-        for item in str(args.countries or "PH,FR,US").split(",")
+        for item in str(
+            args.countries
+            or "US,FR,GB,ID,FI,DE,TW,AU,NL,PH"
+        ).split(",")
         if str(item).strip()
     ]
     base_url = manager.publicvpnlist_api_base_url()
@@ -422,12 +790,35 @@ def run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         "web_catalog_records": 0,
         "web_catalog_matches": 0,
         "metadata_only_skipped": 0,
+        "metadata_records_by_country": {country: 0 for country in countries},
+        "mapped_records_by_country": {country: 0 for country in countries},
+        "available_countries": [],
+        "eligible_candidates_by_country": {country: 0 for country in countries},
+        "attempts_by_country": {country: 0 for country in countries},
+        "live_check_succeeded_by_country": {country: 0 for country in countries},
+        "token_generated_by_country": {country: 0 for country in countries},
+        "downloaded_by_country": {country: 0 for country in countries},
+        "validated_by_country": {country: 0 for country in countries},
+        "connectable_by_country": {country: 0 for country in countries},
+        "skipped_by_country": {country: {} for country in countries},
+        "failed_candidates_by_country": {country: {} for country in countries},
+        "us_classification_attempted": 0,
+        "us_residential_accepted": 0,
+        "us_nonresidential_rejected": 0,
+        "us_unclassified_rejected": 0,
         "connectable_candidates": 0,
         "config_downloads": 0,
         "profiles_downloaded": 0,
         "profiles_validated": 0,
+        "download_results": [],
         "api_endpoints": [],
         "errors": [],
+        "optional_country_errors": {
+            country: {}
+            for country in countries
+            if country in OPTIONAL_DEGRADED_COUNTRIES
+        },
+        "blocking_api_errors": [],
         "openvpn": "not_started",
         "redacted": True,
     }
@@ -468,7 +859,22 @@ def run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     except Exception as exc:
         endpoint_errors.append(_redacted_error(exc))
 
+    blocking_endpoint_errors: list[dict[str, Any]] = []
+    for error in endpoint_errors:
+        endpoint = str(error.get("endpoint") or "")
+        country = endpoint.rsplit("/", 1)[-1].strip().upper() if endpoint.startswith("servers/") else ""
+        if country in OPTIONAL_DEGRADED_COUNTRIES:
+            reason = str(error.get("reason") or error.get("category") or "endpoint_error")
+            _record_country_reason(
+                report,
+                "optional_country_errors",
+                country,
+                reason,
+            )
+            continue
+        blocking_endpoint_errors.append(error)
     report["errors"] = endpoint_errors
+    report["blocking_api_errors"] = blocking_endpoint_errors
     report["metadata_records"] = len(all_records)
     web_catalog_meta: dict[str, Any] = {}
     all_records = manager.publicvpnlist_attach_official_web_ids(
@@ -494,19 +900,38 @@ def run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         for record in all_records
     ]
     normalized_rows = [row for row in normalized_rows if row and row.get("country_short") in set(countries)]
+    for raw in all_records:
+        row = manager.normalize_publicvpnlist_row(raw)
+        if not row:
+            continue
+        country = str(row.get("country_short") or "").upper()
+        if country not in report["metadata_records_by_country"]:
+            continue
+        report["metadata_records_by_country"][country] += 1
+        if _row_mapping(manager, raw):
+            report["mapped_records_by_country"][country] += 1
+        else:
+            report["skipped_by_country"][country]["metadata_only"] = (
+                report["skipped_by_country"][country].get("metadata_only", 0) + 1
+            )
+    report["available_countries"] = [
+        country
+        for country in countries
+        if report["metadata_records_by_country"].get(country, 0) > 0
+    ]
     report["metadata_with_download_path"] = sum(
-        1 for raw in all_records if _row_mapping(manager, raw)
+        report["mapped_records_by_country"].values()
     )
-    report["metadata_only_skipped"] = max(
-        0,
-        len(normalized_rows) - report["metadata_with_download_path"],
+    report["metadata_only_skipped"] = sum(
+        report["skipped_by_country"][country].get("metadata_only", 0)
+        for country in countries
     )
 
-    if endpoint_errors:
+    if blocking_endpoint_errors:
         report["status"] = classify_api_result(
             all_records,
             [raw for raw in all_records if _row_mapping(manager, raw)],
-            endpoint_errors,
+            blocking_endpoint_errors,
         )
         report["elapsed_seconds"] = round(time.monotonic() - started, 3)
         return 1, report
@@ -518,24 +943,68 @@ def run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     report["status"] = classify_api_result(all_records, mapped_records)
     if args.download and mapped_records:
         # Detail enrichment is bounded by the manager's API request budget.
+        # Candidate selection is also bounded to the first two ranked rows per
+        # country, so the smoke exercises the same two-round policy as refresh.
         detail_meta = {"request_count": 0}
         try:
-            ranked = manager.publicvpnlist_order_api_candidate_records(all_records)
+            retry_cache = manager.load_publicvpnlist_api_cache()
+            ranked = manager.publicvpnlist_order_api_candidate_records(
+                all_records,
+                retry_cache=retry_cache,
+                now=time.time(),
+            )
             enriched = manager.publicvpnlist_api_enrich_records_for_download(
-                ranked[: max(1, int(args.max_profiles) * 2)],
+                ranked[: max(1, min(100, int(args.max_profiles) * 5))],
                 detail_meta,
             )
-            candidates = _select_records(manager, enriched, countries, args.max_profiles)
+            candidates = _prepare_candidates(
+                manager,
+                enriched,
+                countries,
+                args.max_profiles,
+                report,
+            )
+            flow_deadline = started + max(1, int(args.timeout))
             for raw in candidates[: max(1, int(args.max_profiles))]:
+                row = manager.normalize_publicvpnlist_row(raw)
+                country = str(row.get("country_short") or "").upper() if row else ""
+                if country not in report["attempts_by_country"]:
+                    continue
+                remaining = flow_deadline - time.monotonic()
+                if remaining <= 0:
+                    _record_country_reason(report, "skipped_by_country", country, "deadline_exceeded")
+                    continue
+                report["attempts_by_country"][country] += 1
                 try:
-                    result = _download_one(manager, raw, args.timeout)
+                    result = _download_one(
+                        manager,
+                        raw,
+                        max(1, min(int(args.timeout), int(remaining))),
+                    )
+                    flow = result.pop("_flow", {})
+                    _account_flow_report(report, country, flow)
                     report["config_downloads"] += 1
                     report["profiles_downloaded"] += 1
                     report["profiles_validated"] += 1
+                    report["validated_by_country"][country] += 1
+                    report["connectable_by_country"][country] += 1
                     report["connectable_candidates"] += 1
-                    report["download_result"] = result
-                    break
+                    report["download_results"].append(result)
+                    report.setdefault("download_result", result)
                 except Exception as exc:
+                    flow = getattr(exc, "_pvl_flow", {})
+                    if not isinstance(flow, dict):
+                        flow = {}
+                    _account_flow_report(report, country, flow)
+                    if flow.get("profile_downloaded"):
+                        report["profiles_downloaded"] += 1
+                    reason = _safe_reason_code(exc)
+                    _record_country_reason(
+                        report,
+                        "failed_candidates_by_country",
+                        country,
+                        reason,
+                    )
                     report["errors"].append(_redacted_error(exc))
             report["detail_requests"] = int(detail_meta.get("detail_requests") or 0)
             report["detail_successes"] = int(detail_meta.get("detail_successes") or 0)
@@ -561,9 +1030,9 @@ def run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="PublicVPNList API/config smoke check")
     parser.add_argument("--api", action="store_true", help="validate API v1 (default)")
-    parser.add_argument("--countries", default="PH,FR,US")
-    parser.add_argument("--max-profiles", type=int, default=1)
-    parser.add_argument("--timeout", type=int, default=60)
+    parser.add_argument("--countries", default="US,FR,GB,ID,FI,DE,TW,AU,NL,PH")
+    parser.add_argument("--max-profiles", type=int, default=20)
+    parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--redact", action="store_true", help="keep all report fields redacted")
     parser.add_argument("--download", action="store_true", help="run at most max-profiles bounded config flow")
     parser.add_argument("--json-report", default="")

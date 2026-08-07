@@ -6,7 +6,7 @@ on:
       - main
   push:
     branches:
-      - feat/publicvpnlist-live-download
+      - fix/publicvpnlist-country-rounds
   workflow_dispatch:
 
 permissions:
@@ -31,7 +31,7 @@ jobs:
         run: |
           mkdir -p artifacts/logs
           set +e
-          python3 tools/publicvpnlist-smoke.py             --api             --countries PH,FR             --max-profiles 3             --timeout 60             --redact             --download             --json-report artifacts/logs/publicvpnlist-live-smoke.json             > artifacts/logs/publicvpnlist-live-smoke.log 2>&1
+          python3 tools/publicvpnlist-smoke.py             --api             --countries US,FR,GB,ID,FI,DE,TW,AU,NL,PH             --max-profiles 20             --timeout 180             --redact             --download             --json-report artifacts/logs/publicvpnlist-live-smoke.json             > artifacts/logs/publicvpnlist-live-smoke.log 2>&1
           smoke_status=$?
           cat artifacts/logs/publicvpnlist-live-smoke.json || true
           tail -n 20 artifacts/logs/publicvpnlist-live-smoke.log || true
@@ -42,14 +42,81 @@ jobs:
           report = json.loads(open(sys.argv[1], encoding="utf-8").read())
           required = ("profiles_downloaded", "profiles_validated", "connectable_candidates")
           missing = [name for name in required if int(report.get(name) or 0) < 1]
-          if missing:
-              raise SystemExit("live profile smoke missing: " + ", ".join(missing))
-          print("profiles_downloaded=" + str(report["profiles_downloaded"]))
-          print("profiles_validated=" + str(report["profiles_validated"]))
-          print("connectable_candidates=" + str(report["connectable_candidates"]))
+          import importlib.util
+          from pathlib import Path
+
+          smoke_spec = importlib.util.spec_from_file_location(
+              "publicvpnlist_smoke_coverage",
+              Path("tools/publicvpnlist-smoke.py"),
+          )
+          publicvpnlist_smoke = importlib.util.module_from_spec(smoke_spec)
+          smoke_spec.loader.exec_module(publicvpnlist_smoke)
+          coverage = publicvpnlist_smoke.evaluate_live_coverage(report)
+
+          fixed_countries = coverage["fixed_countries"]
+          required_countries = coverage["required_countries"]
+          metadata_missing = coverage["metadata_missing"]
+          attempts = report.get("attempts_by_country") or {}
+          downloaded = report.get("downloaded_by_country") or {}
+          validated = report.get("validated_by_country") or {}
+          eligible = report.get("eligible_candidates_by_country") or {}
+          skipped = report.get("skipped_by_country") or {}
+          failed = report.get("failed_candidates_by_country") or {}
+          first_round_safety_skips = coverage["first_round_safety_skips"]
+          attempts_missing = coverage["attempts_missing"]
+          attempts_over_limit = coverage["attempts_over_limit"]
+          unvalidated_countries = coverage["unvalidated_countries"]
+          optional_degraded = coverage["optional_degraded_countries"]
+          validated_country_count = coverage["validated_country_count"]
+          required_validated_country_count = coverage["required_validated_country_count"]
+          unvalidated_details = {
+              country: {
+                  "eligible": int(eligible.get(country) or 0),
+                  "attempts": int(attempts.get(country) or 0),
+                  "downloaded": int(downloaded.get(country) or 0),
+                  "validated": int(validated.get(country) or 0),
+                  "skipped": skipped.get(country) or {},
+                  "failed": failed.get(country) or {},
+              }
+              for country in unvalidated_countries
+          }
+
+          print("profiles_downloaded=" + str(report.get("profiles_downloaded", 0)))
+          print("profiles_validated=" + str(report.get("profiles_validated", 0)))
+          print("connectable_candidates=" + str(report.get("connectable_candidates", 0)))
+          print("metadata_records_by_country=" + json.dumps(report.get("metadata_records_by_country", {}), sort_keys=True))
+          print("mapped_records_by_country=" + json.dumps(report.get("mapped_records_by_country", {}), sort_keys=True))
+          print("eligible_candidates_by_country=" + json.dumps(eligible, sort_keys=True))
+          print("attempts_by_country=" + json.dumps(attempts, sort_keys=True))
+          print("live_check_succeeded_by_country=" + json.dumps(report.get("live_check_succeeded_by_country", {}), sort_keys=True))
+          print("token_generated_by_country=" + json.dumps(report.get("token_generated_by_country", {}), sort_keys=True))
+          print("downloaded_by_country=" + json.dumps(downloaded, sort_keys=True))
+          print("validated_by_country=" + json.dumps(validated, sort_keys=True))
+          print("connectable_by_country=" + json.dumps(report.get("connectable_by_country", {}), sort_keys=True))
+          print("skipped_by_country=" + json.dumps(skipped, sort_keys=True))
+          print("failed_candidates_by_country=" + json.dumps(failed, sort_keys=True))
+          print("us_classification_attempted=" + str(report.get("us_classification_attempted", 0)))
+          print("us_residential_accepted=" + str(report.get("us_residential_accepted", 0)))
+          print("us_nonresidential_rejected=" + str(report.get("us_nonresidential_rejected", 0)))
+          print("us_unclassified_rejected=" + str(report.get("us_unclassified_rejected", 0)))
+          print("first_round_safety_skips=" + json.dumps(first_round_safety_skips, sort_keys=True))
+          print("unvalidated_countries=" + json.dumps(unvalidated_details, sort_keys=True))
+          print("validated_country_count=" + str(validated_country_count))
+          print("required_validated_country_count=" + str(required_validated_country_count))
+          print("optional_country_degraded=" + json.dumps(optional_degraded, sort_keys=True))
           print("openvpn_started=" + str(report.get("openvpn") == "started"))
+
+          coverage_errors = list(coverage["coverage_errors"])
+          print("coverage_errors=" + json.dumps(coverage_errors, sort_keys=True))
+          if coverage_errors:
+              raise SystemExit(
+                  "live profile smoke coverage incomplete: "
+                  + "; ".join(coverage_errors)
+              )
           PY
+          coverage_status=$?
           test "$smoke_status" -eq 0
+          test "$coverage_status" -eq 0
 
       - name: Upload redacted live smoke report
         if: always()

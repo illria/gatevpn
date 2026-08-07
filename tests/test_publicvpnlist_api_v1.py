@@ -132,6 +132,26 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
 
         self.assertEqual([row["id"] for row in ordered], ["ph-high", "fr-best", "ph-low"])
 
+    def test_api_candidate_order_completes_two_country_rounds(self):
+        records = []
+        country_order = tuple(vpngate_manager.PUBLICVPNLIST_ALLOWED_COUNTRY_ORDER)
+        for country in country_order:
+            best_id = f"{country.lower()}-best"
+            second_id = f"{country.lower()}-second"
+            best = self.record(best_id, country=country, with_config=False)
+            second = self.record(second_id, country=country, with_config=False)
+            best["technical_quality_score"] = 100
+            second["technical_quality_score"] = 90
+            records.extend((second, best))
+
+        ordered = vpngate_manager.publicvpnlist_order_api_candidate_records(records)
+
+        self.assertEqual(
+            [row["id"] for row in ordered],
+            [f"{country.lower()}-best" for country in country_order]
+            + [f"{country.lower()}-second" for country in country_order],
+        )
+
     def test_api_fetches_each_country_with_bounded_query_and_maps_known_fields(self):
         calls = []
 
@@ -1666,6 +1686,68 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
         self.assertEqual(stats["live_check_succeeded"], 1)
         self.assertEqual(stats["token_generated"], 1)
 
+    def test_ph_live_failure_keeps_other_country_candidate(self):
+        ph = self.record("ph-live-unavailable", country="PH", with_config=False)
+        fr = self.record("fr-live-available", country="FR", with_config=False)
+        ph["web_download_id"] = "111250"
+        fr["web_download_id"] = "111251"
+        ph["config_sha256"] = ""
+        fr["config_sha256"] = ""
+
+        def fake_live_flow(row, metadata=None, **_kwargs):
+            country = str(row.get("country_short") or "").upper()
+            if country == "PH":
+                metadata.update({
+                    "official_flow": True,
+                    "live_check_attempted": 1,
+                    "live_check_succeeded": False,
+                })
+                raise vpngate_manager.PublicVPNListSnapshotError(
+                    "PH live check unavailable"
+                )
+            config = (
+                "client\nproto tcp\n"
+                f"remote {row['host']} 443\n"
+                "<ca>\nCERT\n</ca>\n"
+            )
+            metadata.update({
+                "official_flow": True,
+                "live_check_attempted": 1,
+                "live_check_succeeded": True,
+                "token_request_attempted": 1,
+                "token_generated": True,
+                "profile_download_attempted": 1,
+                "profile_downloaded": 1,
+                "response_sha256": hashlib.sha256(config.encode()).hexdigest(),
+            })
+            return config
+
+        with mock.patch.object(
+            vpngate_manager,
+            "fetch_publicvpnlist_snapshot",
+            return_value={"data": [ph, fr]},
+        ), mock.patch.object(
+            vpngate_manager,
+            "fetch_publicvpnlist_official_config",
+            side_effect=fake_live_flow,
+        ), mock.patch.object(vpngate_manager, "log_to_json"):
+            result = vpngate_manager.fetch_publicvpnlist_candidates(
+                ["PH", "FR"],
+                set(),
+            )
+
+        stats = vpngate_manager.load_publicvpnlist_cache()["last_refresh_stats"]
+        self.assertEqual(
+            {node["country_short"] for node in result},
+            {"FR"},
+            stats,
+        )
+        self.assertEqual(stats["attempts_by_country"]["PH"], 1)
+        self.assertEqual(stats["attempts_by_country"]["FR"], 1)
+        self.assertTrue(stats["failed_candidates_by_country"]["PH"])
+        self.assertEqual(stats["validated_by_country"]["FR"], 1)
+        self.assertEqual(stats["connectable_by_country"]["FR"], 1)
+
     def test_live_check_failure_is_fail_closed_without_token_request(self):
         row = self.record("live-failed", with_config=False)
         row["web_download_id"] = "111207"
@@ -1817,6 +1899,20 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
         changed_row["config_updated_at"] = "v2"
         changed_row["config_sha256"] = hashlib.sha256(config.encode("utf-8")).hexdigest()
 
+        def fake_live_flow(_row, metadata=None, **_kwargs):
+            metadata.update(
+                {
+                    "official_flow": True,
+                    "live_check_succeeded": True,
+                    "token_request_attempted": 1,
+                    "token_generated": True,
+                    "profile_download_attempted": 1,
+                    "profile_downloaded": 1,
+                    "response_sha256": hashlib.sha256(config.encode("utf-8")).hexdigest(),
+                }
+            )
+            return config
+
         with mock.patch.object(vpngate_manager, "publicvpnlist_refresh_needed", return_value=True), mock.patch.object(
             vpngate_manager,
             "fetch_publicvpnlist_snapshot",
@@ -1824,7 +1920,7 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
         ), mock.patch.object(
             vpngate_manager,
             "fetch_publicvpnlist_official_config",
-            return_value=config,
+            side_effect=fake_live_flow,
         ) as live_flow:
             refreshed = vpngate_manager.refresh_publicvpnlist_cache(cache=cache)
 
@@ -1864,7 +1960,49 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
 
         self.assertEqual(calls, ["/download/111208/", "/test_server.php", "/get_token.php", "/download.php"])
 
-    def test_live_flow_budget_and_circuit_breaker_stop_additional_profiles(self):
+    def test_country_diagnostics_separate_metadata_and_mapped_records(self):
+        unmapped = self.record("ph-unmapped", with_config=False)
+        mapped = self.record("ph-mapped", with_config=False)
+        mapped["web_download_id"] = "111209"
+        mapped["config_sha256"] = ""
+        config = (
+            "client\nproto tcp\nremote ph-mapped.fixture.invalid 443\n"
+            "<ca>\nCERT\n</ca>\n"
+        )
+
+        def fake_live_flow(_row, metadata=None, **_kwargs):
+            metadata.update(
+                {
+                    "official_flow": True,
+                    "live_check_succeeded": True,
+                    "token_request_attempted": 1,
+                    "token_generated": True,
+                    "profile_download_attempted": 1,
+                    "profile_downloaded": 1,
+                    "response_sha256": hashlib.sha256(config.encode()).hexdigest(),
+                }
+            )
+            return config
+
+        with mock.patch.object(
+            vpngate_manager,
+            "fetch_publicvpnlist_snapshot",
+            return_value={"data": [unmapped, mapped]},
+        ), mock.patch.object(
+            vpngate_manager,
+            "fetch_publicvpnlist_official_config",
+            side_effect=fake_live_flow,
+        ), mock.patch.object(vpngate_manager, "log_to_json"):
+            result = vpngate_manager.fetch_publicvpnlist_candidates(["PH"], set())
+
+        self.assertEqual(len(result), 1)
+        stats = vpngate_manager.load_publicvpnlist_cache()["last_refresh_stats"]
+        self.assertEqual(stats["metadata_records_by_country"]["PH"], 2)
+        self.assertEqual(stats["mapped_records_by_country"]["PH"], 1)
+        self.assertEqual(stats["attempts_by_country"]["PH"], 1)
+        self.assertEqual(stats["validated_by_country"]["PH"], 1)
+
+    def test_live_flow_country_cap_stops_a_third_profile(self):
         rows = [self.record(f"budget-{index}", with_config=False) for index in range(4)]
         for index, row in enumerate(rows):
             row["web_download_id"] = str(111210 + index)
@@ -1890,7 +2028,11 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
         self.assertEqual(live_flow.call_count, 2)
         stats = vpngate_manager.load_publicvpnlist_cache()["last_refresh_stats"]
         self.assertEqual(stats["live_flow_attempts"], 2)
-        self.assertTrue(stats["live_flow_budget_exhausted"])
+        self.assertFalse(stats["live_flow_budget_exhausted"])
+        self.assertEqual(
+            stats["skipped_by_country"]["PH"]["country_attempt_limit"],
+            2,
+        )
 
     def test_downloaded_but_invalid_profile_counts_validation_failure_and_keeps_streak(self):
         row = self.record("validation-after-download", with_config=False)
@@ -1930,6 +2072,10 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
         self.assertEqual(stats["profile_downloaded"], 1)
         self.assertEqual(stats["profile_validation_failed"], 1)
         self.assertEqual(vpngate_manager.load_publicvpnlist_api_cache()["live_flow_failure_streak"], 1)
+        self.assertEqual(
+            stats["failed_candidates_by_country"]["PH"]["config_sha256_mismatch"],
+            1,
+        )
 
     def test_persisted_live_flow_failure_streak_opens_circuit_on_next_refresh(self):
         api_cache = vpngate_manager.publicvpnlist_api_cache_default()
@@ -1957,7 +2103,7 @@ class PublicVPNListAPIV1Tests(unittest.TestCase):
             vpngate_manager.refresh_publicvpnlist_cache()
 
         stats = vpngate_manager.load_publicvpnlist_cache()["last_refresh_stats"]
-        self.assertEqual(stats["live_flow_attempts"], 0)
+        self.assertEqual(stats["live_flow_attempts"], 1)
         self.assertTrue(stats["live_flow_circuit_open"])
 
     def test_retry_entries_for_profiles_missing_from_complete_metadata_are_pruned(self):

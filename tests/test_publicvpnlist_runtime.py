@@ -18,12 +18,225 @@ def load_smoke_module():
 
 
 class PublicVPNListRuntimeTests(unittest.TestCase):
-    def test_live_flow_defaults_are_bounded(self):
+    def test_live_flow_defaults_cover_two_rounds_for_all_fixed_countries(self):
         import vpngate_manager
 
-        self.assertLessEqual(vpngate_manager.PUBLICVPNLIST_LIVE_FLOW_MAX_ATTEMPTS, 3)
-        self.assertLessEqual(vpngate_manager.PUBLICVPNLIST_LIVE_FLOW_MAX_SECONDS, 30)
+        self.assertEqual(vpngate_manager.PUBLICVPNLIST_LIVE_FLOW_ATTEMPTS_PER_COUNTRY, 2)
+        self.assertEqual(vpngate_manager.PUBLICVPNLIST_LIVE_FLOW_MAX_ATTEMPTS, 20)
+        self.assertEqual(vpngate_manager.PUBLICVPNLIST_LIVE_FLOW_MAX_SECONDS, 180.0)
+        self.assertEqual(vpngate_manager.PUBLICVPNLIST_LIVE_FLOW_MAX_FAILURES, 9)
+        self.assertEqual(len(vpngate_manager.PUBLICVPNLIST_ALLOWED_COUNTRY_ORDER), 10)
         self.assertLessEqual(vpngate_manager.PUBLICVPNLIST_API_MAX_REQUESTS_PER_REFRESH, 30)
+
+    def test_ph_missing_metadata_is_optional_degradation(self):
+        smoke = load_smoke_module()
+        countries = list(smoke.FIXED_COUNTRY_ORDER)
+        report = {
+            "countries": countries,
+            "profiles_downloaded": 9,
+            "profiles_validated": 9,
+            "connectable_candidates": 9,
+            "metadata_records_by_country": {
+                country: 0 if country == "PH" else 1
+                for country in countries
+            },
+            "eligible_candidates_by_country": {
+                country: 0 if country == "PH" else 1
+                for country in countries
+            },
+            "attempts_by_country": {
+                country: 0 if country == "PH" else 1
+                for country in countries
+            },
+            "validated_by_country": {
+                country: 0 if country == "PH" else 1
+                for country in countries
+            },
+            "skipped_by_country": {country: {} for country in countries},
+            "failed_candidates_by_country": {country: {} for country in countries},
+            "optional_country_errors": {"PH": {}},
+            "openvpn": "not_started",
+        }
+
+        coverage = smoke.evaluate_live_coverage(report)
+
+        self.assertEqual(coverage["coverage_errors"], [])
+        self.assertNotIn("PH", coverage["metadata_missing"])
+        self.assertEqual(coverage["required_validated_country_count"], 9)
+        self.assertEqual(
+            coverage["optional_degraded_countries"]["PH"]["reason"],
+            "metadata_missing",
+        )
+
+    def test_ph_endpoint_failure_is_optional_degradation(self):
+        smoke = load_smoke_module()
+        countries = list(smoke.FIXED_COUNTRY_ORDER)
+        report = {
+            "countries": countries,
+            "profiles_downloaded": 9,
+            "profiles_validated": 9,
+            "connectable_candidates": 9,
+            "metadata_records_by_country": {
+                country: 0 if country == "PH" else 1
+                for country in countries
+            },
+            "eligible_candidates_by_country": {
+                country: 0 if country == "PH" else 1
+                for country in countries
+            },
+            "attempts_by_country": {
+                country: 0 if country == "PH" else 1
+                for country in countries
+            },
+            "validated_by_country": {
+                country: 0 if country == "PH" else 1
+                for country in countries
+            },
+            "skipped_by_country": {country: {} for country in countries},
+            "failed_candidates_by_country": {country: {} for country in countries},
+            "optional_country_errors": {"PH": {"network_error": 1}},
+            "openvpn": "not_started",
+        }
+
+        coverage = smoke.evaluate_live_coverage(report)
+
+        self.assertEqual(coverage["coverage_errors"], [])
+        self.assertEqual(
+            coverage["optional_degraded_countries"]["PH"]["reason"],
+            "api_endpoint_error:network_error",
+        )
+
+    def test_smoke_selection_caps_two_candidates_per_country(self):
+        import vpngate_manager
+
+        smoke = load_smoke_module()
+        records = []
+        for country in ("PH", "FR"):
+            for index in range(3):
+                records.append(
+                    {
+                        "id": f"{country.lower()}-{index}",
+                        "country_code": country,
+                        "hostname": f"{country.lower()}-{index}.fixture.invalid",
+                        "ip": f"198.51.100.{20 + index + (0 if country == 'PH' else 10)}",
+                        "protocol": "openvpn",
+                        "transport": "tcp",
+                        "port": 443,
+                        "technical_quality_score": 100 - index,
+                    }
+                )
+
+        selected = smoke._select_records(vpngate_manager, records, ["PH", "FR"], 20)
+        selected_counts = {}
+        for raw in selected:
+            country = vpngate_manager.normalize_publicvpnlist_row(raw)["country_short"]
+            selected_counts[country] = selected_counts.get(country, 0) + 1
+
+        self.assertEqual(selected_counts, {"PH": 2, "FR": 2})
+
+    def test_smoke_selection_is_two_interleaved_rounds_not_three(self):
+        import vpngate_manager
+
+        smoke = load_smoke_module()
+        records = []
+        for country in ("PH", "FR"):
+            for index in range(3):
+                records.append(
+                    {
+                        "id": f"{country.lower()}-{index}",
+                        "country_code": country,
+                        "hostname": f"{country.lower()}-{index}.fixture.invalid",
+                        "ip": f"198.51.100.{40 + index + (0 if country == 'PH' else 10)}",
+                        "protocol": "openvpn",
+                        "transport": "tcp",
+                        "port": 443,
+                        "technical_quality_score": 100 - index,
+                        "web_download_id": str(112000 + index),
+                    }
+                )
+
+        selected = smoke._select_records(vpngate_manager, records, ["PH", "FR"], 20)
+
+        self.assertEqual(
+            [row["id"] for row in selected],
+            ["ph-0", "fr-0", "ph-1", "fr-1"],
+        )
+
+    def test_smoke_filters_us_before_live_flow_and_preserves_safety_reason(self):
+        import vpngate_manager
+
+        smoke = load_smoke_module()
+        records = [
+            {
+                "id": "us-hosting",
+                "country_code": "US",
+                "hostname": "us-hosting.fixture.invalid",
+                "ip": "198.51.100.51",
+                "protocol": "openvpn",
+                "transport": "tcp",
+                "port": 443,
+                "web_download_id": "112051",
+            },
+            {
+                "id": "us-residential",
+                "country_code": "US",
+                "hostname": "us-residential.fixture.invalid",
+                "ip": "198.51.100.52",
+                "protocol": "openvpn",
+                "transport": "tcp",
+                "port": 443,
+                "web_download_id": "112052",
+            },
+            {
+                "id": "ph-usable",
+                "country_code": "PH",
+                "hostname": "ph-usable.fixture.invalid",
+                "ip": "198.51.100.53",
+                "protocol": "openvpn",
+                "transport": "tcp",
+                "port": 443,
+                "web_download_id": "112053",
+            },
+        ]
+        report = {
+            "eligible_candidates_by_country": {"US": 0, "PH": 0},
+            "skipped_by_country": {"US": {}, "PH": {}},
+            "us_classification_attempted": 0,
+            "us_residential_accepted": 0,
+            "us_nonresidential_rejected": 0,
+            "us_unclassified_rejected": 0,
+            "attempts_by_country": {"US": 0, "PH": 0},
+            "failed_candidates_by_country": {"US": {}, "PH": {}},
+            "available_countries": [],
+        }
+        classifications = {
+            "us-hosting": {"ip_type": "hosting", "risk_sources": ["ipinfo"]},
+            "us-residential": {"ip_type": "residential", "risk_sources": ["ipinfo"]},
+        }
+        with patch.object(
+            vpngate_manager,
+            "load_publicvpnlist_api_cache",
+            return_value={},
+        ), patch.object(
+            vpngate_manager,
+            "publicvpnlist_enrich_us_rows",
+            return_value=(classifications, False),
+        ):
+            selected = smoke._prepare_candidates(
+                vpngate_manager,
+                records,
+                ["US", "PH"],
+                20,
+                report,
+            )
+
+        self.assertEqual(
+            {row["id"] for row in selected},
+            {"us-residential", "ph-usable"},
+        )
+        self.assertEqual(report["us_classification_attempted"], 2)
+        self.assertEqual(report["us_nonresidential_rejected"], 1)
+        self.assertEqual(report["skipped_by_country"]["US"]["us_nonresidential"], 1)
 
     def test_smoke_classifies_metadata_without_verified_mapping(self):
         smoke = load_smoke_module()
