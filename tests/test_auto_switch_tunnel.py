@@ -13,10 +13,10 @@ class AutoSwitchTunnelTests(unittest.TestCase):
         self.assertEqual(vpngate_manager.AUTO_FAILOVER_TUNNEL_MODE, "single")
         page = Path(vpngate_manager.__file__).read_text(encoding="utf-8")
         self.assertIn('id="settings_auto_switch_tunnel_mode"', page)
-        self.assertIn('value="single">单通道（默认，兼容现有流程）', page)
-        self.assertIn('value="dual">双通道辅助切换（保留旧隧道排空）', page)
+        self.assertIn('value="single">单通道：停旧启新', page)
+        self.assertIn('value="dual">双通道：验证新节点后切换', page)
         self.assertIn('id="settings_auto_failover_tunnel_mode"', page)
-        self.assertIn('value="dual">双通道故障切换（先验证后切换）', page)
+        self.assertIn('value="dual">双通道：验证备用后切换', page)
 
     def test_ui_mode_accepts_only_single_or_dual(self):
         with mock.patch.object(vpngate_manager, "load_ui_config", return_value={"auto_switch_tunnel_mode": "dual"}):

@@ -11658,21 +11658,21 @@ INDEX_HTML = r"""<!doctype html>
           </div>
 
           <div class="form-group" style="margin-bottom: 12px;">
-            <label class="form-label" for="settings_auto_switch_tunnel_mode">主动切换通道模式</label>
+            <label class="form-label" for="settings_auto_switch_tunnel_mode">发现更优节点时的切换方式</label>
             <select id="settings_auto_switch_tunnel_mode" class="input-field">
-              <option value="single">单通道（默认，兼容现有流程）</option>
-              <option value="dual">双通道辅助切换（保留旧隧道排空）</option>
+              <option value="single">单通道：停旧启新</option>
+              <option value="dual">双通道：验证新节点后切换</option>
             </select>
-            <div style="font-size: 12px; color: var(--text-secondary); margin-top: 6px; line-height: 1.4;">单通道保持原有停旧启新流程；双通道用于健康连接主动优选，先验证备用隧道再切路由，失败时保留当前出口。</div>
+            <div style="font-size: 12px; color: var(--text-secondary); margin-top: 6px; line-height: 1.4;">双通道会先验证新节点，成功后再切换；两种方式互不影响故障切换设置。</div>
           </div>
 
           <div class="form-group" style="margin-bottom: 12px;">
-            <label class="form-label" for="settings_auto_failover_tunnel_mode">故障自动切换通道模式</label>
+            <label class="form-label" for="settings_auto_failover_tunnel_mode">节点故障时的切换方式</label>
             <select id="settings_auto_failover_tunnel_mode" class="input-field">
-              <option value="single">单通道（默认，停旧启新）</option>
-              <option value="dual">双通道故障切换（先验证后切换）</option>
+              <option value="single">单通道：停旧启新</option>
+              <option value="dual">双通道：验证备用后切换</option>
             </select>
-            <div style="font-size: 12px; color: var(--text-secondary); margin-top: 6px; line-height: 1.4;">双通道会在代理连续失败后先启动备用隧道并验证出口，成功后切换路由并排空旧隧道；备用隧道失败时自动回退单通道恢复。此设置独立于上面的主动优选模式。</div>
+            <div style="font-size: 12px; color: var(--text-secondary); margin-top: 6px; line-height: 1.4;">双通道会先验证备用节点，成功后再切换；失败时回退单通道恢复。</div>
           </div>
 
           <div class="form-group" style="margin-bottom: 12px;">
