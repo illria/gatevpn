@@ -348,8 +348,15 @@ if (
 AUTO_SWITCH_DRAIN_SECONDS = max(0, int(os.environ.get("AUTO_SWITCH_DRAIN_SECONDS", "45")))
 # 代理健康检查保护：OpenVPN 刚建立后，tun0/策略路由/本地代理有短暂稳定期。
 # 在保护期内或连续失败次数未达到阈值时，不会把当前节点判死并强制断开，避免“已连接 -> 立即清理 -> 反复重连”。
-PROXY_FAIL_GRACE_SECONDS = int(os.environ.get("PROXY_FAIL_GRACE_SECONDS", "75"))
+# 默认保护期缩短为 30 秒，仍保留连续 3 次失败防抖，减少故障节点造成的无谓断链时间。
+PROXY_FAIL_GRACE_SECONDS = max(0, int(os.environ.get("PROXY_FAIL_GRACE_SECONDS", "30")))
 PROXY_FAIL_AUTO_SWITCH_THRESHOLD = max(1, int(os.environ.get("PROXY_FAIL_AUTO_SWITCH_THRESHOLD", "3")))
+# 代理健康检查间隔。此前固定 sleep(30) 会让连续失败累计过慢；默认 10 秒，单次检测超时仍受
+# check_proxy_health() 自身的 curl/subprocess 超时限制，避免检测线程高频占用 CPU。
+PROXY_HEALTH_CHECK_INTERVAL_SECONDS = max(
+    5,
+    int(os.environ.get("PROXY_HEALTH_CHECK_INTERVAL_SECONDS", "10")),
+)
 AUTO_SWITCH_RETRY_COOLDOWN_SECONDS = max(10, int(os.environ.get("AUTO_SWITCH_RETRY_COOLDOWN_SECONDS", "45")))
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
@@ -1563,6 +1570,7 @@ def get_state() -> dict[str, Any]:
     state.setdefault("last_auto_switch_attempt_at", 0)
     state["proxy_fail_grace_seconds"] = PROXY_FAIL_GRACE_SECONDS
     state["proxy_fail_auto_switch_threshold"] = PROXY_FAIL_AUTO_SWITCH_THRESHOLD
+    state["proxy_health_check_interval_seconds"] = PROXY_HEALTH_CHECK_INTERVAL_SECONDS
     state["auto_switch_retry_cooldown_seconds"] = AUTO_SWITCH_RETRY_COOLDOWN_SECONDS
     
     return state
@@ -12846,10 +12854,10 @@ def background_proxy_checker() -> None:
     while True:
         try:
             if is_connecting:
-                time.sleep(5)
+                time.sleep(min(5, PROXY_HEALTH_CHECK_INTERVAL_SECONDS))
                 continue
             if not active_openvpn_node_id or not active_openvpn_running():
-                time.sleep(30)
+                time.sleep(PROXY_HEALTH_CHECK_INTERVAL_SECONDS)
                 continue
 
             res = check_proxy_health()
@@ -12884,7 +12892,7 @@ def background_proxy_checker() -> None:
 
                 # OpenVPN 刚连上时，代理出口可能还在稳定；连续失败达到阈值后才触发故障转移。
                 if in_grace or fail_count < PROXY_FAIL_AUTO_SWITCH_THRESHOLD:
-                    time.sleep(30)
+                    time.sleep(PROXY_HEALTH_CHECK_INTERVAL_SECONDS)
                     continue
 
                 with lock:
@@ -12899,7 +12907,7 @@ def background_proxy_checker() -> None:
         except Exception as e:
             print(f"[错误] 代理后台检测发生异常: {e}", flush=True)
             log_to_json("ERROR", "Proxy", f"检测守护线程发生异常: {e}")
-        time.sleep(30)
+        time.sleep(PROXY_HEALTH_CHECK_INTERVAL_SECONDS)
 
 def active_node_pinger() -> None:
     global active_openvpn_node_id, is_connecting

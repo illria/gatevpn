@@ -447,8 +447,11 @@ AUTO_SWITCH_DRAIN_SECONDS=45
 # 代理出口连续失败几次才触发故障转移；默认 3，避免瞬时抖动误切走手动选择的住宅 IP
 PROXY_FAIL_AUTO_SWITCH_THRESHOLD=3
 
-# 新连接建立后的健康保护期，默认 75 秒，保护期内不会因为代理检测短暂失败而切换
-PROXY_FAIL_GRACE_SECONDS=75
+# 新连接建立后的健康保护期，默认 30 秒，保护期内不会因为代理检测短暂失败而切换
+PROXY_FAIL_GRACE_SECONDS=30
+
+# 代理出口健康检测间隔，默认 10 秒；连续 3 次失败后触发故障转移
+PROXY_HEALTH_CHECK_INTERVAL_SECONDS=10
 
 # 自动优选切换冷却时间，避免频繁跳节点，默认 600 秒
 AUTO_SELECT_COOLDOWN_SECONDS=600

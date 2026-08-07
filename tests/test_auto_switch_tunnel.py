@@ -11,6 +11,9 @@ class AutoSwitchTunnelTests(unittest.TestCase):
     def test_single_tunnel_is_the_default_and_ui_exposes_both_modes(self):
         self.assertEqual(vpngate_manager.AUTO_SWITCH_TUNNEL_MODE, "single")
         self.assertEqual(vpngate_manager.AUTO_FAILOVER_TUNNEL_MODE, "single")
+        self.assertEqual(vpngate_manager.PROXY_FAIL_AUTO_SWITCH_THRESHOLD, 3)
+        self.assertEqual(vpngate_manager.PROXY_FAIL_GRACE_SECONDS, 30)
+        self.assertEqual(vpngate_manager.PROXY_HEALTH_CHECK_INTERVAL_SECONDS, 10)
         page = Path(vpngate_manager.__file__).read_text(encoding="utf-8")
         self.assertIn('id="settings_auto_switch_tunnel_mode"', page)
         self.assertIn('value="single">单通道：停旧启新', page)
