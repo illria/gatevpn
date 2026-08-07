@@ -340,6 +340,7 @@ ENV_FILE = "/etc/eianun-vpngate.env"
 LEGACY_ENV_FILE = "/etc/default/eianun-vpngate"
 PUBLICVPNLIST_ENV_KEYS = (
     "PUBLICVPNLIST_ENABLED",
+    "PUBLICVPNLIST_USER_DISABLED",
     "PUBLICVPNLIST_API_BASE_URL",
     "PUBLICVPNLIST_API_URL",
     "PUBLICVPNLIST_SNAPSHOT_URL",
@@ -399,6 +400,8 @@ def load_publicvpnlist_environment():
             default = ""
             if key == "PUBLICVPNLIST_ENABLED":
                 default = "1"
+            elif key == "PUBLICVPNLIST_USER_DISABLED":
+                default = "0"
             elif key == "PUBLICVPNLIST_API_BASE_URL":
                 default = PUBLICVPNLIST_API_BASE_URL_DEFAULT
             elif key == "PUBLICVPNLIST_API_URL":
@@ -408,11 +411,29 @@ def load_publicvpnlist_environment():
             os.environ[key] = values[key]
     return values
 
+def publicvpnlist_is_enabled(values=None):
+    values = values if isinstance(values, dict) else load_publicvpnlist_environment()
+    if str(values.get("PUBLICVPNLIST_USER_DISABLED", "0")).strip().lower() in {"1", "true", "yes", "on", "disabled"}:
+        return False
+    raw = str(values.get("PUBLICVPNLIST_ENABLED", "1") or "1").strip().lower()
+    if raw in {"0", "false", "no", "off", "disabled"}:
+        # Compatibility with old source-picker settings; the dedicated
+        # disable command writes PUBLICVPNLIST_USER_DISABLED=1.
+        return True
+    return True
+
 def save_publicvpnlist_environment(updates):
     values = read_env_file(LEGACY_ENV_FILE)
     values.update(read_env_file(ENV_FILE))
     for key, value in updates.items():
         values[key] = str(value or "")
+    if "PUBLICVPNLIST_ENABLED" in updates and "PUBLICVPNLIST_USER_DISABLED" not in updates:
+        raw_enabled = str(values.get("PUBLICVPNLIST_ENABLED", "1") or "1").strip().lower()
+        values["PUBLICVPNLIST_USER_DISABLED"] = (
+            "0"
+            if raw_enabled not in {"0", "false", "no", "off", "disabled"}
+            else "1"
+        )
     directory = os.path.dirname(ENV_FILE) or "."
     temporary_path = None
     temporary_fd = None
@@ -602,7 +623,7 @@ def publicvpnlist_api_cache_summary(values=None):
 
 def publicvpnlist_source_mode(values=None, usable=0):
     values = values if isinstance(values, dict) else load_publicvpnlist_environment()
-    if str(values.get("PUBLICVPNLIST_ENABLED", "1")).strip().lower() in {"0", "false", "no", "off", "disabled"}:
+    if not publicvpnlist_is_enabled(values):
         return "disabled"
     if values.get("PUBLICVPNLIST_SNAPSHOT_FILE"):
         return "snapshot_file"
@@ -796,7 +817,12 @@ def publicvpnlist_command(args):
         return
     if action in ("enable", "disable"):
         enabled = "1" if action == "enable" else "0"
-        if save_publicvpnlist_environment({"PUBLICVPNLIST_ENABLED": enabled}):
+        if save_publicvpnlist_environment(
+            {
+                "PUBLICVPNLIST_ENABLED": enabled,
+                "PUBLICVPNLIST_USER_DISABLED": "0" if enabled == "1" else "1",
+            }
+        ):
             print("PublicVPNList 已启用。" if enabled == "1" else "PublicVPNList 已停用；缓存文件未删除。")
             publicvpnlist_auto_activation_message()
         return
@@ -967,21 +993,24 @@ def save_ui_cfg(cfg):
                 pass
 
 def save_node_sources_transaction(cfg):
-    """Commit UI node_sources and PUBLICVPNLIST_ENABLED together."""
+    """Save UI sources without disabling the default PublicVPNList API source."""
     if not isinstance(cfg, dict):
         return False
-    previous = load_publicvpnlist_environment()
-    previous_enabled = str(previous.get("PUBLICVPNLIST_ENABLED", "1"))
     sources = str(cfg.get("node_sources") or "")
-    enabled = "1" if any(
+    publicvpnlist_selected = any(
         token.strip().lower() in {"publicvpnlist", "public_vpn_list", "pvl"}
         for token in re.split(r"[,，;；|/\s]+", sources)
-    ) else "0"
-    if not save_publicvpnlist_environment({"PUBLICVPNLIST_ENABLED": enabled}):
+    )
+    previous = load_publicvpnlist_environment() if publicvpnlist_selected else {}
+    if publicvpnlist_selected and not save_publicvpnlist_environment({"PUBLICVPNLIST_ENABLED": "1"}):
         return False
     if save_ui_cfg(cfg) is True:
         return True
-    save_publicvpnlist_environment({"PUBLICVPNLIST_ENABLED": previous_enabled})
+    if publicvpnlist_selected:
+        rollback = {"PUBLICVPNLIST_ENABLED": str(previous.get("PUBLICVPNLIST_ENABLED", "1"))}
+        if "PUBLICVPNLIST_USER_DISABLED" in previous:
+            rollback["PUBLICVPNLIST_USER_DISABLED"] = str(previous["PUBLICVPNLIST_USER_DISABLED"])
+        save_publicvpnlist_environment(rollback)
     return False
 
 def load_state():

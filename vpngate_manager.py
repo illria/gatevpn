@@ -2432,12 +2432,24 @@ def publicvpnlist_snapshot_source() -> tuple[str, str]:
 
 
 def publicvpnlist_is_enabled() -> bool:
-    """Return the explicit source switch; absence means enabled by default."""
+    """Return the source switch with compatibility for old source settings.
 
+    Older releases wrote ``PUBLICVPNLIST_ENABLED=0`` when the generic source
+    picker did not include PublicVPNList.  That value was not an explicit
+    PublicVPNList opt-out and survives upgrades.  A new marker is written by
+    the dedicated enable/disable controls so a deliberate disable remains
+    disabled.
+    """
+
+    if _publicvpnlist_env_bool("PUBLICVPNLIST_USER_DISABLED", False):
+        return False
     raw = os.environ.get("PUBLICVPNLIST_ENABLED")
     if raw is None or not str(raw).strip():
         return bool(PUBLICVPNLIST_ENABLED)
-    return str(raw).strip().lower() not in {"0", "false", "no", "off", "disabled"}
+    if str(raw).strip().lower() in {"0", "false", "no", "off", "disabled"}:
+        # Compatibility with environments written by the old source picker.
+        return True
+    return True
 
 
 def publicvpnlist_api_base_url() -> str:
@@ -5998,6 +6010,7 @@ def publicvpnlist_environment_values() -> dict[str, str]:
     values.update(_read_environment_file(PUBLICVPNLIST_ENV_FILE))
     for key in (
         "PUBLICVPNLIST_ENABLED",
+        "PUBLICVPNLIST_USER_DISABLED",
         "PUBLICVPNLIST_API_BASE_URL",
         "PUBLICVPNLIST_API_URL",
         "PUBLICVPNLIST_API_REFRESH_SECONDS",
@@ -6017,6 +6030,8 @@ def publicvpnlist_environment_values() -> dict[str, str]:
             default = ""
             if key == "PUBLICVPNLIST_ENABLED":
                 default = "1"
+            elif key == "PUBLICVPNLIST_USER_DISABLED":
+                default = "0"
             elif key == "PUBLICVPNLIST_API_BASE_URL":
                 default = publicvpnlist_api_base_url()
             elif key == "PUBLICVPNLIST_API_URL":
@@ -6269,6 +6284,7 @@ def publicvpnlist_write_environment(updates: dict[str, Any]) -> dict[str, str]:
     values.update(_read_environment_file(PUBLICVPNLIST_ENV_FILE))
     for key in (
         "PUBLICVPNLIST_ENABLED",
+        "PUBLICVPNLIST_USER_DISABLED",
         "PUBLICVPNLIST_API_BASE_URL",
         "PUBLICVPNLIST_API_URL",
         "PUBLICVPNLIST_SNAPSHOT_URL",
@@ -6284,6 +6300,12 @@ def publicvpnlist_write_environment(updates: dict[str, Any]) -> dict[str, str]:
             values[key] = os.environ.get(key, default)
     for key, value in updates.items():
         values[str(key)] = str(value or "")
+    if "PUBLICVPNLIST_ENABLED" in updates and "PUBLICVPNLIST_USER_DISABLED" not in updates:
+        values["PUBLICVPNLIST_USER_DISABLED"] = (
+            "0"
+            if _publicvpnlist_env_bool_from_value(values.get("PUBLICVPNLIST_ENABLED"), True)
+            else "1"
+        )
     normalized_hosts, host_error = publicvpnlist_normalize_allowed_hosts(
         values.get("PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS") or ""
     )
@@ -6308,6 +6330,7 @@ def publicvpnlist_write_environment(updates: dict[str, Any]) -> dict[str, str]:
     PUBLICVPNLIST_SNAPSHOT_FILE = str(values.get("PUBLICVPNLIST_SNAPSHOT_FILE") or "").strip()
     PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS = frozenset(normalized_hosts.split(",")) if normalized_hosts else frozenset()
     os.environ["PUBLICVPNLIST_ENABLED"] = "1" if PUBLICVPNLIST_ENABLED else "0"
+    os.environ["PUBLICVPNLIST_USER_DISABLED"] = values.get("PUBLICVPNLIST_USER_DISABLED", "0")
     os.environ["PUBLICVPNLIST_API_BASE_URL"] = PUBLICVPNLIST_API_BASE_URL
     os.environ["PUBLICVPNLIST_API_URL"] = PUBLICVPNLIST_API_URL
     os.environ["PUBLICVPNLIST_SNAPSHOT_URL"] = PUBLICVPNLIST_SNAPSHOT_URL
@@ -6316,30 +6339,63 @@ def publicvpnlist_write_environment(updates: dict[str, Any]) -> dict[str, str]:
     return values
 
 
+def publicvpnlist_migrate_legacy_enablement() -> bool:
+    """Persist the default-on state for old installs after an upgrade."""
+
+    values = publicvpnlist_environment_values()
+    enabled = _publicvpnlist_env_bool_from_value(values.get("PUBLICVPNLIST_ENABLED"), True)
+    explicitly_disabled = _publicvpnlist_env_bool_from_value(
+        values.get("PUBLICVPNLIST_USER_DISABLED"), False
+    )
+    if enabled or explicitly_disabled:
+        return False
+    try:
+        publicvpnlist_write_environment(
+            {"PUBLICVPNLIST_ENABLED": "1", "PUBLICVPNLIST_USER_DISABLED": "0"}
+        )
+        log_to_json(
+            "INFO",
+            "PublicVPNList",
+            "检测到旧版来源选择器关闭标记，已迁移为默认 API 来源启用",
+        )
+        return True
+    except Exception as exc:
+        log_to_json(
+            "WARNING",
+            "PublicVPNList",
+            f"旧版 PublicVPNList 开关迁移失败，错误类型={type(exc).__name__}",
+        )
+        return False
+
+
 def save_node_sources_transaction(ui_cfg: dict[str, Any]) -> bool:
-    """Update UI sources and the PublicVPNList switch as one logical operation."""
+    """Save UI sources without disabling the default PublicVPNList API source."""
 
     if not isinstance(ui_cfg, dict):
         return False
-    previous_values = publicvpnlist_environment_values()
-    previous_enabled = str(
-        previous_values.get(
-            "PUBLICVPNLIST_ENABLED",
-            "1" if publicvpnlist_is_enabled() else "0",
-        )
-    )
-    enabled = "1" if "publicvpnlist" in split_node_sources(ui_cfg.get("node_sources")) else "0"
-    try:
-        publicvpnlist_write_environment({"PUBLICVPNLIST_ENABLED": enabled})
-    except Exception as exc:
-        log_to_json("WARNING", "Settings", f"节点来源事务未写入环境文件，错误类型={type(exc).__name__}")
-        return False
+    publicvpnlist_selected = "publicvpnlist" in split_node_sources(ui_cfg.get("node_sources"))
+    previous_values: dict[str, str] = {}
+    environment_changed = False
+    if publicvpnlist_selected:
+        previous_values = publicvpnlist_environment_values()
+        try:
+            publicvpnlist_write_environment({"PUBLICVPNLIST_ENABLED": "1"})
+            environment_changed = True
+        except Exception as exc:
+            log_to_json("WARNING", "Settings", f"节点来源事务未写入环境文件，错误类型={type(exc).__name__}")
+            return False
     try:
         if save_ui_config(ui_cfg) is not True:
             raise OSError("UI 配置写入失败")
     except Exception as exc:
         try:
-            publicvpnlist_write_environment({"PUBLICVPNLIST_ENABLED": previous_enabled})
+            if environment_changed:
+                rollback = {
+                    "PUBLICVPNLIST_ENABLED": previous_values.get("PUBLICVPNLIST_ENABLED", "1"),
+                }
+                if "PUBLICVPNLIST_USER_DISABLED" in previous_values:
+                    rollback["PUBLICVPNLIST_USER_DISABLED"] = previous_values["PUBLICVPNLIST_USER_DISABLED"]
+                publicvpnlist_write_environment(rollback)
         except Exception as rollback_exc:
             log_to_json(
                 "WARNING",
@@ -13049,6 +13105,7 @@ def restore_cached_publicvpnlist_nodes() -> int:
 
 def main() -> None:
     ensure_dirs()
+    publicvpnlist_migrate_legacy_enablement()
     kill_existing_openvpn_processes()
     
     log_file = DATA_DIR / "vpngate.log"
