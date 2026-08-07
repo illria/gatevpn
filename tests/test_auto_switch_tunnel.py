@@ -10,16 +10,124 @@ import vpngate_manager
 class AutoSwitchTunnelTests(unittest.TestCase):
     def test_single_tunnel_is_the_default_and_ui_exposes_both_modes(self):
         self.assertEqual(vpngate_manager.AUTO_SWITCH_TUNNEL_MODE, "single")
+        self.assertEqual(vpngate_manager.AUTO_FAILOVER_TUNNEL_MODE, "single")
         page = Path(vpngate_manager.__file__).read_text(encoding="utf-8")
         self.assertIn('id="settings_auto_switch_tunnel_mode"', page)
         self.assertIn('value="single">单通道（默认，兼容现有流程）', page)
         self.assertIn('value="dual">双通道辅助切换（保留旧隧道排空）', page)
+        self.assertIn('id="settings_auto_failover_tunnel_mode"', page)
+        self.assertIn('value="dual">双通道故障切换（先验证后切换）', page)
 
     def test_ui_mode_accepts_only_single_or_dual(self):
         with mock.patch.object(vpngate_manager, "load_ui_config", return_value={"auto_switch_tunnel_mode": "dual"}):
             self.assertEqual(vpngate_manager.get_auto_switch_tunnel_mode(), "dual")
         with mock.patch.object(vpngate_manager, "load_ui_config", return_value={"auto_switch_tunnel_mode": "invalid"}):
             self.assertEqual(vpngate_manager.get_auto_switch_tunnel_mode(), "single")
+        with mock.patch.object(vpngate_manager, "load_ui_config", return_value={"auto_failover_tunnel_mode": "dual"}):
+            self.assertEqual(vpngate_manager.get_auto_failover_tunnel_mode(), "dual")
+        with mock.patch.object(vpngate_manager, "load_ui_config", return_value={"auto_failover_tunnel_mode": "invalid"}):
+            self.assertEqual(vpngate_manager.get_auto_failover_tunnel_mode(), "single")
+
+    def test_failure_failover_dual_mode_tries_backup_before_single_fallback(self):
+        old_process = mock.Mock()
+        old_process.poll.return_value = None
+        nodes = [
+            {
+                "id": "old",
+                "probe_status": "available",
+                "active": True,
+                "country_short": "US",
+                "ip_type": "residential",
+            },
+            {
+                "id": "backup",
+                "probe_status": "available",
+                "active": False,
+                "country_short": "US",
+                "ip_type": "residential",
+                "risk_level": "clean",
+                "risk_sources": ["fixture"],
+                "blacklist_count": 0,
+            },
+        ]
+        original_state = (
+            vpngate_manager.active_openvpn_process,
+            vpngate_manager.active_openvpn_node_id,
+            vpngate_manager.is_connecting,
+        )
+        vpngate_manager.active_openvpn_process = old_process
+        vpngate_manager.active_openvpn_node_id = "old"
+        vpngate_manager.is_connecting = False
+        try:
+            def read_json_for_test(path, default=None):
+                if path == vpngate_manager.NODES_FILE:
+                    return nodes
+                return {}
+
+            with ExitStack() as stack:
+                stack.enter_context(mock.patch.object(vpngate_manager, "read_json", side_effect=read_json_for_test))
+                stack.enter_context(mock.patch.object(vpngate_manager, "set_state"))
+                stack.enter_context(mock.patch.object(vpngate_manager, "log_to_json"))
+                stack.enter_context(mock.patch.object(vpngate_manager, "get_failover_targets", return_value=["US"]))
+                stack.enter_context(mock.patch.object(vpngate_manager, "choose_auto_failover_candidates", return_value=([nodes[1]], "fixture")))
+                stack.enter_context(mock.patch.object(vpngate_manager, "active_connection_looks_healthy", return_value=False))
+                stack.enter_context(mock.patch.object(vpngate_manager, "node_is_clean_for_connect", return_value=True))
+                stack.enter_context(mock.patch.object(vpngate_manager, "get_auto_failover_tunnel_mode", return_value="dual"))
+                dual = stack.enter_context(mock.patch.object(
+                    vpngate_manager,
+                    "connect_node_dual_tunnel",
+                    return_value=(True, "Dual tunnel connected backup"),
+                ))
+                single = stack.enter_context(mock.patch.object(vpngate_manager, "connect_node"))
+                vpngate_manager.auto_switch_node()
+
+            dual.assert_called_once_with("backup", update_failover_scope=False, allow_auto_risky=False)
+            single.assert_not_called()
+        finally:
+            vpngate_manager.active_openvpn_process, vpngate_manager.active_openvpn_node_id, vpngate_manager.is_connecting = original_state
+
+    def test_failure_failover_dual_mode_falls_back_to_single_when_backup_fails(self):
+        old_process = mock.Mock()
+        old_process.poll.return_value = None
+        nodes = [
+            {"id": "old", "probe_status": "available", "active": True, "country_short": "US"},
+            {"id": "backup", "probe_status": "available", "active": False, "country_short": "US"},
+        ]
+        original_state = (
+            vpngate_manager.active_openvpn_process,
+            vpngate_manager.active_openvpn_node_id,
+            vpngate_manager.is_connecting,
+        )
+        vpngate_manager.active_openvpn_process = old_process
+        vpngate_manager.active_openvpn_node_id = "old"
+        vpngate_manager.is_connecting = False
+        try:
+            def read_json_for_test(path, default=None):
+                if path == vpngate_manager.NODES_FILE:
+                    return nodes
+                return {}
+
+            with ExitStack() as stack:
+                stack.enter_context(mock.patch.object(vpngate_manager, "read_json", side_effect=read_json_for_test))
+                stack.enter_context(mock.patch.object(vpngate_manager, "set_state"))
+                stack.enter_context(mock.patch.object(vpngate_manager, "log_to_json"))
+                stack.enter_context(mock.patch.object(vpngate_manager, "get_failover_targets", return_value=["US"]))
+                stack.enter_context(mock.patch.object(vpngate_manager, "choose_auto_failover_candidates", return_value=([nodes[1]], "fixture")))
+                stack.enter_context(mock.patch.object(vpngate_manager, "active_connection_looks_healthy", return_value=False))
+                stack.enter_context(mock.patch.object(vpngate_manager, "node_is_clean_for_connect", return_value=True))
+                stack.enter_context(mock.patch.object(vpngate_manager, "get_auto_failover_tunnel_mode", return_value="dual"))
+                dual = stack.enter_context(mock.patch.object(
+                    vpngate_manager,
+                    "connect_node_dual_tunnel",
+                    return_value=(False, "双通道故障切换失败，保持当前出口"),
+                ))
+                single = stack.enter_context(mock.patch.object(vpngate_manager, "connect_node"))
+                vpngate_manager.auto_switch_node()
+
+            dual.assert_called_once_with("backup", update_failover_scope=False, allow_auto_risky=False)
+            single.assert_called_once_with("backup", update_failover_scope=False, allow_auto_risky=False)
+        finally:
+            vpngate_manager.active_openvpn_process, vpngate_manager.active_openvpn_node_id, vpngate_manager.is_connecting = original_state
 
     def test_proxy_new_connections_can_follow_promoted_interface(self):
         original = proxy_server.get_tun_interface()

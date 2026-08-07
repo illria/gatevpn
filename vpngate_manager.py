@@ -331,6 +331,12 @@ AUTO_SWITCH_TUNNEL_MODE_ENV = os.environ.get("AUTO_SWITCH_TUNNEL_MODE")
 AUTO_SWITCH_TUNNEL_MODE = (AUTO_SWITCH_TUNNEL_MODE_ENV or "single").strip().lower()
 if AUTO_SWITCH_TUNNEL_MODE not in {"single", "dual"}:
     AUTO_SWITCH_TUNNEL_MODE = "single"
+# 故障自动切换使用独立的通道模式。默认 single 保持既有故障转移行为；dual
+# 会先建立并验证备用隧道，确认可用后再切换代理接口和策略路由。
+AUTO_FAILOVER_TUNNEL_MODE_ENV = os.environ.get("AUTO_FAILOVER_TUNNEL_MODE")
+AUTO_FAILOVER_TUNNEL_MODE = (AUTO_FAILOVER_TUNNEL_MODE_ENV or "single").strip().lower()
+if AUTO_FAILOVER_TUNNEL_MODE not in {"single", "dual"}:
+    AUTO_FAILOVER_TUNNEL_MODE = "single"
 AUTO_SWITCH_DUAL_INTERFACE = (os.environ.get("AUTO_SWITCH_DUAL_INTERFACE") or "tun1").strip()
 if (
     not AUTO_SWITCH_DUAL_INTERFACE
@@ -530,6 +536,7 @@ def load_ui_config() -> dict[str, Any]:
             "node_sources": NODE_SOURCES_ENV or DEFAULT_NODE_SOURCES,
             "auto_select_allow_active_switch": AUTO_SELECT_ALLOW_ACTIVE_SWITCH,
             "auto_switch_tunnel_mode": AUTO_SWITCH_TUNNEL_MODE,
+            "auto_failover_tunnel_mode": AUTO_FAILOVER_TUNNEL_MODE,
         }
         updated = False
         if auth_file.exists():
@@ -550,6 +557,8 @@ def load_ui_config() -> dict[str, Any]:
             config["auto_select_best_node"] = AUTO_SELECT_BEST_NODE
         if AUTO_SWITCH_TUNNEL_MODE_ENV is not None and AUTO_SWITCH_TUNNEL_MODE_ENV.strip():
             config["auto_switch_tunnel_mode"] = AUTO_SWITCH_TUNNEL_MODE
+        if AUTO_FAILOVER_TUNNEL_MODE_ENV is not None and AUTO_FAILOVER_TUNNEL_MODE_ENV.strip():
+            config["auto_failover_tunnel_mode"] = AUTO_FAILOVER_TUNNEL_MODE
         if NODE_SOURCES_ENV:
             config["node_sources"] = NODE_SOURCES_ENV
         
@@ -908,6 +917,19 @@ def get_auto_switch_tunnel_mode() -> str:
 def auto_switch_tunnel_mode_display(mode: str | None = None) -> str:
     value = mode or get_auto_switch_tunnel_mode()
     return "双通道辅助切换" if value == "dual" else "单通道"
+
+
+def get_auto_failover_tunnel_mode() -> str:
+    if AUTO_FAILOVER_TUNNEL_MODE_ENV is not None and AUTO_FAILOVER_TUNNEL_MODE_ENV.strip():
+        return AUTO_FAILOVER_TUNNEL_MODE
+    cfg = load_ui_config()
+    mode = str(cfg.get("auto_failover_tunnel_mode") or AUTO_FAILOVER_TUNNEL_MODE).strip().lower()
+    return mode if mode in {"single", "dual"} else "single"
+
+
+def auto_failover_tunnel_mode_display(mode: str | None = None) -> str:
+    value = mode or get_auto_failover_tunnel_mode()
+    return "双通道故障切换" if value == "dual" else "单通道"
 
 def active_connection_looks_healthy(active_node: dict[str, Any] | None = None) -> bool:
     if not active_openvpn_running():
@@ -1524,6 +1546,8 @@ def get_state() -> dict[str, Any]:
     state["auto_select_allow_active_switch"] = get_auto_select_allow_active_switch()
     state["auto_switch_tunnel_mode"] = get_auto_switch_tunnel_mode()
     state["auto_switch_tunnel_mode_display"] = auto_switch_tunnel_mode_display(state["auto_switch_tunnel_mode"])
+    state["auto_failover_tunnel_mode"] = get_auto_failover_tunnel_mode()
+    state["auto_failover_tunnel_mode_display"] = auto_failover_tunnel_mode_display(state["auto_failover_tunnel_mode"])
     state["active_openvpn_interface"] = active_openvpn_interface
     state["dual_tunnel_supported"] = True
     state["auto_switch_drain_seconds"] = AUTO_SWITCH_DRAIN_SECONDS
@@ -9531,6 +9555,32 @@ def auto_switch_node(attempt: int = 0) -> None:
         msg = f"当前连接已失效或代理连通性检测失败，正在按固定地区 {scope_display} / IP 类型 {ip_type_scope_display} 自动切换: {next_node['id']} ({ip_kind})；策略: {candidate_reason}"
         print(f"[自动切换] {msg}", flush=True)
         log_to_json("INFO", "VPN", msg)
+
+        # 故障转移也可以独立选择双通道。先在备用 tun 上完成 OpenVPN
+        # 握手、策略路由和代理出口检查，成功后才替换活动隧道；如果备用
+        # 隧道无法建立，回退到原有单通道流程，避免双通道失败阻塞恢复。
+        if (
+            get_auto_failover_tunnel_mode() == "dual"
+            and active_openvpn_running()
+            and active_openvpn_node_id
+        ):
+            try:
+                dual_ok, dual_message = connect_node_dual_tunnel(
+                    next_node["id"],
+                    update_failover_scope=False,
+                    allow_auto_risky=not clean_ok,
+                )
+            except Exception as exc:
+                dual_ok = False
+                dual_message = f"双通道故障切换异常：{exc}"
+            if dual_ok:
+                set_state(last_check_message=dual_message)
+                return
+            fallback_message = f"{dual_message}；正在回退单通道故障恢复"
+            print(f"[自动切换] {fallback_message}", flush=True)
+            log_to_json("WARNING", "VPN", fallback_message)
+            set_state(last_check_message=fallback_message)
+
         try:
             connect_node(next_node["id"], update_failover_scope=False, allow_auto_risky=not clean_ok)
         except Exception as e:
@@ -11613,7 +11663,16 @@ INDEX_HTML = r"""<!doctype html>
               <option value="single">单通道（默认，兼容现有流程）</option>
               <option value="dual">双通道辅助切换（保留旧隧道排空）</option>
             </select>
-            <div style="font-size: 12px; color: var(--text-secondary); margin-top: 6px; line-height: 1.4;">单通道保持原有停旧启新流程；双通道仅用于健康连接主动优选，先验证备用隧道再切路由，失败时保留当前出口。故障转移和手动连接仍使用单通道。</div>
+            <div style="font-size: 12px; color: var(--text-secondary); margin-top: 6px; line-height: 1.4;">单通道保持原有停旧启新流程；双通道用于健康连接主动优选，先验证备用隧道再切路由，失败时保留当前出口。</div>
+          </div>
+
+          <div class="form-group" style="margin-bottom: 12px;">
+            <label class="form-label" for="settings_auto_failover_tunnel_mode">故障自动切换通道模式</label>
+            <select id="settings_auto_failover_tunnel_mode" class="input-field">
+              <option value="single">单通道（默认，停旧启新）</option>
+              <option value="dual">双通道故障切换（先验证后切换）</option>
+            </select>
+            <div style="font-size: 12px; color: var(--text-secondary); margin-top: 6px; line-height: 1.4;">双通道会在代理连续失败后先启动备用隧道并验证出口，成功后切换路由并排空旧隧道；备用隧道失败时自动回退单通道恢复。此设置独立于上面的主动优选模式。</div>
           </div>
 
           <div class="form-group" style="margin-bottom: 12px;">
@@ -12585,6 +12644,7 @@ function openSettingsModal() {
     $("settings_node_sources").value = state.node_sources || "vpngate,vpnbook,ipspeed,vpngate_scraper,publicvpnlist";
     $("settings_auto_select_allow_active_switch").value = state.auto_select_allow_active_switch ? "1" : "0";
     $("settings_auto_switch_tunnel_mode").value = state.auto_switch_tunnel_mode === "dual" ? "dual" : "single";
+    $("settings_auto_failover_tunnel_mode").value = state.auto_failover_tunnel_mode === "dual" ? "dual" : "single";
     const ipTypeValue = state.target_ip_types || "residential";
     const legacyIpTypeMap = {
       "residential,mobile": "residential",
@@ -12620,6 +12680,7 @@ async function saveSettings(e) {
   const autoSelectBestNode = $("settings_auto_select_best_node").value === "1";
   const autoSelectAllowActiveSwitch = $("settings_auto_select_allow_active_switch").value === "1";
   const autoSwitchTunnelMode = $("settings_auto_switch_tunnel_mode").value === "dual" ? "dual" : "single";
+  const autoFailoverTunnelMode = $("settings_auto_failover_tunnel_mode").value === "dual" ? "dual" : "single";
   const newUsername = $("settings_new_username").value.trim();
   const newPassword = $("settings_new_password").value.trim();
   const currUsername = $("settings_curr_username").value.trim();
@@ -12653,6 +12714,7 @@ async function saveSettings(e) {
         auto_select_best_node: autoSelectBestNode,
         auto_select_allow_active_switch: autoSelectAllowActiveSwitch,
         auto_switch_tunnel_mode: autoSwitchTunnelMode,
+        auto_failover_tunnel_mode: autoFailoverTunnelMode,
         new_username: newUsername,
         new_password: newPassword,
         curr_username: currUsername,
@@ -13209,6 +13271,13 @@ class Handler(BaseHTTPRequestHandler):
                 if new_auto_switch_tunnel_mode not in {"single", "dual"}:
                     self.send_json({"ok": False, "error": "通道模式只能是 single 或 dual"}, HTTPStatus.BAD_REQUEST)
                     return
+                requested_failover_tunnel_mode = payload.get("auto_failover_tunnel_mode")
+                if requested_failover_tunnel_mode is None:
+                    requested_failover_tunnel_mode = load_ui_config().get("auto_failover_tunnel_mode", "single")
+                new_auto_failover_tunnel_mode = str(requested_failover_tunnel_mode or "single").strip().lower()
+                if new_auto_failover_tunnel_mode not in {"single", "dual"}:
+                    self.send_json({"ok": False, "error": "故障切换通道模式只能是 single 或 dual"}, HTTPStatus.BAD_REQUEST)
+                    return
                 new_username = str(payload.get("new_username") or "").strip()
                 new_password = str(payload.get("new_password") or "").strip()
                 
@@ -13238,6 +13307,7 @@ class Handler(BaseHTTPRequestHandler):
                 ui_cfg["auto_select_best_node"] = new_auto_select_best_node
                 ui_cfg["auto_select_allow_active_switch"] = new_auto_select_allow_active_switch
                 ui_cfg["auto_switch_tunnel_mode"] = new_auto_switch_tunnel_mode
+                ui_cfg["auto_failover_tunnel_mode"] = new_auto_failover_tunnel_mode
                 if new_username:
                     ui_cfg["username"] = new_username
                 if new_password:

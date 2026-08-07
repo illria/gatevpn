@@ -438,6 +438,9 @@ AUTO_SELECT_ALLOW_ACTIVE_SWITCH=0
 # 主动优选的通道模式：single（默认）或 dual。dual 仅用于健康连接的主动优选。
 AUTO_SWITCH_TUNNEL_MODE=single
 
+# 故障自动切换的通道模式：single（默认）或 dual；与主动优选模式独立。
+AUTO_FAILOVER_TUNNEL_MODE=single
+
 # dual 模式切换成功后旧隧道保留排空的秒数，默认 45
 AUTO_SWITCH_DRAIN_SECONDS=45
 
@@ -494,7 +497,7 @@ STRICT_IP_TYPE_FILTER=1
 
 为了避免影响使用体验，默认启用“非中断检测”：每轮检测只刷新节点质量和风控信息，当前节点正常时不会为了优选而主动断开重连。你可以在 Web 面板设置里打开「当前连接正常时主动切换更优节点」，或通过 `AUTO_SELECT_ALLOW_ACTIVE_SWITCH=1` 恢复主动跳转。
 
-主动跳转默认使用 `AUTO_SWITCH_TUNNEL_MODE=single`，即沿用原有的停旧启新流程。设置为 `dual` 后，只有健康连接的主动优选会先在备用 `tun1` 建立并检查新隧道，确认出口可用后再切换策略路由，并让旧隧道短暂排空；手动连接和故障转移仍使用单通道。双通道失败时会保留当前连接，不会为了优选强制中断。现有 TCP/UDP 会话不能保证迁移到新公网 IP，但新建请求可在切换后使用新隧道。冷却时间仍由 `AUTO_SELECT_COOLDOWN_SECONDS` 控制。
+主动优选默认使用 `AUTO_SWITCH_TUNNEL_MODE=single`，即沿用原有的停旧启新流程。设置为 `dual` 后，健康连接发现明显更优节点时会先在备用 `tun1` 建立并检查新隧道，确认出口可用后再切换策略路由，并让旧隧道短暂排空。故障转移另由 `AUTO_FAILOVER_TUNNEL_MODE` 独立控制，设置为 `dual` 时，代理连续失败达到阈值后也会先建立并验证备用隧道，再切换到新出口；备用隧道失败会回退原有单通道恢复流程。手动连接仍使用单通道。现有 TCP/UDP 会话不能保证迁移到新公网 IP，但新建请求可在切换后使用新隧道。冷却时间仍由 `AUTO_SELECT_COOLDOWN_SECONDS` 控制。
 
 
 ### VPNBook 节点检测安全说明
