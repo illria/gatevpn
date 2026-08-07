@@ -428,6 +428,30 @@ def query_proxycheck(ip: str) -> dict[str, Any]:
         "type": item.get("type") or "",
     }
 
+
+def _risk_classification_vote(
+    *,
+    proxy: bool = False,
+    vpn: bool = False,
+    tor: bool = False,
+    hosting: bool = False,
+    mobile: bool = False,
+    type_text: str = "",
+) -> str:
+    """Reduce one provider's result to a conservative IP-quality vote."""
+
+    normalized_type = str(type_text or "").strip().lower()
+    if tor or vpn or proxy or any(token in normalized_type for token in ("proxy", "vpn", "tor")):
+        return "proxy"
+    if hosting or any(
+        token in normalized_type
+        for token in ("hosting", "server", "datacenter", "data center", "cloud")
+    ):
+        return "hosting"
+    if mobile or "mobile" in normalized_type:
+        return "mobile"
+    return "residential"
+
 def build_risk_profile(ip: str, ipapi_item: dict[str, Any] | None = None) -> dict[str, Any]:
     now = time.time()
     flags: list[str] = []
@@ -443,6 +467,7 @@ def build_risk_profile(ip: str, ipapi_item: dict[str, Any] | None = None) -> dic
     vpn = False
     tor = False
     external_risks: list[int] = []
+    classification_votes: dict[str, str] = {}
 
     if ipapi_item:
         sources.append("ip-api.com")
@@ -453,6 +478,11 @@ def build_risk_profile(ip: str, ipapi_item: dict[str, Any] | None = None) -> dic
         proxy = proxy or bool(ipapi_item.get("proxy"))
         hosting = hosting or bool(ipapi_item.get("hosting"))
         mobile = mobile or bool(ipapi_item.get("mobile"))
+        classification_votes["ip-api.com"] = _risk_classification_vote(
+            proxy=bool(ipapi_item.get("proxy")),
+            hosting=bool(ipapi_item.get("hosting")),
+            mobile=bool(ipapi_item.get("mobile")),
+        )
 
     if env_bool("IPWHOIS_CHECK", True):
         info = query_ipwhois(ip)
@@ -466,6 +496,12 @@ def build_risk_profile(ip: str, ipapi_item: dict[str, Any] | None = None) -> dic
             hosting = hosting or bool(info.get("hosting"))
             vpn = vpn or bool(info.get("vpn"))
             tor = tor or bool(info.get("tor"))
+            classification_votes["ipwho.is"] = _risk_classification_vote(
+                proxy=bool(info.get("proxy")),
+                vpn=bool(info.get("vpn")),
+                tor=bool(info.get("tor")),
+                hosting=bool(info.get("hosting")),
+            )
 
     if env_bool("PROXYCHECK_CHECK", True):
         info = query_proxycheck(ip)
@@ -480,6 +516,13 @@ def build_risk_profile(ip: str, ipapi_item: dict[str, Any] | None = None) -> dic
             tor = tor or bool(info.get("tor"))
             if info.get("risk"):
                 external_risks.append(int(info.get("risk", 0)))
+            classification_votes["proxycheck.io"] = _risk_classification_vote(
+                proxy=bool(info.get("proxy")),
+                vpn=bool(info.get("vpn")),
+                tor=bool(info.get("tor")),
+                hosting=bool(info.get("hosting")),
+                type_text=str(info.get("type") or ""),
+            )
 
     text_blob = " ".join([owner, as_name, asn]).lower()
     suspicious_asn = any(k in text_blob for k in SUSPICIOUS_ASN_KEYWORDS)
@@ -550,6 +593,15 @@ def build_risk_profile(ip: str, ipapi_item: dict[str, Any] | None = None) -> dic
         "risk_level": risk_level,
         "fraud_flags": flags,
         "risk_sources": sorted(set(sources + (["dnsbl"] if blacklist else []))),
+        "classification_votes": classification_votes,
+        "residential_votes": sorted(
+            source for source, vote in classification_votes.items()
+            if vote == "residential"
+        ),
+        "classification_vote_count": len(classification_votes),
+        "residential_vote_count": sum(
+            1 for vote in classification_votes.values() if vote == "residential"
+        ),
         "blacklist_hits": blacklist,
         "blacklist_count": len(blacklist),
         "ip_clean": bool(risk_level == "clean" and not blacklist and ip_type == "residential"),
@@ -560,9 +612,17 @@ def apply_ip_profile(node: dict[str, Any], profile: dict[str, Any]) -> None:
     for key in [
         "owner", "asn", "as_name", "location", "ip_type", "quality", "fraud_score",
         "clean_score", "risk_level", "fraud_flags", "risk_sources", "blacklist_hits",
-        "blacklist_count", "ip_clean",
+        "blacklist_count", "ip_clean", "classification_votes", "residential_votes",
+        "classification_vote_count", "residential_vote_count",
     ]:
-        node[key] = profile.get(key, [] if key.endswith("hits") or key.endswith("flags") or key.endswith("sources") else "" if key in {"owner", "asn", "as_name", "location", "ip_type", "quality", "risk_level"} else 0)
+        node[key] = profile.get(
+            key,
+            {} if key == "classification_votes" else []
+            if key.endswith("hits") or key.endswith("flags") or key.endswith("sources")
+            else ""
+            if key in {"owner", "asn", "as_name", "location", "ip_type", "quality", "risk_level"}
+            else 0,
+        )
 
 def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
     with ip_cache_lock:
@@ -577,7 +637,15 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
         if not ip:
             continue
         cached = cache.get(ip)
-        if cached and now - cached.get("cached_at", 0) < cache_ttl:
+        # Profiles written before provider-vote provenance was added must be
+        # refreshed once.  Otherwise PublicVPNList could make a decision from
+        # an old aggregate ip_type without knowing how many providers voted.
+        has_vote_provenance = (
+            isinstance(cached, dict)
+            and "classification_votes" in cached
+            and "residential_vote_count" in cached
+        )
+        if cached and has_vote_provenance and now - cached.get("cached_at", 0) < cache_ttl:
             apply_ip_profile(node, cached)
         elif ip not in ips_to_query:
             ips_to_query.append(ip)

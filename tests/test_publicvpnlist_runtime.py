@@ -241,8 +241,26 @@ class PublicVPNListRuntimeTests(unittest.TestCase):
             "available_countries": [],
         }
         classifications = {
-            "us-hosting": {"ip_type": "hosting", "risk_sources": ["ipinfo"]},
-            "us-residential": {"ip_type": "residential", "risk_sources": ["ipinfo"]},
+            "us-hosting": {
+                "ip_type": "hosting",
+                "risk_sources": ["ipinfo"],
+                "classification_votes": {
+                    "ip-api.com": "hosting",
+                    "ipwho.is": "hosting",
+                    "proxycheck.io": "hosting",
+                },
+                "residential_votes": [],
+            },
+            "us-residential": {
+                "ip_type": "residential",
+                "risk_sources": ["ipinfo"],
+                "classification_votes": {
+                    "ip-api.com": "residential",
+                    "ipwho.is": "residential",
+                    "proxycheck.io": "residential",
+                },
+                "residential_votes": ["ip-api.com", "ipwho.is", "proxycheck.io"],
+            },
         }
         with patch.object(
             vpngate_manager,

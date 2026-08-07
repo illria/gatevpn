@@ -175,6 +175,13 @@ PUBLICVPNLIST_MAX_NODES = _publicvpnlist_env_int("PUBLICVPNLIST_MAX_NODES", 100,
 PUBLICVPNLIST_MAX_SCAN_ROWS = _publicvpnlist_env_int("PUBLICVPNLIST_MAX_SCAN_ROWS", 500, 1)
 PUBLICVPNLIST_MAX_RAW_ROWS = _publicvpnlist_env_int("PUBLICVPNLIST_MAX_RAW_ROWS", 5000, 1)
 PUBLICVPNLIST_MAX_RESPONSE_BYTES = _publicvpnlist_env_int("PUBLICVPNLIST_MAX_RESPONSE_BYTES", 8 * 1024 * 1024, 256 * 1024)
+# PublicVPNList US eligibility is based on the three independent providers
+# already used by vpn_utils.  At least two providers must vote residential.
+# This does not change classification for VPNGate, VPNBook, or IPSpeed.
+PUBLICVPNLIST_US_RESIDENTIAL_MIN_VOTES = min(
+    3,
+    _publicvpnlist_env_int("PUBLICVPNLIST_US_RESIDENTIAL_MIN_VOTES", 2, 2),
+)
 # Temporary PublicVPNList links are short-lived/one-time; callers may
 # explicitly opt into retries only for a separately verified reusable URL.
 PUBLICVPNLIST_MAX_RETRIES = _publicvpnlist_env_int("PUBLICVPNLIST_MAX_RETRIES", 1, 1)
@@ -245,8 +252,17 @@ PUBLICVPNLIST_CLASSIFICATION_FIELDS = (
     "blacklist_count",
     "ip_clean",
     "risk_classified_at",
+    "classification_votes",
+    "residential_votes",
+    "classification_vote_count",
+    "residential_vote_count",
 )
-PUBLICVPNLIST_CLASSIFICATION_LIST_FIELDS = frozenset({"risk_sources", "fraud_flags", "blacklist_hits"})
+PUBLICVPNLIST_CLASSIFICATION_LIST_FIELDS = frozenset(
+    {"risk_sources", "fraud_flags", "blacklist_hits", "residential_votes"}
+)
+PUBLICVPNLIST_RISK_VOTE_PROVIDERS = frozenset(
+    {"ip-api.com", "ipwho.is", "proxycheck.io"}
+)
 SOURCE_PRIORITY = {
     "vpngate": 0,
     "ipspeed": 1,
@@ -6470,7 +6486,16 @@ def publicvpnlist_classification_defaults() -> dict[str, Any]:
     for field in PUBLICVPNLIST_CLASSIFICATION_FIELDS:
         if field in PUBLICVPNLIST_CLASSIFICATION_LIST_FIELDS:
             defaults[field] = []
-        elif field in {"fraud_score", "clean_score", "blacklist_count", "risk_classified_at"}:
+        elif field == "classification_votes":
+            defaults[field] = {}
+        elif field in {
+            "fraud_score",
+            "clean_score",
+            "blacklist_count",
+            "risk_classified_at",
+            "classification_vote_count",
+            "residential_vote_count",
+        }:
             defaults[field] = 0
         elif field == "ip_clean":
             defaults[field] = False
@@ -6514,6 +6539,16 @@ def publicvpnlist_normalize_classification(value: Any) -> dict[str, Any] | None:
                 classification[field] = 0
         elif field == "blacklist_count":
             classification[field] = publicvpnlist_metric_int(item)
+        elif field in {"classification_vote_count", "residential_vote_count"}:
+            classification[field] = publicvpnlist_metric_int(item)
+        elif field == "classification_votes":
+            if not isinstance(item, dict):
+                item = {}
+            classification[field] = {
+                str(source): str(vote).strip().lower()
+                for source, vote in item.items()
+                if str(source).strip() and str(vote).strip()
+            }
         else:
             classification[field] = item if item is not None else classification[field]
     classification["ip_type"] = normalize_ip_type_token(classification.get("ip_type"))
@@ -6530,6 +6565,28 @@ def publicvpnlist_apply_classification(node: dict[str, Any], classification: Any
         node[field] = list(value) if field in PUBLICVPNLIST_CLASSIFICATION_LIST_FIELDS else value
 
 
+def publicvpnlist_classification_votes(
+    classification: dict[str, Any] | None,
+) -> tuple[dict[str, str], list[str]]:
+    """Return only recognized provider votes and their residential voters."""
+
+    if not isinstance(classification, dict):
+        return {}, []
+    raw_votes = classification.get("classification_votes")
+    if not isinstance(raw_votes, dict):
+        return {}, []
+    votes = {
+        str(source).strip().lower(): str(vote).strip().lower()
+        for source, vote in raw_votes.items()
+        if str(source).strip().lower() in PUBLICVPNLIST_RISK_VOTE_PROVIDERS
+        and str(vote).strip()
+    }
+    residential_votes = sorted(
+        source for source, vote in votes.items() if vote == "residential"
+    )
+    return votes, residential_votes
+
+
 def publicvpnlist_us_classification_allowed(classification: dict[str, Any] | None) -> bool:
     classification = publicvpnlist_normalize_classification(classification) or {}
     ip_type = normalize_ip_type_token(classification.get("ip_type"))
@@ -6537,7 +6594,13 @@ def publicvpnlist_us_classification_allowed(classification: dict[str, Any] | Non
     if isinstance(raw_sources, str):
         raw_sources = [raw_sources]
     risk_sources = {str(item).strip().lower() for item in raw_sources if str(item).strip()}
-    return ip_type == "residential" and bool(risk_sources - {"dnsbl"})
+    votes, residential_votes = publicvpnlist_classification_votes(classification)
+    return (
+        ip_type == "residential"
+        and len(votes) >= PUBLICVPNLIST_US_RESIDENTIAL_MIN_VOTES
+        and len(residential_votes) >= PUBLICVPNLIST_US_RESIDENTIAL_MIN_VOTES
+        and bool(risk_sources - {"dnsbl"})
+    )
 
 
 def publicvpnlist_enrich_us_rows(
@@ -6568,6 +6631,24 @@ def publicvpnlist_enrich_us_rows(
         for (key, _row), item in zip(batch_rows, batch):
             classification = publicvpnlist_normalize_classification(item)
             if classification:
+                votes, residential_votes = publicvpnlist_classification_votes(classification)
+                vote_count = len(votes)
+                residential_vote_count = len(residential_votes)
+                classification["classification_votes"] = votes
+                classification["residential_votes"] = residential_votes
+                classification["classification_vote_count"] = vote_count
+                classification["residential_vote_count"] = residential_vote_count
+                if (
+                    vote_count >= PUBLICVPNLIST_US_RESIDENTIAL_MIN_VOTES
+                    and residential_vote_count >= PUBLICVPNLIST_US_RESIDENTIAL_MIN_VOTES
+                ):
+                    # PublicVPNList's US policy is based on the explicit
+                    # three-provider vote, not the aggregate severity label
+                    # produced by vpn_utils.  Keep all raw risk fields, but
+                    # expose the vote result as the node's effective type.
+                    classification["ip_type"] = "residential"
+                    if classification.get("quality") in {"proxy", "datacenter", "risky", ""}:
+                        classification["quality"] = "normal"
                 classification["risk_classified_at"] = checked_at
                 classifications[key] = classification
             else:
