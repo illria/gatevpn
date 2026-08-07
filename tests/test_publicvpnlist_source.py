@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 import vpngate_manager
+import vpn_utils
 
 
 OPENVPN_CONFIG = """client
@@ -149,9 +150,26 @@ class PublicVPNListSourceTests(unittest.TestCase):
             raise AssertionError(f"unexpected fixture URL: {url}")
 
         snapshot = snapshot if snapshot is not None else {"data": rows}
+
+        def fixture_enrich(nodes):
+            if enrich is not None:
+                enrich(nodes)
+            # Older source fixtures modeled only the aggregate ip_type.  Give
+            # those fixtures explicit three-provider provenance so the
+            # production PublicVPNList policy can remain strict.
+            for node in nodes:
+                if "classification_votes" in node:
+                    continue
+                vote = str(node.get("ip_type") or "unknown").strip().lower()
+                providers = ("ip-api.com", "ipwho.is", "proxycheck.io")
+                node["classification_votes"] = {provider: vote for provider in providers}
+                node["residential_votes"] = list(providers) if vote == "residential" else []
+                node["classification_vote_count"] = len(providers)
+                node["residential_vote_count"] = len(node["residential_votes"])
+
         with mock.patch.object(vpngate_manager, "fetch_publicvpnlist_snapshot", return_value=snapshot), mock.patch.object(
             vpngate_manager, "publicvpnlist_http_get", side_effect=fixture_http_get
-        ), mock.patch.object(vpngate_manager.vpn_utils, "enrich_ip_info", side_effect=enrich) as enrich_mock:
+        ), mock.patch.object(vpngate_manager.vpn_utils, "enrich_ip_info", side_effect=fixture_enrich) as enrich_mock:
             result = vpngate_manager.fetch_publicvpnlist_candidates(
                 target or [], set(), blocked_endpoint_keys=blocked_endpoint_keys
             )
@@ -660,6 +678,143 @@ class PublicVPNListSourceTests(unittest.TestCase):
         self.assertEqual(enrich_mock.call_count, 1)
         self.assertEqual(len(enrich_mock.call_args.args[0]), len(rows))
 
+    def test_us_two_of_three_provider_votes_are_enough(self):
+        row = self.row("us-two-votes", "US", "198.51.100.60")
+        calls = []
+
+        def enrich(nodes):
+            nodes[0].update(
+                ip_type="proxy",
+                risk_sources=["ip-api.com", "ipwho.is", "proxycheck.io"],
+                classification_votes={
+                    "ip-api.com": "residential",
+                    "ipwho.is": "residential",
+                    "proxycheck.io": "proxy",
+                },
+                residential_votes=["ip-api.com", "ipwho.is"],
+                classification_vote_count=3,
+                residential_vote_count=2,
+            )
+
+        def http_get(url, **_kwargs):
+            calls.append(url)
+            return self.config(row["host"], row["port"], row["proto"]).encode()
+
+        result, _ = self.fetch_rows([row], target=["US"], enrich=enrich, http_get=http_get)
+        self.assertEqual([node["ip"] for node in result], [row["ip"]])
+        self.assertEqual(result[0]["ip_type"], "residential")
+        self.assertEqual(result[0]["residential_vote_count"], 2)
+        self.assertEqual(len(calls), 1)
+
+    def test_us_one_of_three_provider_votes_is_rejected_before_download(self):
+        row = self.row("us-one-vote", "US", "198.51.100.61")
+        calls = []
+
+        def enrich(nodes):
+            nodes[0].update(
+                ip_type="proxy",
+                risk_sources=["ip-api.com", "ipwho.is", "proxycheck.io"],
+                classification_votes={
+                    "ip-api.com": "residential",
+                    "ipwho.is": "proxy",
+                    "proxycheck.io": "hosting",
+                },
+                residential_votes=["ip-api.com"],
+                classification_vote_count=3,
+                residential_vote_count=1,
+            )
+
+        def http_get(url, **_kwargs):
+            calls.append(url)
+            return self.config(row["host"], row["port"], row["proto"]).encode()
+
+        result, _ = self.fetch_rows([row], target=["US"], enrich=enrich, http_get=http_get)
+        self.assertEqual(result, [])
+        self.assertEqual(calls, [])
+
+    def test_us_vote_threshold_ignores_unrecognized_sources(self):
+        row = self.row("us-unknown-vote", "US", "198.51.100.62")
+        calls = []
+
+        def enrich(nodes):
+            nodes[0].update(
+                ip_type="proxy",
+                risk_sources=["ip-api.com", "ipwho.is", "proxycheck.io"],
+                classification_votes={
+                    "ip-api.com": "residential",
+                    "ipwho.is": "proxy",
+                    "proxycheck.io": "hosting",
+                    "unrecognized.example": "residential",
+                },
+                residential_votes=["ip-api.com", "unrecognized.example"],
+                classification_vote_count=4,
+                residential_vote_count=2,
+            )
+
+        def http_get(url, **_kwargs):
+            calls.append(url)
+            return self.config(row["host"], row["port"], row["proto"]).encode()
+
+        result, _ = self.fetch_rows([row], target=["US"], enrich=enrich, http_get=http_get)
+        self.assertEqual(result, [])
+        self.assertEqual(calls, [])
+
+    def test_three_provider_vote_provenance_is_recorded(self):
+        with mock.patch.object(vpn_utils, "env_bool", return_value=True), mock.patch.object(
+            vpn_utils, "dnsbl_hits", return_value=[]
+        ), mock.patch.object(
+            vpn_utils,
+            "query_ipwhois",
+            return_value={
+                "source": "ipwho.is",
+                "owner": "Cox Communications Inc.",
+                "asn": "AS22773",
+                "as_name": "Cox",
+                "proxy": False,
+                "vpn": False,
+                "tor": False,
+                "hosting": False,
+            },
+        ), mock.patch.object(
+            vpn_utils,
+            "query_proxycheck",
+            return_value={
+                "source": "proxycheck.io",
+                "owner": "Cox Communications Inc.",
+                "asn": "AS22773",
+                "as_name": "Cox",
+                "proxy": False,
+                "vpn": False,
+                "tor": False,
+                "hosting": False,
+                "type": "Residential",
+                "risk": 0,
+            },
+        ):
+            profile = vpn_utils.build_risk_profile(
+                "68.100.253.188",
+                {
+                    "status": "success",
+                    "org": "Cox Communications Inc.",
+                    "isp": "Cox Communications Inc.",
+                    "as": "AS22773 Cox Communications Inc.",
+                    "asname": "ASN-CXA-ALL-CCI-22773-RDC",
+                    "country": "United States",
+                    "regionName": "Virginia",
+                    "city": "Fairfax",
+                    "proxy": False,
+                    "hosting": False,
+                    "mobile": False,
+                },
+            )
+
+        self.assertEqual(profile["classification_vote_count"], 3)
+        self.assertEqual(profile["residential_vote_count"], 3)
+        self.assertEqual(
+            set(profile["residential_votes"]),
+            {"ip-api.com", "ipwho.is", "proxycheck.io"},
+        )
+
     def test_us_residential_classification_is_written_to_final_node_and_sorting(self):
         row = self.row("us-full-classification", "US", "198.51.100.47")
 
@@ -750,7 +905,18 @@ class PublicVPNListSourceTests(unittest.TestCase):
 
         def residential(nodes):
             for node in nodes:
-                node.update(ip_type="residential", risk_sources=["ip-api.com"])
+                node.update(
+                    ip_type="residential",
+                    risk_sources=["ip-api.com", "ipwho.is", "proxycheck.io"],
+                    classification_votes={
+                        "ip-api.com": "residential",
+                        "ipwho.is": "residential",
+                        "proxycheck.io": "residential",
+                    },
+                    residential_votes=["ip-api.com", "ipwho.is", "proxycheck.io"],
+                    classification_vote_count=3,
+                    residential_vote_count=3,
+                )
 
         self.fetch_rows([us, ph], enrich=residential)
         with mock.patch.object(vpngate_manager, "PUBLICVPNLIST_ALLOWED_DOWNLOAD_HOSTS", frozenset()), mock.patch.object(
@@ -817,7 +983,15 @@ class PublicVPNListSourceTests(unittest.TestCase):
         cached_profile = {
             "cached_at": time.time(),
             "ip_type": "residential",
-            "risk_sources": ["ip-api.com"],
+            "risk_sources": ["ip-api.com", "ipwho.is", "proxycheck.io"],
+            "classification_votes": {
+                "ip-api.com": "residential",
+                "ipwho.is": "residential",
+                "proxycheck.io": "residential",
+            },
+            "residential_votes": ["ip-api.com", "ipwho.is", "proxycheck.io"],
+            "classification_vote_count": 3,
+            "residential_vote_count": 3,
             "owner": "fixture",
             "asn": "AS64500",
             "as_name": "fixture",
@@ -1503,7 +1677,18 @@ class PublicVPNListSourceTests(unittest.TestCase):
 
         def residential(nodes):
             for node in nodes:
-                node.update(ip_type="residential", risk_sources=["ip-api.com"])
+                node.update(
+                    ip_type="residential",
+                    risk_sources=["ip-api.com", "ipwho.is", "proxycheck.io"],
+                    classification_votes={
+                        "ip-api.com": "residential",
+                        "ipwho.is": "residential",
+                        "proxycheck.io": "residential",
+                    },
+                    residential_votes=["ip-api.com", "ipwho.is", "proxycheck.io"],
+                    classification_vote_count=3,
+                    residential_vote_count=3,
+                )
 
         with mock.patch.object(vpngate_manager, "PUBLICVPNLIST_MAX_NODES", 500):
             self.fetch_rows(rows, target=["US"], enrich=residential)
@@ -1586,6 +1771,10 @@ class PublicVPNListSourceTests(unittest.TestCase):
             "cached_at": now,
             "ip_type": "residential",
             "risk_sources": ["ip-api.com"],
+            "classification_votes": {"ip-api.com": "residential"},
+            "residential_votes": ["ip-api.com"],
+            "classification_vote_count": 1,
+            "residential_vote_count": 1,
             "owner": "fixture ISP",
             "asn": "AS64500",
             "as_name": "fixture",
