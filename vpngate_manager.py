@@ -8428,6 +8428,19 @@ def schedule_publicvpnlist_api_refresh(
                     blocked_endpoint_keys=blocked_endpoint_keys,
                     target_countries=target_countries,
                 )
+                # The collector may have assembled its current candidate list
+                # before this bounded refresh finished.  Reconcile the newly
+                # validated profiles into nodes.json immediately so the UI and
+                # subsequent health checks see PublicVPNList in the same
+                # refresh cycle.  This is cache-only and never starts another
+                # network refresh or OpenVPN process.
+                restored = restore_cached_publicvpnlist_nodes()
+                if restored:
+                    log_to_json(
+                        "INFO",
+                        "PublicVPNList",
+                        f"后台 API 刷新后已合并已验证缓存节点 {restored} 个到节点池",
+                    )
                 log_to_json("INFO", "PublicVPNList", "PublicVPNList API 刷新已转入后台完成")
             except Exception as exc:
                 log_to_json(
