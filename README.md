@@ -137,6 +137,8 @@ API 支持每个固定国家的分页、请求/页面/记录/响应大小上限�
 
 PublicVPNList 的状态会显示 `mode`、`Metadata records`、`Live checks`、token、profile 下载/校验、`Connectable candidates`、`Metadata-only skipped`、网页 ID 缺失、熔断/预算/deadline、持久化失败 streak、最后 API 更新时间、API 状态和限流退避状态。若当前 API 的实时检查、一次性下载或配置校验没有产生可连接节点，日志会明确区分 metadata 与 connectable candidates；其他来源仍继续工作。快照 URL、query、签名、Cookie 和 token 不写入缓存、节点文件或日志。
 
+升级兼容：旧版本的通用 `en source` 选择器可能曾写入 `PUBLICVPNLIST_ENABLED=0`，这不会再关闭默认 API 来源；服务升级启动时会自动迁移为启用状态。只有 `en publicvpnlist disable` 或管理后台明确停用时，才会写入独立的人工停用标记并保持关闭。之后修改普通节点来源不会意外停用 PublicVPNList。
+
 PublicVPNList 的固定允许国家为 `PH, US, FR, GB, ID, FI, DE, TW, AU, NL`，实际结果还会与“拉取地区过滤”取交集：
 
 - `PH` 接受全部 IP 类型；

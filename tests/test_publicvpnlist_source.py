@@ -194,6 +194,43 @@ class PublicVPNListSourceTests(unittest.TestCase):
         self.assertEqual(vpngate_manager.split_node_sources("public_vpn_list,pvl"), ["publicvpnlist"])
         self.assertIn("PublicVPNList", vpngate_manager.node_sources_display("publicvpnlist"))
 
+    def test_legacy_zero_switch_is_enabled_without_explicit_disable_marker(self):
+        with mock.patch.dict(
+            vpngate_manager.os.environ,
+            {"PUBLICVPNLIST_ENABLED": "0", "PUBLICVPNLIST_USER_DISABLED": "0"},
+            clear=False,
+        ):
+            self.assertTrue(vpngate_manager.publicvpnlist_is_enabled())
+
+    def test_explicit_disable_marker_remains_disabled(self):
+        with mock.patch.dict(
+            vpngate_manager.os.environ,
+            {"PUBLICVPNLIST_ENABLED": "0", "PUBLICVPNLIST_USER_DISABLED": "1"},
+            clear=False,
+        ):
+            self.assertFalse(vpngate_manager.publicvpnlist_is_enabled())
+
+    def test_legacy_enablement_migration_persists_default_on(self):
+        with mock.patch.object(
+            vpngate_manager,
+            "publicvpnlist_environment_values",
+            return_value={"PUBLICVPNLIST_ENABLED": "0", "PUBLICVPNLIST_USER_DISABLED": "0"},
+        ), mock.patch.object(vpngate_manager, "publicvpnlist_write_environment") as writer, mock.patch.object(
+            vpngate_manager, "log_to_json"
+        ):
+            self.assertTrue(vpngate_manager.publicvpnlist_migrate_legacy_enablement())
+        writer.assert_called_once_with(
+            {"PUBLICVPNLIST_ENABLED": "1", "PUBLICVPNLIST_USER_DISABLED": "0"}
+        )
+
+    def test_source_selector_without_publicvpnlist_does_not_disable_default_api(self):
+        with mock.patch.object(vpngate_manager, "save_ui_config", return_value=True) as save_ui, mock.patch.object(
+            vpngate_manager, "publicvpnlist_write_environment"
+        ) as writer:
+            self.assertTrue(vpngate_manager.save_node_sources_transaction({"node_sources": "vpngate,vpnbook"}))
+        save_ui.assert_called_once()
+        writer.assert_not_called()
+
     def test_split_node_sources_accepts_sequences_without_using_list_repr(self):
         value = ["vpngate", "ipspeed", "publicvpnlist", "vpngate", "vpnbook"]
         self.assertEqual(

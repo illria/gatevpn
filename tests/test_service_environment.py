@@ -261,7 +261,7 @@ class ServiceEnvironmentTests(unittest.TestCase):
             self.assertEqual(generated_state["refresh_ready"], manager_state["refresh_ready"])
             self.assertEqual(generated_state["cache_only"], manager_state["cache_only"])
 
-    def test_generated_en_source_toggles_publicvpnlist_without_claiming_failure(self):
+    def test_generated_en_source_selection_does_not_disable_default_publicvpnlist(self):
         marker = "cat > /usr/bin/en <<'EOF'\n"
         start = self.install_text.index(marker) + len(marker)
         end = self.install_text.index("\nEOF\n", start)
@@ -282,7 +282,7 @@ class ServiceEnvironmentTests(unittest.TestCase):
 
             for key, expected_enabled, expected_sources in (
                 ("1", "1", "vpngate,vpnbook,ipspeed,vpngate_scraper,publicvpnlist"),
-                ("2", "0", "vpngate,vpnbook,ipspeed,vpngate_scraper"),
+                ("2", "1", "vpngate,vpnbook,ipspeed,vpngate_scraper"),
             ):
                 namespace["getch"] = lambda key=key: key
                 with contextlib.redirect_stdout(io.StringIO()):
@@ -304,7 +304,50 @@ class ServiceEnvironmentTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 namespace["configure_source"]()
             rolled_back = namespace["read_env_file"](namespace["ENV_FILE"])
-            self.assertEqual(rolled_back.get("PUBLICVPNLIST_ENABLED"), "0")
+            self.assertEqual(rolled_back.get("PUBLICVPNLIST_ENABLED"), "1")
+
+    def test_generated_en_explicit_disable_writes_persistent_marker(self):
+        marker = "cat > /usr/bin/en <<'EOF'\n"
+        start = self.install_text.index(marker) + len(marker)
+        end = self.install_text.index("\nEOF\n", start)
+        source = self.install_text[start:end]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            namespace = {"__name__": "generated_en_ci"}
+            exec(compile(source, "install.sh:generated-en", "exec"), namespace)
+            namespace["ENV_FILE"] = str(root / "eianun-vpngate.env")
+            namespace["LEGACY_ENV_FILE"] = str(root / "legacy.env")
+            with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(
+                namespace["subprocess"], "run"
+            ), mock.patch.object(namespace["time"], "sleep"):
+                namespace["save_publicvpnlist_environment"](
+                    {"PUBLICVPNLIST_ENABLED": "0"}
+                )
+            saved = namespace["read_env_file"](namespace["ENV_FILE"])
+            self.assertEqual(saved.get("PUBLICVPNLIST_ENABLED"), "0")
+            self.assertEqual(saved.get("PUBLICVPNLIST_USER_DISABLED"), "1")
+
+    def test_generated_en_legacy_zero_uses_api_but_explicit_marker_disables_it(self):
+        marker = "cat > /usr/bin/en <<'EOF'\n"
+        start = self.install_text.index(marker) + len(marker)
+        end = self.install_text.index("\nEOF\n", start)
+        source = self.install_text[start:end]
+        namespace = {"__name__": "generated_en_ci"}
+        exec(compile(source, "install.sh:generated-en", "exec"), namespace)
+        base = {
+            "PUBLICVPNLIST_ENABLED": "0",
+            "PUBLICVPNLIST_USER_DISABLED": "0",
+            "PUBLICVPNLIST_API_URL": "https://publicvpnlist.com/api/v1/servers",
+        }
+        legacy_state = namespace["publicvpnlist_state"](base)
+        self.assertEqual(legacy_state["mode"], "api")
+        self.assertTrue(legacy_state["effective_source_active"])
+
+        explicit_state = namespace["publicvpnlist_state"](
+            {**base, "PUBLICVPNLIST_USER_DISABLED": "1"}
+        )
+        self.assertEqual(explicit_state["mode"], "disabled")
+        self.assertFalse(explicit_state["effective_source_active"])
 
 
 if __name__ == "__main__":
